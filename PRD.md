@@ -133,11 +133,11 @@ dotlink remove [--config <path>]
 
 ## 7. MVP 验收标准
 
-- [ ] `dotlink apply` 能根据 `dotlink.toml` 正确创建文件和目录的符号链接。
-- [ ] 目标已存在时默认报错退出，加 `--force` 后覆盖且不备份。
-- [ ] `--dry-run` 只输出操作不修改文件系统。
-- [ ] `dotlink status` 正确显示每条链接的状态。
-- [ ] `dotlink remove` 只删除指向 source 的符号链接。
-- [ ] 支持 `~`、`$VAR`、`${VAR}` 展开。
-- [ ] 相对 source 路径以配置文件目录为基准。
-- [ ] 在 Linux 和 macOS 上可编译运行。
+- [x] `dotlink apply` 能根据 `dotlink.toml` 正确创建文件和目录的符号链接。
+- [x] 目标已存在时默认报错退出，加 `--force` 后覆盖且不备份。
+- [x] `--dry-run` 只输出操作不修改文件系统。
+- [x] `dotlink status` 正确显示每条链接的状态。
+- [x] `dotlink remove` 只删除指向 source 的符号链接。
+- [x] 支持 `~`、`$VAR`、`${VAR}` 展开。
+- [x] 相对 source 路径以配置文件目录为基准。
+- [x] 在 Linux 和 macOS 上可编译运行。
