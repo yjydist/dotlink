@@ -98,7 +98,7 @@ target = "b"
 	if err := os.Chdir(dir); err != nil {
 		t.Fatal(err)
 	}
-	defer os.Chdir(old)
+	t.Cleanup(func() { _ = os.Chdir(old) })
 
 	cfg, err := Load("dotlink.toml")
 	if err != nil {
