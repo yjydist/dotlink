@@ -1,0 +1,18 @@
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+
+version: '3'
+
+
+tasks:
+  default:
+    desc: 列出所有命令
+    cmds:
+      - task --list
+    silent: true
+
+  build:
+    desc: 编译 dotlink 可执行文件到 bin 目录
+    cmds:
+      - mkdir -p bin
+      - go build -o bin/dotlink ./cmd/dotlink
+    silent: true

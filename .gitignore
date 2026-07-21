@@ -1,0 +1,11 @@
+# Go build artifacts
+./dotlink
+*.exe
+*.test
+*.out
+bin/
+
+# Dependencies
+vendor/
+
+target/

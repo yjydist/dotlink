@@ -1,0 +1,8 @@
+{
+    "files.autoSave": "afterDelay",
+    "go.formatTool": "default",
+    "editor.formatOnSaveMode": "file",
+    "editor.defaultFormatter": "golang.go",
+    "editor.autoClosingBrackets": "always",
+    "editor.autoClosingOvertype":"always"
+}
