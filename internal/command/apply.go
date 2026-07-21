@@ -10,13 +10,18 @@ import (
 	"github.com/yjydist/dotlink/internal/util"
 )
 
+var (
+	ErrSourceMissing  = errors.New("source missing")
+	ErrTargetConflict = errors.New("target conflict")
+)
+
 type ApplyResult struct {
 	Source string
 	Target string
 	Action string
 }
 
-func Apply(cfgPath string, cfg *config.Config, force, dryRun bool) ([]ApplyResult, error) {
+func Apply(cfg *config.Config, force, dryRun bool) ([]ApplyResult, error) {
 	var results []ApplyResult
 
 	for _, l := range cfg.Link {
@@ -27,23 +32,19 @@ func Apply(cfgPath string, cfg *config.Config, force, dryRun bool) ([]ApplyResul
 
 		if _, err := os.Stat(source); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
-				return results, fmt.Errorf("source missing: %s", source)
+				return results, fmt.Errorf("%w: %s", ErrSourceMissing, source)
 			}
 			return results, err
 		}
 
 		tgtInfo, err := os.Lstat(target)
 
-		// 目标不存在：创建链接
 		if errors.Is(err, os.ErrNotExist) {
 			if dryRun {
 				results = append(results, ApplyResult{source, target, "would create symlink"})
 				continue
 			}
-			if err := ensureParentDir(target); err != nil {
-				return results, err
-			}
-			if err := os.Symlink(source, target); err != nil {
+			if err := createSymlink(source, target); err != nil {
 				return results, err
 			}
 			results = append(results, ApplyResult{source, target, "created symlink"})
@@ -53,10 +54,9 @@ func Apply(cfgPath string, cfg *config.Config, force, dryRun bool) ([]ApplyResul
 			return results, err
 		}
 
-		// 目标已存在
 		if tgtInfo.Mode()&os.ModeSymlink == 0 {
 			if !force {
-				return results, fmt.Errorf("target exists and is not a symlink: %s", target)
+				return results, fmt.Errorf("%w: %s exists and is not a symlink", ErrTargetConflict, target)
 			}
 			if dryRun {
 				results = append(results, ApplyResult{source, target, "would replace existing file"})
@@ -75,7 +75,7 @@ func Apply(cfgPath string, cfg *config.Config, force, dryRun bool) ([]ApplyResul
 				continue
 			}
 			if !force {
-				return results, fmt.Errorf("target is symlink to elsewhere: %s -> %s", target, dest)
+				return results, fmt.Errorf("%w: %s is symlink to elsewhere: %s", ErrTargetConflict, target, dest)
 			}
 			if dryRun {
 				results = append(results, ApplyResult{source, target, "would replace symlink"})
@@ -86,10 +86,7 @@ func Apply(cfgPath string, cfg *config.Config, force, dryRun bool) ([]ApplyResul
 			}
 		}
 
-		if err := ensureParentDir(target); err != nil {
-			return results, err
-		}
-		if err := os.Symlink(source, target); err != nil {
+		if err := createSymlink(source, target); err != nil {
 			return results, err
 		}
 		results = append(results, ApplyResult{source, target, "recreated symlink"})
@@ -98,6 +95,9 @@ func Apply(cfgPath string, cfg *config.Config, force, dryRun bool) ([]ApplyResul
 	return results, nil
 }
 
-func ensureParentDir(path string) error {
-	return os.MkdirAll(filepath.Dir(path), 0o755)
+func createSymlink(source, target string) error {
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return err
+	}
+	return os.Symlink(source, target)
 }

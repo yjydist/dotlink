@@ -1,9 +1,9 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
-	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -43,41 +43,33 @@ var removeCmd = &cobra.Command{
 func init() {
 	rootCmd.AddCommand(applyCmd, statusCmd, removeCmd)
 
-	applyCmd.Flags().StringVar(&configPath, "config", "dotlink.toml", "path to config file")
+	rootCmd.PersistentFlags().StringVar(&configPath, "config", "dotlink.toml", "path to config file")
+
 	applyCmd.Flags().BoolVar(&force, "force", false, "overwrite existing targets")
 	applyCmd.Flags().BoolVar(&dryRun, "dry-run", false, "print actions without executing")
-
-	statusCmd.Flags().StringVar(&configPath, "config", "dotlink.toml", "path to config file")
-	removeCmd.Flags().StringVar(&configPath, "config", "dotlink.toml", "path to config file")
 }
 
 func runApply(cmd *cobra.Command, args []string) error {
 	cfg, err := config.Load(configPath)
 	if err != nil {
-		return fmt.Errorf("load config: %w", err)
+		return err
 	}
 
-	results, err := command.Apply(configPath, cfg, force, dryRun)
+	results, err := command.Apply(cfg, force, dryRun)
 	for _, r := range results {
 		fmt.Printf("%s: %s -> %s\n", r.Action, r.Source, r.Target)
 	}
-	if err != nil {
-		return err
-	}
-	return nil
+	return err
 }
 
 func main() {
 	if err := rootCmd.Execute(); err != nil {
-		msg := err.Error()
-		fmt.Fprintf(os.Stderr, "error: %s\n", msg)
+		fmt.Fprintf(os.Stderr, "error: %s\n", err)
 
 		switch {
-		case strings.Contains(msg, "load config"):
-			os.Exit(2)
-		case strings.Contains(msg, "source missing"):
+		case errors.Is(err, command.ErrSourceMissing):
 			os.Exit(4)
-		case strings.Contains(msg, "target exists") || strings.Contains(msg, "symlink to elsewhere"):
+		case errors.Is(err, command.ErrTargetConflict):
 			os.Exit(3)
 		default:
 			os.Exit(1)
