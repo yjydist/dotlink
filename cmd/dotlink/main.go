@@ -95,6 +95,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
 
 		switch {
+		case errors.Is(err, config.ErrConfigParse):
+			os.Exit(2)
 		case errors.Is(err, command.ErrSourceMissing):
 			os.Exit(4)
 		case errors.Is(err, command.ErrTargetConflict):

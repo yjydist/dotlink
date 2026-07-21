@@ -1,11 +1,14 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 
 	"github.com/BurntSushi/toml"
 )
+
+var ErrConfigParse = errors.New("config parse failure")
 
 type Link struct {
 	Source string `toml:"source"`
@@ -20,7 +23,7 @@ type Config struct {
 func Load(path string) (*Config, error) {
 	var cfg Config
 	if _, err := toml.DecodeFile(path, &cfg); err != nil {
-		return nil, fmt.Errorf("load config %s: %w", path, err)
+		return nil, fmt.Errorf("%w: %s: %v", ErrConfigParse, path, err)
 	}
 
 	cfg.BaseDir = filepath.Dir(path)
