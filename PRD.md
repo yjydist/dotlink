@@ -5,7 +5,7 @@
 `dotlink` 是一个**自用的 dotfiles 管理工具**，通过**符号链接（symlink）**把分散在 dotfiles 仓库里的配置文件挂到目标位置。
 
 - **平台**：Linux / macOS，不支持 Windows。
-- **语言**：Rust（基于现有 `dotlink` crate）。
+- **语言**：Go（标准项目布局，cobra CLI 框架）。
 - **链接方式**：只支持软链接，不支持硬链接、复制 fallback。
 - **核心原则**：通过配置文件显式声明每条链接，禁止自动推断。
 

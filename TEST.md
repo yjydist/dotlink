@@ -76,4 +76,4 @@
 ## 扩展建议
 
 - 可在 GitHub Actions 中运行相同脚本，增加 macOS 与 Ubuntu 两个 runner 验证跨平台行为。
-- 对 Rust 项目，推荐把核心逻辑拆为可单元测试的库函数，沙箱脚本作为集成测试补充。
+- 核心逻辑已拆为可单元测试的包函数（`internal/command`、`internal/config`），沙箱脚本作为集成测试补充。
