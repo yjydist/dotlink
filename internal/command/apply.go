@@ -20,7 +20,7 @@ func Apply(cfgPath string, cfg *config.Config, force, dryRun bool) ([]ApplyResul
 	var results []ApplyResult
 
 	for _, l := range cfg.Link {
-		source, target, err := util.ResolveLink(cfgPath, l.Source, l.Target)
+		source, target, err := util.ResolveLink(cfg.BaseDir, l.Source, l.Target)
 		if err != nil {
 			return results, fmt.Errorf("resolve link: %w", err)
 		}

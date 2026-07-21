@@ -107,7 +107,7 @@ func TestResolveLink(t *testing.T) {
 
 	tests := []struct {
 		name       string
-		cfgPath    string
+		baseDir    string
 		srcRaw     string
 		tgRaw      string
 		wantSource string
@@ -115,7 +115,7 @@ func TestResolveLink(t *testing.T) {
 	}{
 		{
 			name:       "相对 source 基于 cfg 目录，相对 target 基于 cwd",
-			cfgPath:    "/etc/dotlink/dotlink.toml",
+			baseDir:    "/etc/dotlink",
 			srcRaw:     "files/gitconfig",
 			tgRaw:      ".gitconfig",
 			wantSource: "/etc/dotlink/files/gitconfig",
@@ -123,7 +123,7 @@ func TestResolveLink(t *testing.T) {
 		},
 		{
 			name:       "绝对路径保持不变",
-			cfgPath:    "/etc/dotlink/dotlink.toml",
+			baseDir:    "/etc/dotlink",
 			srcRaw:     "/absolute/source",
 			tgRaw:      "/absolute/target",
 			wantSource: "/absolute/source",
@@ -131,7 +131,7 @@ func TestResolveLink(t *testing.T) {
 		},
 		{
 			name:       "展开波浪号和环境变量",
-			cfgPath:    "/etc/dotlink/dotlink.toml",
+			baseDir:    "/etc/dotlink",
 			srcRaw:     "~/dotfiles/$DOTLINK_HOME",
 			tgRaw:      "${DOTLINK_HOME}",
 			wantSource: filepath.Join(home, "dotfiles", "myenv"),
@@ -141,9 +141,9 @@ func TestResolveLink(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotSource, gotTarget, err := util.ResolveLink(tt.cfgPath, tt.srcRaw, tt.tgRaw)
+			gotSource, gotTarget, err := util.ResolveLink(tt.baseDir, tt.srcRaw, tt.tgRaw)
 			if err != nil {
-				t.Fatalf("ResolveLink(%q, %q, %q) 返回错误: %v", tt.cfgPath, tt.srcRaw, tt.tgRaw, err)
+				t.Fatalf("ResolveLink(%q, %q, %q) 返回错误: %v", tt.baseDir, tt.srcRaw, tt.tgRaw, err)
 			}
 			if gotSource != tt.wantSource {
 				t.Errorf("source = %q, want %q", gotSource, tt.wantSource)

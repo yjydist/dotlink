@@ -3,14 +3,10 @@ package util
 import (
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 )
 
-var envVarRe = regexp.MustCompile(`\$(\w+|\{\w+\})`)
-
-// ExpandPath
-// 展开路径, 包括 "~", "$VAR", "${VAR}"
+// ExpandPath expands ~, $VAR, and ${VAR} in path.
 func ExpandPath(path string) (string, error) {
 	if path == "" {
 		return path, nil
@@ -24,33 +20,18 @@ func ExpandPath(path string) (string, error) {
 		path = home + path[1:]
 	}
 
-	path = envVarRe.ReplaceAllStringFunc(path, func(s string) string {
-		name := strings.TrimPrefix(s, "$")
-		name = strings.Trim(name, "{}")
-		return os.Getenv(name)
-	})
-
-	return path, nil
-
+	return os.ExpandEnv(path), nil
 }
 
-// ResolveLink
-// 把 Config 中的 source 和 target 解析成绝对路径
-func ResolveLink(cfgPath string, srcRaw string, tgRaw string) (source string, target string, err error) {
-	cfgDir := filepath.Dir(cfgPath)
-	if !filepath.IsAbs(cfgDir) {
-		cfgDir, err = filepath.Abs(cfgDir)
-		if err != nil {
-			return "", "", err
-		}
-	}
-
+// ResolveLink resolves source and target from config entries into absolute paths.
+// Relative sources resolve against baseDir; relative targets resolve against cwd.
+func ResolveLink(baseDir, srcRaw, tgRaw string) (source string, target string, err error) {
 	source, err = ExpandPath(srcRaw)
 	if err != nil {
 		return "", "", err
 	}
 	if !filepath.IsAbs(source) {
-		source = filepath.Join(cfgDir, source)
+		source = filepath.Join(baseDir, source)
 	}
 	source = filepath.Clean(source)
 
@@ -58,14 +39,10 @@ func ResolveLink(cfgPath string, srcRaw string, tgRaw string) (source string, ta
 	if err != nil {
 		return "", "", err
 	}
-	if !filepath.IsAbs(target) {
-		cwd, err := os.Getwd()
-		if err != nil {
-			return "", "", err
-		}
-		target = filepath.Join(cwd, target)
+	target, err = filepath.Abs(target)
+	if err != nil {
+		return "", "", err
 	}
-	target = filepath.Clean(target)
 
 	return source, target, nil
 }
