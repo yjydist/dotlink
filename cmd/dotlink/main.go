@@ -31,7 +31,7 @@ var applyCmd = &cobra.Command{
 var statusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "Show current status of each link",
-	Run:   func(cmd *cobra.Command, args []string) {},
+	RunE:  runStatus,
 }
 
 var removeCmd = &cobra.Command{
@@ -58,6 +58,19 @@ func runApply(cmd *cobra.Command, args []string) error {
 	results, err := command.Apply(cfg, force, dryRun)
 	for _, r := range results {
 		fmt.Printf("%s: %s -> %s\n", r.Action, r.Source, r.Target)
+	}
+	return err
+}
+
+func runStatus(cmd *cobra.Command, args []string) error {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return err
+	}
+
+	results, err := command.Status(cfg)
+	for _, r := range results {
+		fmt.Printf("%-18s %s -> %s\n", r.Status, r.Source, r.Target)
 	}
 	return err
 }
