@@ -16,3 +16,19 @@ tasks:
       - mkdir -p bin
       - go build -o bin/dotlink ./cmd/dotlink
     silent: true
+
+  test:
+    desc: 运行单元测试
+    cmds:
+      - go test -race ./...
+
+  lint:
+    desc: 运行 golangci-lint
+    cmds:
+      - golangci-lint run ./...
+
+  e2e:
+    desc: 运行 E2E 端到端测试
+    deps: [build]
+    cmds:
+      - ./e2e_test.sh
