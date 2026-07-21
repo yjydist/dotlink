@@ -45,6 +45,24 @@ target = "~/.gitconfig"
 			content: "[[link\nsource = broken",
 			wantErr: true,
 		},
+		{
+			name: "empty source field",
+			content: `
+[[link]]
+source = ""
+target = "~/.zshrc"
+`,
+			wantErr: true,
+		},
+		{
+			name: "empty target field",
+			content: `
+[[link]]
+source = "zsh/.zshrc"
+target = ""
+`,
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {

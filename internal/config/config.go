@@ -26,6 +26,15 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("%w: %s: %v", ErrConfigParse, path, err)
 	}
 
+	for i, l := range cfg.Link {
+		if l.Source == "" {
+			return nil, fmt.Errorf("%w: link[%d] has empty source", ErrConfigParse, i)
+		}
+		if l.Target == "" {
+			return nil, fmt.Errorf("%w: link[%d] has empty target", ErrConfigParse, i)
+		}
+	}
+
 	cfg.BaseDir = filepath.Dir(path)
 	if !filepath.IsAbs(cfg.BaseDir) {
 		abs, err := filepath.Abs(cfg.BaseDir)
