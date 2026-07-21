@@ -37,7 +37,7 @@ var statusCmd = &cobra.Command{
 var removeCmd = &cobra.Command{
 	Use:   "remove",
 	Short: "Remove symlinks created by dotlink",
-	Run:   func(cmd *cobra.Command, args []string) {},
+	RunE:  runRemove,
 }
 
 func init() {
@@ -47,6 +47,8 @@ func init() {
 
 	applyCmd.Flags().BoolVar(&force, "force", false, "overwrite existing targets")
 	applyCmd.Flags().BoolVar(&dryRun, "dry-run", false, "print actions without executing")
+
+	removeCmd.Flags().BoolVar(&dryRun, "dry-run", false, "print actions without executing")
 }
 
 func runApply(cmd *cobra.Command, args []string) error {
@@ -71,6 +73,19 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	results, err := command.Status(cfg)
 	for _, r := range results {
 		fmt.Printf("%-18s %s -> %s\n", r.Status, r.Source, r.Target)
+	}
+	return err
+}
+
+func runRemove(cmd *cobra.Command, args []string) error {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return err
+	}
+
+	results, err := command.Remove(cfg, dryRun)
+	for _, r := range results {
+		fmt.Printf("%s: %s -> %s\n", r.Action, r.Source, r.Target)
 	}
 	return err
 }
