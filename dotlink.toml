@@ -1,3 +1,11 @@
 [[link]]
-source = "hello"
-target = "world"
+source = "zsh/.zshrc"
+target = "~/.zshrc"
+
+[[link]]
+source = "nvim"
+target = "$XDG_CONFIG_HOME/nvim"
+
+[[link]]
+source = "git/.gitconfig"
+target = "~/.gitconfig"

@@ -1,5 +1,5 @@
 # Go build artifacts
-./dotlink
+/dotlink
 *.exe
 *.test
 *.out
@@ -7,5 +7,3 @@ bin/
 
 # Dependencies
 vendor/
-
-target/
