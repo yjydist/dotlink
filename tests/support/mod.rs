@@ -1,6 +1,6 @@
-//! 端到端测试夹具: 临时仓库 + 临时 HOME.
+//! 端到端测试夹具与共用辅助: 临时仓库 + 临时 HOME + 各套件共享的观测辅助.
 //!
-//! 每个测试文件只用到其中一部分方法, 故整个模块允许 dead_code.
+//! 每个测试文件只用到其中一部分条目, 故整个模块允许 dead_code.
 
 #![allow(dead_code)]
 
@@ -131,6 +131,194 @@ impl Default for TempEnv {
     }
 }
 
+/// 一次命令调用的观测结果.
+pub struct Run {
+    pub code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// 运行 `dotlink <args...>` (cwd = 仓库根, HOME = 临时主目录).
+pub fn run(env: &TempEnv, args: &[&str]) -> Run {
+    let assert = env.cmd().args(args).assert();
+    let output = assert.get_output();
+    Run {
+        code: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+/// 构造清单: 每个条目为 `(source, target, on_conflict)`, 策略写 `"-"` 表示缺省.
+pub fn manifest_of(entries: &[(&str, &str, &str)]) -> String {
+    let mut text = String::new();
+    for (source, target, policy) in entries {
+        text.push_str("[[entry]]\n");
+        text.push_str(&format!("source = \"{source}\"\n"));
+        text.push_str(&format!("target = \"{target}\"\n"));
+        if *policy != "-" {
+            text.push_str(&format!("on_conflict = \"{policy}\"\n"));
+        }
+    }
+    text
+}
+
+/// 该行是否是逐条目行 (`<序号>/<总数> ...`), 用于把末尾汇总行排除在外.
+pub fn is_entry_line(line: &str) -> bool {
+    match line
+        .split_whitespace()
+        .next()
+        .and_then(|word| word.split_once('/'))
+    {
+        Some((index, total)) => index.parse::<usize>().is_ok() && total.parse::<usize>().is_ok(),
+        None => false,
+    }
+}
+
+/// 全部逐条目行 (排除末尾汇总行).
+pub fn entry_lines(stdout: &str) -> Vec<&str> {
+    stdout.lines().filter(|line| is_entry_line(line)).collect()
+}
+
+/// 逐条目行数.
+pub fn entry_line_count(stdout: &str) -> usize {
+    stdout.lines().filter(|line| is_entry_line(line)).count()
+}
+
+/// 含 `needle` 的那一行.
+#[track_caller]
+pub fn line_for<'a>(stdout: &'a str, needle: &str) -> &'a str {
+    stdout
+        .lines()
+        .find(|line| line.contains(needle))
+        .unwrap_or_else(|| panic!("输出中没有含 {needle} 的行:\n{stdout}"))
+}
+
+/// 行内的 token (第 2 个字段).
+#[track_caller]
+pub fn token_of(line: &str) -> &str {
+    line.split_whitespace()
+        .nth(1)
+        .unwrap_or_else(|| panic!("行内没有 token: {line}"))
+}
+
+/// 行内展示的 target (第 3 个字段, 即用户书写的原始字符串).
+#[track_caller]
+pub fn target_of(line: &str) -> &str {
+    line.split_whitespace()
+        .nth(2)
+        .unwrap_or_else(|| panic!("行内没有 target: {line}"))
+}
+
+/// 断言输出中出现了 token `token` (以整词出现).
+#[track_caller]
+pub fn assert_token(run: &Run, token: &str) {
+    assert!(
+        run.stdout.split_whitespace().any(|word| word == token),
+        "输出中缺少 token {token}, 实际输出: {}",
+        run.stdout
+    );
+}
+
+/// 仓库 + HOME 的递归快照 (路径 + 文件内容 / 链接文本), 用于断言"零改动".
+///
+/// HOME 位于仓库之内 (夹具如此), 两份递归会重叠出重复项; 这里排序后按路径去重,
+/// 使"前后比对"不受重复影响.
+pub fn snapshot_all(env: &TempEnv) -> Vec<(PathBuf, String)> {
+    let mut rows = env.snapshot(env.repo());
+    rows.extend(env.snapshot(env.home()));
+    rows.sort();
+    rows.dedup();
+    rows
+}
+
+/// 仓库根的**物理**路径.
+///
+/// 子进程的 `std::env::current_dir()` 返回物理路径 (macOS 上临时目录位于
+/// `/var/folders/...`, 即 `/private/var/folders/...`), 而 `TempEnv::repo()` 返回的是
+/// 未解析的那一份. 链接归属判定以物理路径为基准 (夹具的 `assert_symlink_to` 是纯
+/// 词法比较, 两种书写形态在它眼中是不同的路径), 因此手工构造链接时必须用同一基准,
+/// 否则会构造出一个指向错误位置的链接 (得到 `wrong` 而非 `ok`).
+pub fn physical_repo(env: &TempEnv) -> PathBuf {
+    fs::canonicalize(env.repo()).expect("解析仓库根的物理路径")
+}
+
+/// 某目录下所有备份文件名 (含最终名与 `.partial` 残留).
+pub fn backups_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap_or_else(|error| panic!("列举 {} 失败: {error}", dir.display()))
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".dotlink-backup."))
+        .collect();
+    names.sort();
+    names
+}
+
+/// 从命令输出中取出备份文件的完整路径 (FR-016 的"必现信息").
+///
+/// 输出里的路径可能被标点 (`,;.` 与 `)`) 收尾, 因此先试原词, 再试去掉收尾标点的形态.
+#[track_caller]
+pub fn backup_path_from_output(stdout: &str) -> PathBuf {
+    for word in stdout.split_whitespace() {
+        if !word.contains(".dotlink-backup.") {
+            continue;
+        }
+        for candidate in [
+            word.to_string(),
+            word.trim_end_matches([',', ';', '.', ')']).to_string(),
+        ] {
+            let path = PathBuf::from(&candidate);
+            if fs::symlink_metadata(&path).is_ok() {
+                return path;
+            }
+        }
+    }
+    panic!("输出中未给出可定位的备份文件完整路径: {stdout}");
+}
+
+/// 以 root 运行时权限位无效 (chmod 000 不阻止读取), 依赖 `EACCES` 的断言必须跳过.
+pub fn running_as_root() -> bool {
+    let probe = std::env::temp_dir().join(format!("dotlink-root-probe-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&probe);
+    if fs::create_dir_all(&probe).is_err() {
+        return false;
+    }
+    let locked = probe.join("locked");
+    let outcome = fs::create_dir_all(&locked)
+        .and_then(|()| {
+            fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+        })
+        .and_then(|()| fs::read_dir(&locked).map(|_| ()));
+    let as_root = outcome.is_ok();
+    let _ = fs::remove_dir_all(&probe);
+    as_root
+}
+
+/// 一份"目标父目录不可进入"的清单与被打上 chmod 000 的目录.
+///
+/// 第一条目标是正常的 (用于断言"其余条目正常处理"), 第二条落在不可进入的目录里.
+pub fn env_with_locked_target() -> (TempEnv, PathBuf) {
+    let env = TempEnv::new();
+    env.write_source("shell/bashrc", "managed\n");
+    env.write_source("shell/zshrc", "managed-zsh\n");
+    env.write_manifest(
+        "[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"~/.bashrc\"\n\n\
+         [[entry]]\nsource = \"shell/zshrc\"\ntarget = \"~/.locked/rc\"\n",
+    );
+
+    let locked = env.home().join(".locked");
+    fs::create_dir_all(&locked).expect("创建目标父目录");
+    fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+        .expect("设置权限位");
+    (env, locked)
+}
+
+/// 恢复目录的可列举性, 使临时目录能被正常清理.
+pub fn unlock(dir: &Path) {
+    let _ = fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o755));
+}
+
 /// 递归收集 `path` 之下的全部条目.
 fn collect(path: &Path, rows: &mut Vec<(PathBuf, String)>) {
     let Ok(meta) = fs::symlink_metadata(path) else {
@@ -160,8 +348,9 @@ fn collect(path: &Path, rows: &mut Vec<(PathBuf, String)>) {
 
 /// 词法解析: 以 `base` 为基准把相对路径变为绝对路径, 并消除 `.` 与 `..`.
 ///
-/// 仅用于断言, 与 `src/os/mod.rs` 的 `normalize` 同语义. 后者在 `os` 模块内为
-/// crate 私有路径, 测试无法直接复用, 故此处保留一份最小副本.
+/// 纯词法折叠, **不解析**路径中的符号链接; 仅供测试计算断言的期望值. 它与
+/// `src/os` 的 `normalize` 并不同语义 (后者还会解析祖先段的符号链接, 只有末段
+/// 不解析), 那份实现在 crate 私有路径上, 测试无法直接复用.
 pub fn resolve_lexically(path: &Path, base: Option<&Path>) -> PathBuf {
     let absolute = if path.is_absolute() {
         path.to_path_buf()

@@ -7,7 +7,7 @@
 //!
 //! 三处"唯一来源"在这里只被接线, 不被重写:
 //!
-//! - token 与说明措辞: `render` 层 (`row_from_state` / `row_for`);
+//! - token 与说明措辞: `render` 层 (`row_from_state` / `fail_row`);
 //! - 逐条结果侧的退出码 (0 / 1): `exit_code_for`, 输入即报告行本身;
 //! - 派发**之前**的结局 (2 / 3): `Error::exit_code`.
 
@@ -147,7 +147,7 @@ fn apply(manifest: &Manifest, states: &[EntryState]) -> Vec<ReportRow> {
                 backup.is_some(),
                 backup.as_deref(),
             ),
-            Err(error) => failure_row(entry, &error),
+            Err(error) => render::fail_row(entry, &error.to_string()),
         })
         .collect()
 }
@@ -182,7 +182,7 @@ struct UndoItem<'a> {
     /// 同目录最新备份. token 是 `restore` 还是 `undo` 由它决定, 与 `Current` 是
     /// `LinkedCorrect` 还是 `LinkedWrong` 无关 (`contracts/cli.md` 的 `undo` 分支表).
     backup: Option<PathBuf>,
-    /// 移除失败的原因 (FR-014: 不中断其余条目).
+    /// 备份快照或移除/恢复失败的原因 (FR-014: 不中断其余条目).
     failure: Option<String>,
 }
 
@@ -198,16 +198,30 @@ fn undo(manifest: &Manifest, states: &[EntryState]) -> Vec<ReportRow> {
         .entries
         .iter()
         .zip(states)
-        .map(|(entry, state)| UndoItem {
-            entry,
-            state,
-            backup: match state.current {
+        .map(|(entry, state)| {
+            // 备份查找取不到结果不等于"无备份": 目录读取失败是环境故障, 与
+            // `Unreadable` 同类处置 -- 该条目记为 `fail` 且不再触碰文件系统, 底层原因
+            // 随行报告; 把它吞成"无备份"会让条目落进成功列的 `undo` 并移除链接.
+            let snapshot = match state.current {
                 Current::LinkedCorrect | Current::LinkedWrong => {
                     backup::find_latest_backup(&entry.target_path)
                 }
-                _ => None,
-            },
-            failure: None,
+                _ => Ok(None),
+            };
+            match snapshot {
+                Ok(backup) => UndoItem {
+                    entry,
+                    state,
+                    backup,
+                    failure: None,
+                },
+                Err(error) => UndoItem {
+                    entry,
+                    state,
+                    backup: None,
+                    failure: Some(error.to_string()),
+                },
+            }
         })
         .collect();
 
@@ -215,6 +229,11 @@ fn undo(manifest: &Manifest, states: &[EntryState]) -> Vec<ReportRow> {
     // (`Foreign*` / `Absent` / `SourceMissing` / `Unreadable` 下它不触碰任何路径);
     // 快照同时就是恢复动作的输入, 因此报告中写的备份路径与实际恢复的必然是同一个.
     for item in plan.iter_mut() {
+        // 快照阶段已失败的条目与 `Unreadable` 同类: 环境故障下什么也不移除, 避免
+        // "删掉了链接却不知道有无备份可恢复"造成的无谓破坏.
+        if item.failure.is_some() {
+            continue;
+        }
         let (entry, state) = (item.entry, item.state);
         if let Err(error) = undo::undo_entry(entry, state, item.backup.as_deref()) {
             item.failure = Some(error.to_string());
@@ -223,11 +242,7 @@ fn undo(manifest: &Manifest, states: &[EntryState]) -> Vec<ReportRow> {
 
     plan.into_iter()
         .map(|item| match item.failure {
-            Some(reason) => render::row_for(
-                item.entry,
-                EntryOutcome::Fail,
-                format!("操作失败: {reason}"),
-            ),
+            Some(reason) => render::fail_row(item.entry, &reason),
             None => render::row_from_state(
                 Command::Undo,
                 item.entry,
@@ -239,13 +254,4 @@ fn undo(manifest: &Manifest, states: &[EntryState]) -> Vec<ReportRow> {
             ),
         })
         .collect()
-}
-
-/// 执行动作失败的行.
-///
-/// 不能走 `row_from_state`: 它按**动手之前**的 `(Current, Action)` 导出 token, 而那
-/// 正是失败了的那个状态 (例如 `Create`). `render` 层为此保留 `row_for` 这一入口,
-/// 措辞与它内部 `fail` 分支的非 `Unreadable` 情形一致 (FR-016 的"失败原因").
-fn failure_row(entry: &Entry, error: &Error) -> ReportRow {
-    render::row_for(entry, EntryOutcome::Fail, format!("操作失败: {error}"))
 }

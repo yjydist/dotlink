@@ -10,99 +10,10 @@ use std::fs;
 use std::path::PathBuf;
 
 use predicates::str::contains;
-use support::TempEnv;
-
-/// 一次命令调用的观测结果.
-struct Run {
-    code: i32,
-    stdout: String,
-    stderr: String,
-}
-
-/// 运行 `dotlink <args...>` (cwd = 仓库根, HOME = 临时主目录).
-fn run(env: &TempEnv, args: &[&str]) -> Run {
-    let assert = env.cmd().args(args).assert();
-    let output = assert.get_output();
-    Run {
-        code: output.status.code().unwrap_or(-1),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    }
-}
-
-/// 构造清单: 每个条目为 `(source, target, on_conflict)`, 策略写 `"-"` 表示缺省.
-fn manifest_of(entries: &[(&str, &str, &str)]) -> String {
-    let mut text = String::new();
-    for (source, target, policy) in entries {
-        text.push_str("[[entry]]\n");
-        text.push_str(&format!("source = \"{source}\"\n"));
-        text.push_str(&format!("target = \"{target}\"\n"));
-        if *policy != "-" {
-            text.push_str(&format!("on_conflict = \"{policy}\"\n"));
-        }
-    }
-    text
-}
-
-/// 该行是否是逐条目行 (`<序号>/<总数> ...`).
-fn is_entry_line(line: &str) -> bool {
-    match line
-        .split_whitespace()
-        .next()
-        .and_then(|word| word.split_once('/'))
-    {
-        Some((index, total)) => index.parse::<usize>().is_ok() && total.parse::<usize>().is_ok(),
-        None => false,
-    }
-}
-
-/// 全部逐条目行 (排除末尾汇总行).
-fn entry_lines(stdout: &str) -> Vec<&str> {
-    stdout.lines().filter(|line| is_entry_line(line)).collect()
-}
-
-/// 含 `needle` 的那一行.
-#[track_caller]
-fn line_for<'a>(stdout: &'a str, needle: &str) -> &'a str {
-    stdout
-        .lines()
-        .find(|line| line.contains(needle))
-        .unwrap_or_else(|| panic!("输出中没有含 {needle} 的行:\n{stdout}"))
-}
-
-/// 行内的 token (第 2 个字段).
-#[track_caller]
-fn token_of(line: &str) -> &str {
-    line.split_whitespace()
-        .nth(1)
-        .unwrap_or_else(|| panic!("行内没有 token: {line}"))
-}
-
-/// 行内展示的 target (第 3 个字段, 即用户书写的原始字符串).
-#[track_caller]
-fn target_of(line: &str) -> &str {
-    line.split_whitespace()
-        .nth(2)
-        .unwrap_or_else(|| panic!("行内没有 target: {line}"))
-}
-
-/// 仓库 + HOME 的递归快照 (路径 + 文件内容 / 链接文本).
-fn snapshot_all(env: &TempEnv) -> Vec<(PathBuf, String)> {
-    let mut rows = env.snapshot(env.repo());
-    rows.extend(env.snapshot(env.home()));
-    rows.sort();
-    rows
-}
-
-/// 仓库根的**物理**路径.
-///
-/// 子进程的 `std::env::current_dir()` 返回物理路径 (macOS 上临时目录位于
-/// `/var/folders/...`, 即 `/private/var/folders/...`), 而 `TempEnv::repo()` 返回的是
-/// 未解析的那一份. 链接归属判定以物理路径为基准, 因此手工构造"已是最新"的链接时
-/// 必须用同一基准, 否则会构造出一个指向错误位置的链接 (得到 `wrong` 而非 `ok`).
-fn physical_repo(env: &TempEnv) -> PathBuf {
-    fs::canonicalize(env.repo()).expect("解析仓库根的物理路径")
-}
+use support::{
+    TempEnv, entry_lines, line_for, manifest_of, physical_repo, run, snapshot_all, target_of,
+    token_of,
+};
 
 // ---------------------------------------------------------------------------
 // T018 (a): 只读 (SC-006) -- 三种状态并存时执行前后完全一致

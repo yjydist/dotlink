@@ -7,84 +7,11 @@
 mod support;
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use support::TempEnv;
-
-/// 一次命令调用的观测结果.
-struct Run {
-    code: i32,
-    stdout: String,
-    #[allow(dead_code)]
-    stderr: String,
-}
-
-/// 运行 `dotlink <args...>` (cwd = 仓库根, HOME = 临时主目录).
-fn run(env: &TempEnv, args: &[&str]) -> Run {
-    let assert = env.cmd().args(args).assert();
-    let output = assert.get_output();
-    Run {
-        code: output.status.code().unwrap_or(-1),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    }
-}
-
-/// 构造清单: 每个条目为 `(source, target, on_conflict)`, 策略写 `"-"` 表示缺省.
-fn manifest_of(entries: &[(&str, &str, &str)]) -> String {
-    let mut text = String::new();
-    for (source, target, policy) in entries {
-        text.push_str("[[entry]]\n");
-        text.push_str(&format!("source = \"{source}\"\n"));
-        text.push_str(&format!("target = \"{target}\"\n"));
-        if *policy != "-" {
-            text.push_str(&format!("on_conflict = \"{policy}\"\n"));
-        }
-    }
-    text
-}
-
-/// 某目录下所有备份文件名 (含最终名与 `.partial` 残留).
-fn backups_in(dir: &Path) -> Vec<String> {
-    let names = fs::read_dir(dir)
-        .unwrap_or_else(|error| panic!("列举 {} 失败: {error}", dir.display()))
-        .flatten()
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|name| name.contains(".dotlink-backup."))
-        .collect::<Vec<_>>();
-    let mut names = names;
-    names.sort();
-    names
-}
-
-/// 从命令输出中取出备份文件的完整路径 (FR-016 的"必现信息").
-#[track_caller]
-fn backup_path_from_output(stdout: &str) -> PathBuf {
-    for word in stdout.split_whitespace() {
-        if !word.contains(".dotlink-backup.") {
-            continue;
-        }
-        for candidate in [
-            word.to_string(),
-            word.trim_end_matches([',', ';', '.', ')']).to_string(),
-        ] {
-            let path = PathBuf::from(&candidate);
-            if fs::symlink_metadata(&path).is_ok() {
-                return path;
-            }
-        }
-    }
-    panic!("输出中未给出可定位的备份文件完整路径: {stdout}");
-}
-
-#[track_caller]
-fn assert_token(run: &Run, token: &str) {
-    assert!(
-        run.stdout.split_whitespace().any(|word| word == token),
-        "输出中缺少 token {token}, 实际输出: {}",
-        run.stdout
-    );
-}
+use support::{
+    TempEnv, assert_token, backup_path_from_output, backups_in, manifest_of, run, running_as_root,
+};
 
 // ---------------------------------------------------------------------------
 // (a) 默认 skip: 原文件逐字未变, 且无备份文件产生
@@ -393,39 +320,44 @@ fn two_replacements_in_the_same_second_keep_both_backups() {
             .nth(1)
             .and_then(|rest| rest.split_once('.').map(|(_, serial)| serial.to_string()))
     };
+    // 备份名中 `<原名>.dotlink-backup.` 之后的部分再取时间戳段 (`<15 位时间戳>[.<序号>]`).
+    let stamp_of = |name: &str| {
+        name.split_once(".dotlink-backup.")
+            .map(|(_, rest)| rest.split('.').next().unwrap_or_default().to_string())
+            .unwrap_or_else(|| panic!("{name} 不是备份名"))
+    };
     assert_eq!(
         serial_of(&first_name),
         None,
         "第一个备份不应带序号: {first_name}"
     );
-    assert_eq!(
-        serial_of(&second_name).as_deref(),
-        Some("2"),
-        "第二个备份必须带序号 2: {second_name}"
-    );
+
+    // 两次替换跨过秒边界时, 第二次拿到的是新时间戳的裸名而非序号 -- 这同样满足
+    // "两个并存且互不覆盖". 序号断言仅在确属同一秒时做出, 使本测试不因墙钟走动而
+    // 抖动 (与 `src/backup.rs` 的同名单测同一处置).
+    if stamp_of(&second_name) == stamp_of(&first_name) {
+        assert_eq!(
+            serial_of(&second_name).as_deref(),
+            Some("2"),
+            "同一秒内的第二个备份必须以序号消歧: {second_name}"
+        );
+    } else {
+        assert_eq!(
+            serial_of(&second_name),
+            None,
+            "跨秒的第二次替换应得到新时间戳的裸名: {second_name}"
+        );
+        assert!(
+            stamp_of(&second_name) > stamp_of(&first_name),
+            "跨秒后的新时间戳必须更晚: {first_name} -> {second_name}"
+        );
+        eprintln!("两次替换跨过秒边界, 序号消歧未被触发: {first_name} -> {second_name}");
+    }
 }
 
 // ---------------------------------------------------------------------------
 // (i) 备份失败的原子性: 原对象保留, 且磁盘上不存在最终名的备份
 // ---------------------------------------------------------------------------
-
-/// 以 root 运行时权限位无效 (chmod 000 不阻止读取), 该断言只能跳过.
-fn running_as_root() -> bool {
-    let probe = std::env::temp_dir().join(format!("dotlink-root-probe-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&probe);
-    if fs::create_dir_all(&probe).is_err() {
-        return false;
-    }
-    let locked = probe.join("locked");
-    let outcome = fs::create_dir_all(&locked)
-        .and_then(|()| {
-            fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o000))
-        })
-        .and_then(|()| fs::read_dir(&locked).map(|_| ()));
-    let as_root = outcome.is_ok();
-    let _ = fs::remove_dir_all(&probe);
-    as_root
-}
 
 #[test]
 fn a_failed_backup_keeps_the_original_and_leaves_no_final_name() {

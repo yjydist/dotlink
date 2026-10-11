@@ -42,12 +42,16 @@ pub struct EntryState {
 
 /// 判定全部条目.
 ///
-/// 全函数只读: 只做两次 `lstat` 与一次 `read_link`, 不产生任何文件系统改动.
+/// 全函数只读, 不产生任何文件系统改动. 每条目固定做两次 `lstat` (源与目标各一);
+/// 目标是符号链接时再做一次 `read_link` 与一次 `os::normalize` (后者按段 lstat
+/// 链接目标的祖先段). 仓库根的 `normalize` 在本函数里只做一次, 不随条目数重复.
 pub fn classify(manifest: &Manifest) -> Vec<EntryState> {
+    // 仓库根在整个运行中不变, 其规范化提到循环外, 每次运行只算一次.
+    let repo_root = os::normalize(&manifest.repo_root);
     manifest
         .entries
         .iter()
-        .map(|entry| classify_entry(entry, &manifest.repo_root))
+        .map(|entry| classify_entry(entry, &repo_root))
         .collect()
 }
 
@@ -55,6 +59,8 @@ pub fn classify(manifest: &Manifest) -> Vec<EntryState> {
 ///
 /// 求值顺序严格为: 两次 `lstat` 的故障裁决 (`Unreadable` 先于表内各行) ->
 /// `SourceMissing` -> `Absent` -> 自上而下取首个命中者.
+///
+/// `repo_root` 必须已经过 `os::normalize` (由 [`classify`] 在循环外算一次).
 fn classify_entry(entry: &Entry, repo_root: &Path) -> EntryState {
     // 两次 lstat: source_path 与 target_path 各一次, 不做任何穿透.
     let source = lstat(&entry.source_path);
@@ -62,28 +68,30 @@ fn classify_entry(entry: &Entry, repo_root: &Path) -> EntryState {
 
     // 求值语义 1: 非 NotFound 的失败是环境故障; 它不是"某个条件命中", 而是
     // "表中各行的条件根本无法求值", 因此先于表中所有行, 且两侧独立裁决.
-    let source_side_failed = source
+    //
+    // 原因同样按侧独立透出: 双侧故障时只报源侧会让目标侧的故障无从诊断; 而拿另一侧
+    // (可能是 NotFound) 的错误文案充当本侧原因同样是误导.
+    let source_error = source
         .as_ref()
-        .is_err_and(|error| error.kind() != ErrorKind::NotFound);
-    let target_side_failed = target
+        .err()
+        .filter(|error| error.kind() != ErrorKind::NotFound);
+    let target_error = target
         .as_ref()
-        .is_err_and(|error| error.kind() != ErrorKind::NotFound);
-    if source_side_failed || target_side_failed {
-        let sides = match (source_side_failed, target_side_failed) {
-            (true, true) => "源侧与目标侧",
-            (true, false) => "源侧",
-            _ => "目标侧",
+        .err()
+        .filter(|error| error.kind() != ErrorKind::NotFound);
+    if source_error.is_some() || target_error.is_some() {
+        let detail = match (source_error, target_error) {
+            (Some(source), Some(target)) => {
+                format!("源侧与目标侧读取失败: 源侧 {source}; 目标侧 {target}")
+            }
+            (Some(source), None) => format!("源侧读取失败: {source}"),
+            (None, Some(target)) => format!("目标侧读取失败: {target}"),
+            (None, None) => unreachable!("至少一侧硬失败才会进入本分支"),
         };
-        let reason = source
-            .as_ref()
-            .err()
-            .or_else(|| target.as_ref().err())
-            .map(|error| error.to_string())
-            .unwrap_or_default();
         return EntryState {
             current: Current::Unreadable,
             action: Action::ReportUnreadable,
-            detail: format!("{sides}读取失败: {reason}"),
+            detail,
         };
     }
 
@@ -136,9 +144,9 @@ fn classify_entry(entry: &Entry, repo_root: &Path) -> EntryState {
         }
     };
     let actual = link_destination(&entry.target_path, &link_text);
-    let source = os::normalize(&entry.source_path);
-
-    if actual == source {
+    // `source_path` 已在 entry 层过 `os::normalize` (两侧同一套规范化语义, 见
+    // `entry.rs`), 直接比较即可, 不在循环里重复规范化.
+    if actual == entry.source_path {
         return new_state(
             Current::LinkedCorrect,
             "已是最新".to_string(),
@@ -148,12 +156,13 @@ fn classify_entry(entry: &Entry, repo_root: &Path) -> EntryState {
 
     // 归属分界 (research.md R2): 落在仓库内 -> 本工具的错误链接; 之外 -> 别人的链接.
     // 二者互斥且穷尽, 且都以同一个 os::normalize 为基准, 因此悬空链接也能正确归类.
+    // 判定直接复用上面已解析出的 `actual` 与循环外算好的仓库根, 不再重读链接.
     //
     // `detail` 与 `render.rs` 的分工 (`render` 不可改, 它按如下方式解释本字段):
     // `wrong` 行取"实际指向"; `foreign` 行取链接文本并自行冠以"符号链接";
     // `missing` 行冠以"仓库中不存在: <source>"; 其余行原样透出. 因此这里只放原始值.
     let link_text = link_text.display().to_string();
-    if os::link_is_inside_repo(&entry.target_path, repo_root) {
+    if os::is_inside_repo(&actual, repo_root) {
         new_state(Current::LinkedWrong, link_text, entry.on_conflict)
     } else {
         new_state(Current::ForeignLink, link_text, entry.on_conflict)

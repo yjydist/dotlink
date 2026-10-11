@@ -18,92 +18,13 @@ mod support;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use support::TempEnv;
+use support::{
+    TempEnv, entry_line_count, env_with_locked_target, line_for, manifest_of, run, running_as_root,
+    snapshot_all, token_of, unlock,
+};
 
 /// 四条命令.
 const COMMANDS: [&str; 4] = ["preview", "apply", "status", "undo"];
-
-/// 一次命令调用的观测结果.
-struct Run {
-    code: i32,
-    stdout: String,
-    stderr: String,
-}
-
-/// 运行 `dotlink <args...>` (cwd = 仓库根, HOME = 临时主目录).
-fn run(env: &TempEnv, args: &[&str]) -> Run {
-    let assert = env.cmd().args(args).assert();
-    let output = assert.get_output();
-    Run {
-        code: output.status.code().unwrap_or(-1),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    }
-}
-
-/// 仓库 + HOME 的递归快照 (路径 + 文件内容 / 链接文本).
-///
-/// `TempEnv` 的 HOME 是仓库**之内**的一个子目录, 因此 `repo()` 与 `home()` 的两次
-/// 递归会重叠出一份重复项; 这里按路径去重, 使"前后比对"不受重复影响.
-fn snapshot_all(env: &TempEnv) -> Vec<(PathBuf, String)> {
-    let mut rows = env.snapshot(env.repo());
-    rows.extend(env.snapshot(env.home()));
-    rows.sort();
-    rows.dedup();
-    rows
-}
-
-/// 该行是否是逐条目行 (`<序号>/<总数> ...`).
-fn is_entry_line(line: &str) -> bool {
-    match line
-        .split_whitespace()
-        .next()
-        .and_then(|word| word.split_once('/'))
-    {
-        Some((index, total)) => index.parse::<usize>().is_ok() && total.parse::<usize>().is_ok(),
-        None => false,
-    }
-}
-
-/// 含 `needle` 的那一行.
-#[track_caller]
-fn line_for<'a>(stdout: &'a str, needle: &str) -> &'a str {
-    stdout
-        .lines()
-        .find(|line| line.contains(needle))
-        .unwrap_or_else(|| panic!("输出中没有含 {needle} 的行:\n{stdout}"))
-}
-
-/// 行内的 token (第 2 个字段).
-#[track_caller]
-fn token_of(line: &str) -> &str {
-    line.split_whitespace()
-        .nth(1)
-        .unwrap_or_else(|| panic!("行内没有 token: {line}"))
-}
-
-/// 逐条目行数.
-fn entry_line_count(stdout: &str) -> usize {
-    stdout.lines().filter(|line| is_entry_line(line)).count()
-}
-
-/// 以 root 运行时权限位无效 (chmod 000 不阻止读取), 依赖 `EACCES` 的断言必须跳过.
-fn running_as_root() -> bool {
-    let probe = std::env::temp_dir().join(format!("dotlink-root-probe-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&probe);
-    if fs::create_dir_all(&probe).is_err() {
-        return false;
-    }
-    let locked = probe.join("locked");
-    let outcome = fs::create_dir_all(&locked)
-        .and_then(|()| {
-            fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o000))
-        })
-        .and_then(|()| fs::read_dir(&locked).map(|_| ()));
-    let as_root = outcome.is_ok();
-    let _ = fs::remove_dir_all(&probe);
-    as_root
-}
 
 /// 就**本次实际用到的那个目录**再确认一次: chmod 000 之后是否真的读不到.
 ///
@@ -111,30 +32,6 @@ fn running_as_root() -> bool {
 /// 是断言真正依赖的那个目录.
 fn permissions_are_ignored(locked: &Path) -> bool {
     fs::read_dir(locked).is_ok()
-}
-
-/// 一份"目标父目录不可进入"的清单与被打上 chmod 000 的目录.
-///
-/// 第一条目标是正常的 (用于断言"其余条目正常处理"), 第二条落在不可进入的目录里.
-fn locked_fixture() -> (TempEnv, PathBuf) {
-    let env = TempEnv::new();
-    env.write_source("shell/bashrc", "managed\n");
-    env.write_source("shell/zshrc", "managed-zsh\n");
-    env.write_manifest(
-        "[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"~/.bashrc\"\n\n\
-         [[entry]]\nsource = \"shell/zshrc\"\ntarget = \"~/.locked/rc\"\n",
-    );
-
-    let locked = env.home().join(".locked");
-    fs::create_dir_all(&locked).expect("创建目标父目录");
-    fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o000))
-        .expect("设置权限位");
-    (env, locked)
-}
-
-/// 恢复权限位, 使临时目录能被正常清理.
-fn unlock(dir: &Path) {
-    let _ = fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o755));
 }
 
 // ---------------------------------------------------------------------------
@@ -151,7 +48,7 @@ fn an_unreadable_entry_is_fail_under_every_command() {
     }
 
     for command in COMMANDS {
-        let (env, locked) = locked_fixture();
+        let (env, locked) = env_with_locked_target();
 
         // 若 chmod 000 在本环境里被绕过, 该用例会退化成"正常处理", 断言无意义.
         if permissions_are_ignored(&locked) {
@@ -296,8 +193,8 @@ fn a_nonexistent_path_is_reported_as_a_deviation_not_as_a_failure() {
     let env = TempEnv::new();
     env.write_source("shell/bashrc", "managed\n");
     env.write_manifest(&manifest_of(&[
-        ("shell/bashrc", "~/.bashrc"),
-        ("shell/gone", "~/.gone"),
+        ("shell/bashrc", "~/.bashrc", "-"),
+        ("shell/gone", "~/.gone", "-"),
     ]));
 
     let run = run(&env, &["status"]);
@@ -313,12 +210,49 @@ fn a_nonexistent_path_is_reported_as_a_deviation_not_as_a_failure() {
     );
 }
 
-/// 构造清单: 每个条目为 `(source, target)`.
-fn manifest_of(entries: &[(&str, &str)]) -> String {
-    entries
-        .iter()
-        .map(|(source, target)| {
-            format!("[[entry]]\nsource = \"{source}\"\ntarget = \"{target}\"\n")
-        })
-        .collect()
+// ---------------------------------------------------------------------------
+// 双侧都读不到: fail 行必须同时给出两侧原因 (不得只透出源侧)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_doubly_unreadable_entry_reports_the_reason_of_both_sides() {
+    if running_as_root() {
+        println!(
+            "跳过 a_doubly_unreadable_entry_reports_the_reason_of_both_sides: 当前以 root 运行, chmod 000 无效"
+        );
+        return;
+    }
+
+    let env = TempEnv::new();
+    // 源侧故障: 中间段是普通文件, lstat 报 "Not a directory" (非 NotFound 的硬失败).
+    env.write_source("shell/file", "not a directory\n");
+    // 目标侧故障: 父目录 chmod 000, lstat 报 "Permission denied".
+    env.write_manifest("[[entry]]\nsource = \"shell/file/rc\"\ntarget = \"~/.locked/rc\"\n");
+
+    let locked = env.home().join(".locked");
+    fs::create_dir_all(&locked).expect("创建目标父目录");
+    fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+        .expect("设置权限位");
+
+    if permissions_are_ignored(&locked) {
+        unlock(&locked);
+        println!(
+            "跳过 a_doubly_unreadable_entry_reports_the_reason_of_both_sides: 权限位在本环境无效"
+        );
+        return;
+    }
+
+    let run = run(&env, &["status"]);
+    unlock(&locked);
+
+    let line = line_for(&run.stdout, "~/.locked/rc");
+    assert_eq!(token_of(line), "fail", "两侧都读不到必须是 fail: {line}");
+    assert!(
+        line.contains("源侧 Not a directory"),
+        "fail 行必须给出源侧的原因 (只透出一侧会让另一侧无从诊断): {line}"
+    );
+    assert!(
+        line.contains("目标侧 Permission denied"),
+        "fail 行必须给出目标侧的原因 (只透出一侧会让另一侧无从诊断): {line}"
+    );
 }

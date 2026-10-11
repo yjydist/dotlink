@@ -4,11 +4,14 @@
 //! "实现时不得在 `render.rs` 里另起一套 token 命名"; 其反面同样成立 -- token 与
 //! 分列口径只在这里确定, 各命令接入时不得自行拼凑.
 //!
-//! 三个导出面各有分工, 调用者只要不绕过它们, 结论就必然一致:
+//! 导出面各有分工, 调用者只要不绕过它们, 结论就必然一致:
 //!
 //! - [`token_for`]: `(命令, Current, Action, 同目录是否有备份)` -> token;
-//! - [`row_for`]: 由同一次判定同时产出 token 与说明, 保证二者不会错配;
+//! - [`row_from_state`]: 由同一次判定同时产出 token 与说明, 保证二者不会错配;
+//! - [`fail_row`]: 执行失败行的**唯一**构造点, "操作失败"措辞只在这里拼写;
 //! - [`render`]: 逐条目行 (含 `<序号>/<总数>`) 与末尾汇总.
+//!
+//! [`row_for`] 是上述入口共用的组装原语: token 与说明都已定, 它只负责落进报告行.
 
 use std::path::Path;
 
@@ -80,7 +83,8 @@ pub fn token_name(token: EntryOutcome) -> &'static str {
 /// 由判定结果与模块内计算出的 token 组装一行.
 ///
 /// `token` 必须来自 [`token_for`] (由 `row_for` 保证), 这样说明措辞与 token 不会错配.
-pub fn row_for(entry: &Entry, token: EntryOutcome, note: String) -> ReportRow {
+/// 只是模块内的组装原语: 命令接入请走 [`row_from_state`] 或 [`fail_row`].
+fn row_for(entry: &Entry, token: EntryOutcome, note: String) -> ReportRow {
     ReportRow {
         target_display: entry.target.clone(),
         token,
@@ -104,6 +108,24 @@ pub fn row_from_state(
     let token = token_for(command, current, action, has_backup);
     let note = note_for_token(command, token, entry, current, detail, backup_path);
     row_for(entry, token, note)
+}
+
+/// 执行失败行 (`fail`) 的**唯一**构造点: token 与"操作失败"措辞同出一处 (FR-016).
+///
+/// 不能走 [`row_from_state`]: 它按**动手之前**的 `(Current, Action)` 导出 token, 而那
+/// 正是失败了的那个状态 (例如 `Create`). 动作失败 (含 `undo` 的备份快照 / 移除恢复
+/// 失败) 一律从这里产出, 使"操作失败: {原因}"的拼写全仓只有这一处.
+pub fn fail_row(entry: &Entry, reason: &str) -> ReportRow {
+    row_for(entry, EntryOutcome::Fail, fail_note(reason))
+}
+
+/// `fail` 行非 `Unreadable` 情形的说明措辞: 有原因给"操作失败: {原因}",
+/// 原因空白时给裸的"操作失败". [`note_for_token`] 与 [`fail_row`] 共用它.
+fn fail_note(detail: &str) -> String {
+    match non_empty(detail) {
+        Some(reason) => format!("操作失败: {reason}"),
+        None => "操作失败".to_string(),
+    }
 }
 
 /// 人类可读说明 (FR-016 的必现信息都落在这里).
@@ -130,7 +152,7 @@ pub fn note_for(
 /// 逐条目行 (`<序号>/<总数> <token> <用户书写的 target> <说明>`) 与末尾汇总.
 ///
 /// 第三列是**用户书写的原始 `entry.target` 字符串**, 不是解析后的绝对路径;
-/// 每行末尾换行; 最后一行是汇总. 无条目时只输出汇总.
+/// 每行末尾换行; 最后一行是汇总.
 pub fn render(rows: &[ReportRow]) -> String {
     let total = rows.len();
     let mut out = String::new();
@@ -347,10 +369,7 @@ fn note_for_token(
         ),
         EntryOutcome::Fail => match current {
             Current::Unreadable => format!("无法判定: {}", unreadable_detail(entry, detail)),
-            _ => match non_empty(detail) {
-                Some(reason) => format!("操作失败: {reason}"),
-                None => "操作失败".to_string(),
-            },
+            _ => fail_note(detail),
         },
     }
 }

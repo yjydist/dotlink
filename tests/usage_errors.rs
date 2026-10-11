@@ -78,3 +78,47 @@ fn usage_errors_do_not_touch_the_filesystem() {
         "调用方式错误不得触碰文件系统"
     );
 }
+
+/// SC-009 / `contracts/cli.md` 的 T041: 退出码 2 的双重含义必须写进帮助文本.
+///
+/// 断言只锁定两个稳定标记 -- 语义标题 "退出码" 与区分判据 "unrecognized subcommand",
+/// 不钉全文措辞.
+#[track_caller]
+fn assert_help_spells_out_exit_code_semantics(args: &[&str]) {
+    let env = TempEnv::new();
+    let observed = env.cmd().args(args).assert().code(0);
+    let text = String::from_utf8_lossy(&observed.get_output().stdout);
+    assert!(
+        text.contains("退出码"),
+        "`{args:?}` 的帮助文本必须含退出码语义说明:\n{text}"
+    );
+    assert!(
+        text.contains("unrecognized subcommand"),
+        "`{args:?}` 的帮助文本必须给出退出码 2 两重含义的区分判据:\n{text}"
+    );
+}
+
+#[test]
+fn root_help_documents_exit_code_semantics() {
+    assert_help_spells_out_exit_code_semantics(&["--help"]);
+}
+
+#[test]
+fn preview_help_documents_exit_code_semantics() {
+    assert_help_spells_out_exit_code_semantics(&["preview", "--help"]);
+}
+
+#[test]
+fn apply_help_documents_exit_code_semantics() {
+    assert_help_spells_out_exit_code_semantics(&["apply", "--help"]);
+}
+
+#[test]
+fn status_help_documents_exit_code_semantics() {
+    assert_help_spells_out_exit_code_semantics(&["status", "--help"]);
+}
+
+#[test]
+fn undo_help_documents_exit_code_semantics() {
+    assert_help_spells_out_exit_code_semantics(&["undo", "--help"]);
+}

@@ -13,82 +13,10 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use support::TempEnv;
-
-/// 一次命令调用的观测结果.
-struct Run {
-    code: i32,
-    stdout: String,
-    #[allow(dead_code)]
-    stderr: String,
-}
-
-/// 运行 `dotlink <args...>` (cwd = 仓库根, HOME = 临时主目录).
-fn run(env: &TempEnv, args: &[&str]) -> Run {
-    let assert = env.cmd().args(args).assert();
-    let output = assert.get_output();
-    Run {
-        code: output.status.code().unwrap_or(-1),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    }
-}
-
-/// 构造清单: 每个条目为 `(source, target, on_conflict)`, 策略写 `"-"` 表示缺省.
-fn manifest_of(entries: &[(&str, &str, &str)]) -> String {
-    let mut text = String::new();
-    for (source, target, policy) in entries {
-        text.push_str("[[entry]]\n");
-        text.push_str(&format!("source = \"{source}\"\n"));
-        text.push_str(&format!("target = \"{target}\"\n"));
-        if *policy != "-" {
-            text.push_str(&format!("on_conflict = \"{policy}\"\n"));
-        }
-    }
-    text
-}
-
-/// 该行是否是逐条目行 (`<序号>/<总数> ...`), 用于把末尾汇总行排除在外.
-fn is_entry_line(line: &str) -> bool {
-    match line
-        .split_whitespace()
-        .next()
-        .and_then(|word| word.split_once('/'))
-    {
-        Some((index, total)) => index.parse::<usize>().is_ok() && total.parse::<usize>().is_ok(),
-        None => false,
-    }
-}
-
-/// 全部逐条目行 (排除末尾汇总行).
-fn entry_lines(stdout: &str) -> Vec<&str> {
-    stdout.lines().filter(|line| is_entry_line(line)).collect()
-}
-
-/// 含 `needle` 的那一行.
-#[track_caller]
-fn line_for<'a>(stdout: &'a str, needle: &str) -> &'a str {
-    stdout
-        .lines()
-        .find(|line| line.contains(needle))
-        .unwrap_or_else(|| panic!("输出中没有含 {needle} 的行:\n{stdout}"))
-}
-
-/// 行内的 token (第 2 个字段).
-#[track_caller]
-fn token_of(line: &str) -> &str {
-    line.split_whitespace()
-        .nth(1)
-        .unwrap_or_else(|| panic!("行内没有 token: {line}"))
-}
-
-/// 行内展示的 target (第 3 个字段, 即用户书写的原始字符串).
-#[track_caller]
-fn target_of(line: &str) -> &str {
-    line.split_whitespace()
-        .nth(2)
-        .unwrap_or_else(|| panic!("行内没有 target: {line}"))
-}
+use support::{
+    Run, TempEnv, entry_lines, line_for, manifest_of, physical_repo, run, snapshot_all, target_of,
+    token_of,
+};
 
 /// 断言每一次条目行的 token 都是 `token`.
 #[track_caller]
@@ -125,32 +53,10 @@ fn assert_summary(run: &Run, expected: &str) {
     );
 }
 
-/// 仓库根的**物理**路径.
-///
-/// 子进程的 `std::env::current_dir()` 返回物理路径 (macOS 上临时目录位于
-/// `/var/folders/...`, 即 `/private/var/folders/...`), 而 `TempEnv::repo()` 返回的是
-/// 未解析的那一份. `apply` 建立的链接以子进程看到的路径为文本, 因此以夹具的
-/// `assert_symlink_to` 断言时必须用同一基准 -- 该夹具的比较是**纯词法**的, 不做
-/// 符号链接解析, 两种书写形态在它眼中是不同的路径.
-fn physical_repo(env: &TempEnv) -> PathBuf {
-    fs::canonicalize(env.repo()).expect("解析仓库根的物理路径")
-}
-
 /// 断言 `link` 指向仓库中的 `source`.
 #[track_caller]
 fn assert_link(env: &TempEnv, link: &std::path::Path, source: &str) {
     env.assert_symlink_to(link, &physical_repo(env).join(source));
-}
-
-/// 仓库 + HOME 的递归快照 (路径 + 文件内容 / 链接文本).
-///
-/// HOME 位于仓库之内 (夹具如此), 两份快照会重叠; 重叠部分在前后两次中一致, 因此
-/// 不影响"零改动"的判定.
-fn snapshot_all(env: &TempEnv) -> Vec<(PathBuf, String)> {
-    let mut rows = env.snapshot(env.repo());
-    rows.extend(env.snapshot(env.home()));
-    rows.sort();
-    rows
 }
 
 /// 快照中是否出现了备份文件 (`<原名>.dotlink-backup.*`).

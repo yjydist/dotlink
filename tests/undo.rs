@@ -7,88 +7,12 @@
 mod support;
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 
-use support::TempEnv;
-
-/// 一次命令调用的观测结果.
-struct Run {
-    code: i32,
-    stdout: String,
-    #[allow(dead_code)]
-    stderr: String,
-}
-
-/// 运行 `dotlink <args...>` (cwd = 仓库根, HOME = 临时主目录).
-fn run(env: &TempEnv, args: &[&str]) -> Run {
-    let assert = env.cmd().args(args).assert();
-    let output = assert.get_output();
-    Run {
-        code: output.status.code().unwrap_or(-1),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    }
-}
-
-/// 构造清单: 每个条目为 `(source, target, on_conflict)`, 策略写 `"-"` 表示缺省.
-fn manifest_of(entries: &[(&str, &str, &str)]) -> String {
-    let mut text = String::new();
-    for (source, target, policy) in entries {
-        text.push_str("[[entry]]\n");
-        text.push_str(&format!("source = \"{source}\"\n"));
-        text.push_str(&format!("target = \"{target}\"\n"));
-        if *policy != "-" {
-            text.push_str(&format!("on_conflict = \"{policy}\"\n"));
-        }
-    }
-    text
-}
-
-/// 某目录下所有备份文件名.
-fn backups_in(dir: &Path) -> Vec<String> {
-    let mut names: Vec<String> = fs::read_dir(dir)
-        .unwrap_or_else(|error| panic!("列举 {} 失败: {error}", dir.display()))
-        .flatten()
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|name| name.contains(".dotlink-backup."))
-        .collect();
-    names.sort();
-    names
-}
-
-/// 从命令输出中取出备份来源路径 (FR-016 的"必现信息").
-#[track_caller]
-fn backup_path_from_output(stdout: &str) -> PathBuf {
-    for word in stdout.split_whitespace() {
-        if !word.contains(".dotlink-backup.") {
-            continue;
-        }
-        let candidate = PathBuf::from(word.trim_end_matches([',', ';', '.', ')']));
-        if fs::symlink_metadata(&candidate).is_ok() {
-            return candidate;
-        }
-    }
-    panic!("输出中未给出可定位的备份来源路径: {stdout}");
-}
-
-/// 输出中某一行 (逐条目行, 排除末尾汇总行).
-#[track_caller]
-fn line_containing(run: &Run, needle: &str) -> String {
-    run.stdout
-        .lines()
-        .find(|line| line.contains(needle))
-        .unwrap_or_else(|| panic!("输出中没有含 {needle} 的行: {}", run.stdout))
-        .to_string()
-}
-
-#[track_caller]
-fn assert_token(run: &Run, token: &str) {
-    assert!(
-        run.stdout.split_whitespace().any(|word| word == token),
-        "输出中缺少 token {token}, 实际输出: {}",
-        run.stdout
-    );
-}
+use support::{
+    TempEnv, assert_token, backup_path_from_output, backups_in, line_for, manifest_of, run, unlock,
+};
 
 /// 已部署的环境: 源在仓库中, 目标是指向源的链接.
 fn deployed(env: &TempEnv, source: &str, target: &str) -> PathBuf {
@@ -134,7 +58,7 @@ fn undo_restores_the_previous_content_and_reports_the_backup_source() {
         "undo 的目标谓词在动手之前求值: 撤销了东西 (restore) 故退 1; stdout:\n{}",
         undone.stdout
     );
-    let line = line_containing(&undone, "restore");
+    let line = line_for(&undone.stdout, "restore");
     assert!(
         line.contains(&backup.display().to_string()),
         "restore 行必须给出备份文件的完整路径: {line}"
@@ -213,7 +137,7 @@ fn undo_skips_a_real_directory_and_keeps_its_content() {
     );
     env.assert_content(&target.join("nested/keep"), "keep me\n");
     assert!(
-        line_containing(&undone, "skip").contains("目录"),
+        line_for(&undone.stdout, "skip").contains("目录"),
         "skip 行必须说明原因与占用物类型"
     );
 }
@@ -447,4 +371,133 @@ fn undo_never_creates_a_state_or_index_file() {
             row.0.display()
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// 同一秒内 10 个并存备份: 恢复序号数值最大的 `.10`, 不是字典序最大的 `.9`
+// ---------------------------------------------------------------------------
+
+/// 同一秒同路径产生 bare / `.2` ... `.10` 共 10 个备份后, `undo` 必须恢复**真正最新**
+/// 的 `.10` 并报告 `restore` (FR-016 给出备份来源路径).
+///
+/// "最新"是 (时间戳, 序号) 的序: 同一秒内 bare 是第 1 个, 序号逐一递增到 10. 若按
+/// 整名字典序取最大, `.9` 会压过 `.10`, 恢复出来的就不是最新的备份.
+#[test]
+fn undo_restores_the_newest_of_ten_same_second_backups() {
+    let env = TempEnv::new();
+    env.write_source("shell/bashrc", "managed\n");
+    env.write_manifest(&manifest_of(&[("shell/bashrc", "~/.bashrc", "-")]));
+
+    let applied = run(&env, &["apply"]);
+    assert_eq!(applied.code, 0, "{}", applied.stdout);
+
+    // 手工摆出"同一秒内产生 10 个备份"之后的名字集合 (bare, .2 ... .10), 时间戳取
+    // 定值使本用例不依赖墙钟: 名字集合与工具在同一秒内替换 10 次的结果逐一相同,
+    // 第 N 个备份的内容记为 backup-{N-1}.
+    let home = env.home();
+    let mut backups = Vec::new();
+    for round in 0..10usize {
+        let name = if round == 0 {
+            ".bashrc.dotlink-backup.20260101T000000".to_string()
+        } else {
+            format!(".bashrc.dotlink-backup.20260101T000000.{}", round + 1)
+        };
+        let path = home.join(&name);
+        fs::write(&path, format!("backup-{round}")).unwrap();
+        backups.push(path);
+    }
+    let newest = backups.last().unwrap().clone();
+
+    let undone = run(&env, &["undo"]);
+    assert_token(&undone, "restore");
+    assert_eq!(
+        undone.code, 1,
+        "撤销了东西 (restore) 故退 1; stdout:\n{}",
+        undone.stdout
+    );
+
+    env.assert_content(&home.join(".bashrc"), "backup-9");
+    let line = line_for(&undone.stdout, "restore");
+    assert!(
+        line.contains(&newest.display().to_string()),
+        "restore 行必须给出真正最新的备份 (.10) 的完整路径: {line}"
+    );
+    for path in &backups {
+        assert!(
+            fs::symlink_metadata(path).is_ok(),
+            "备份文件本身必须保留: {}",
+            path.display()
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 备份查找的目录读取故障: 报 fail 且给出底层原因, 不是成功列的 "无备份可恢复"
+// ---------------------------------------------------------------------------
+
+/// 父目录可进入 (lstat 得到链接) 但不可列举 (read_dir 失败): 判定照常得出
+/// `LinkedCorrect`, 而备份查找是环境故障. 该条目必须报 `fail` 并给出底层原因, 且与
+/// `Unreadable` 同类处置 -- 不移除链接. 若把列举故障吞成"无备份", 该条目会被报成
+/// 成功列的 `undo`, 链接也会被移除.
+#[test]
+fn undo_reports_fail_with_the_cause_when_backups_cannot_be_listed() {
+    let env = TempEnv::new();
+    env.write_source("shell/zshrc", "managed-zsh\n");
+    env.write_manifest(&manifest_of(&[("shell/zshrc", "~/.locked/rc", "-")]));
+
+    let applied = run(&env, &["apply"]);
+    assert_eq!(applied.code, 0, "{}", applied.stdout);
+
+    let locked = env.home().join(".locked");
+    let target = locked.join("rc");
+    assert!(
+        fs::symlink_metadata(&target)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "前置部署必须留下链接"
+    );
+
+    // 可进入 (x) 不可列举 (r): 判定与备份查找所需权限正交, 这正是"判定成功而备份
+    // 查找失败"的最小夹具. 以 root 运行时权限位无效, 该断言必须跳过.
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o333)).unwrap();
+    if fs::read_dir(&locked).is_ok() {
+        unlock(&locked);
+        println!(
+            "跳过 undo_reports_fail_with_the_cause_when_backups_cannot_be_listed: 权限位在本环境无效"
+        );
+        return;
+    }
+
+    let undone = run(&env, &["undo"]);
+    unlock(&locked);
+
+    assert_eq!(undone.code, 1, "stdout:\n{}", undone.stdout);
+    let line = line_for(&undone.stdout, "~/.locked/rc");
+    assert_eq!(
+        line.split_whitespace().nth(1),
+        Some("fail"),
+        "备份查找故障必须报 fail, 不得落进成功列的 undo: {line}"
+    );
+    assert!(
+        line.contains("Permission denied"),
+        "fail 行必须给出底层原因: {line}"
+    );
+    assert!(
+        undone
+            .stdout
+            .lines()
+            .last()
+            .unwrap_or_default()
+            .contains("1 失败"),
+        "该条目必须计入汇总的 `失败` 列: {}",
+        undone.stdout
+    );
+    assert!(
+        fs::symlink_metadata(&target)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "环境故障下不得移除链接 (与 Unreadable 同类处置)"
+    );
 }

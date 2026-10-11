@@ -1,9 +1,10 @@
-//! 清单解析与全量校验 (V-1 到 V-8).
+//! 清单解析与全量校验 (V-1 到 V-10).
 
 use std::path::Path;
 
 use crate::entry::{self, Entry, OnConflict};
 use crate::error::{Error, Result};
+use crate::os;
 
 /// 清单文件的固定名字: 当前工作目录下的这一个, 不向上搜索父目录 (FR-015).
 const MANIFEST_NAME: &str = "dotlink.toml";
@@ -55,9 +56,12 @@ pub fn load() -> Result<Manifest> {
 /// 文件系统改动. 校验规则 V-1 到 V-8 见 `data-model.md` 第 1 节, 逐条对应如下:
 /// V-2 语法 (本函数前半), V-3 条目非空, V-4 两字段非空, V-5 目标路径互不重复,
 /// V-6 目标可解析为绝对路径, V-7 `on_conflict` 取值合法, V-8 只出现已定义的键.
+/// V-9 (目标落点不得退化) 与 V-10 (目标不得自指) 是其后新增的两条落点校验,
+/// 定义见 `contracts/manifest.md`.
 ///
 /// 不校验的三件事: 源条目在仓库中是否存在 (那是运行时状态 `SourceMissing`),
-/// `target` 是否与某个 `source` 指向同一路径 (自指清单合法), 以及条目数量上限.
+/// `target` 是否与**其他条目**的 `source` 指向同一路径 (与本条目自己的 `source`
+/// 重合已由 V-10 整体拒绝), 以及条目数量上限.
 pub fn parse(text: &str, repo_root: &Path) -> Result<Manifest> {
     // 手工从 `toml::Table` 读而不是反序列化进一个 `#[derive(Deserialize)]` 的中间
     // 结构: `#[serde(deny_unknown_fields)]` 的错误里没有条目下标, 而 V-4 到 V-8 都
@@ -91,6 +95,8 @@ pub fn parse(text: &str, repo_root: &Path) -> Result<Manifest> {
     }
 
     let mut entries: Vec<Entry> = Vec::with_capacity(written_entries.len());
+    // V-9 的仓库形态比较基准: 归一化后的仓库根 (与 `entry::resolve` 的越界判定同源).
+    let repo = os::normalize(repo_root);
 
     for (index, written) in written_entries.iter().enumerate() {
         let Some(table) = written.as_table() else {
@@ -131,6 +137,20 @@ pub fn parse(text: &str, repo_root: &Path) -> Result<Manifest> {
                 )
             })?;
 
+        // V-9: 目标落点不得退化 (文件系统根 / 主目录 / 仓库根本身或其祖先).
+        reject_degenerate_target(index, &resolved, &repo)?;
+        // V-10: 目标不得指向本条目自己的 source -- 归一化后重合时建出的链接指向
+        // 自己, 恒为断链. 只与**本条目**比较: 跨条目的重合属判定阶段的冲突.
+        if resolved.target_path == resolved.source_path {
+            return Err(invalid_entry(
+                index,
+                format!(
+                    "`{target}` 归一化后与本条目的 `{SOURCE_KEY}` 相同 (均为 `{}`): 自指链接恒为断链",
+                    resolved.target_path.display()
+                ),
+            ));
+        }
+
         // V-5: 比较 `os::normalize` 之后的 `target_path` (由 `resolve` 产出).
         // 不得用 `Path::canonicalize`: 待部署的目标通常尚不存在.
         if let Some(previous) = entries
@@ -138,7 +158,7 @@ pub fn parse(text: &str, repo_root: &Path) -> Result<Manifest> {
             .position(|existing| existing.target_path == resolved.target_path)
         {
             return Err(Error::ManifestInvalid(format!(
-                "条目 {previous} (`{}`) 与条目 {index} (`{}`) 声明了同一个目标路径: {}",
+                "条目 `{}` 与条目 `{}` 声明了同一个目标路径: {}",
                 entry_label(previous),
                 entry_label(index),
                 resolved.target_path.display()
@@ -230,14 +250,54 @@ fn parse_on_conflict(table: &toml::Table, index: usize) -> Result<OnConflict> {
     }
 }
 
-/// 条目级校验失败的统一说明: V-4 到 V-8 的每一条都必须能指出条目下标.
+/// 条目级校验失败的统一说明: V-4 到 V-10 的每一条都必须能指出条目下标.
+///
+/// 下标只以 `entry[{index}]` 的形态出现一次.
 fn invalid_entry(index: usize, detail: impl std::fmt::Display) -> Error {
-    Error::ManifestInvalid(format!("条目 {index} (`{}`): {detail}", entry_label(index)))
+    Error::ManifestInvalid(format!("条目 `{}`: {detail}", entry_label(index)))
 }
 
 /// 条目下标的写法: `entry[3]`.
 fn entry_label(index: usize) -> String {
     format!("{ENTRY_KEY}[{index}]")
+}
+
+/// V-9: 目标落点不得退化 -- 归一化后命中以下位置之一即整体拒绝.
+///
+/// 三个落点的共同点是命中它们的条目一旦落地 (`replace_and_backup` 尤甚) 就会毁掉
+/// 远超单个链接范围的内容: 文件系统根或主目录本身被替换备份, 毁掉的是一整棵树;
+/// 仓库根本身或其祖先被替换备份, 毁掉的是源仓库. `.` / `..` / 裸 `~` 都是极易写出
+/// 的笔误形态, 与 V-6 的立场一致, 静默放行比报错危险得多.
+fn reject_degenerate_target(index: usize, entry: &Entry, repo: &Path) -> Result<()> {
+    let written = &entry.target;
+    let landing = &entry.target_path;
+
+    // 落点已过 `os::normalize`, 文件系统根的形态恰是 `/` (任何上溯都被 `normalize`
+    // 停在根).
+    if landing.as_path() == Path::new("/") {
+        return Err(invalid_entry(
+            index,
+            format!("`{written}` 归一化后是文件系统根: 不能以整个文件系统根为落点"),
+        ));
+    }
+    // 主目录: 裸 `~` 与书成绝对路径的等价形态. HOME 无法确定时不作比较 -- 需要
+    // HOME 的 `~` 形态已由 V-6 报错, 绝对路径不得因缺 HOME 而被拒.
+    if let Ok(home) = entry::home()
+        && landing.as_path() == os::normalize(&home).as_path()
+    {
+        return Err(invalid_entry(
+            index,
+            format!("`{written}` 归一化后是当前用户主目录: 不能以主目录本身为落点"),
+        ));
+    }
+    // 仓库根本身或其祖先 (`.` / `..` 之类): 落点覆盖源仓库.
+    if repo.starts_with(landing) {
+        return Err(invalid_entry(
+            index,
+            format!("`{written}` 归一化后是仓库根本身或其祖先: 不能以源仓库为落点"),
+        ));
+    }
+    Ok(())
 }
 
 /// V-8 说明中的合法键清单.
@@ -266,7 +326,14 @@ mod tests {
     /// 子串形式锁定这三类信息.
     #[track_caller]
     fn assert_invalid(text: &str, needles: &[&str]) {
-        let error = parse(text, &repo())
+        assert_invalid_at(text, &repo(), needles);
+    }
+
+    /// 同上, 但可指定仓库根 (V-9 的"祖先"形态需要比 `/repo` 更深的仓库根才能
+    /// 与文件系统根区分开).
+    #[track_caller]
+    fn assert_invalid_at(text: &str, repo_root: &Path, needles: &[&str]) {
+        let error = parse(text, repo_root)
             .err()
             .unwrap_or_else(|| panic!("期望整体拒绝, 实际接受了这份清单:\n{text}"));
         let message = match error {
@@ -560,6 +627,94 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // V-9: 目标落点不得退化 (文件系统根 / 当前用户主目录 / 仓库根本身或其祖先)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn v9_the_file_system_root_target_is_rejected() {
+        assert_invalid(
+            "[[entry]]\nsource = \"a\"\ntarget = \"/\"\n",
+            &["entry[0]", "文件系统根", "`/`"],
+        );
+    }
+
+    #[test]
+    fn v9_the_home_target_is_rejected() {
+        // 裸 `~` 与书成绝对路径的等价形态都归一化到主目录本身.
+        assert_invalid(
+            "[[entry]]\nsource = \"a\"\ntarget = \"~\"\n",
+            &["entry[0]", "主目录", "`~`"],
+        );
+        let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) else {
+            return;
+        };
+        let written = PathBuf::from(home);
+        assert_invalid(
+            &format!(
+                "[[entry]]\nsource = \"a\"\ntarget = \"{}\"\n",
+                written.display()
+            ),
+            &["entry[0]", "主目录"],
+        );
+    }
+
+    #[test]
+    fn v9_the_repo_root_and_its_ancestors_are_rejected() {
+        // 仓库根取深一层的路径: 对 `/repo` 而言唯一的祖先是文件系统根, 会先命中
+        // V-9 的第一条, 测不到"祖先"这一形态.
+        let repo_root = Path::new("/a/b/repo");
+        for written in [".", "..", "sub/../.."] {
+            assert_invalid_at(
+                &format!("[[entry]]\nsource = \"a\"\ntarget = \"{written}\"\n"),
+                repo_root,
+                &["entry[0]", "仓库根本身或其祖先", &format!("`{written}`")],
+            );
+        }
+    }
+
+    #[test]
+    fn v9_legal_target_shapes_are_not_harmed() {
+        // `~/sub` 不是主目录本身; `/etc/hosts` 这类绝对路径与相对仓库根的
+        // `link/bashrc` 都各有合法形态.
+        let text = "[[entry]]\nsource = \"a\"\ntarget = \"~/sub\"\n\n[[entry]]\nsource = \"b\"\ntarget = \"/etc/hosts\"\n\n[[entry]]\nsource = \"c\"\ntarget = \"link/bashrc\"\n";
+        let manifest = parse(text, &repo()).expect("合法落点不得被误伤");
+        assert_eq!(manifest.entries.len(), 3);
+        assert_eq!(
+            manifest.entries[1].target_path,
+            crate::os::normalize(Path::new("/etc/hosts"))
+        );
+        assert_eq!(
+            manifest.entries[2].target_path,
+            crate::os::normalize(&repo().join("link/bashrc"))
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // V-10: 目标不得指向本条目自己的 source (自指链接恒为断链)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn v10_a_self_referential_target_is_rejected() {
+        assert_invalid(
+            "[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"shell/bashrc\"\n",
+            &["entry[0]", "自指", "shell/bashrc"],
+        );
+        // 书写形态不同, 归一化后仍是同一条路径.
+        assert_invalid(
+            "[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"shell/../shell/bashrc\"\n",
+            &["entry[0]", "自指"],
+        );
+    }
+
+    #[test]
+    fn v10_a_target_that_differs_from_its_source_is_accepted() {
+        // 只与本条目比较: 跨条目的重合 (a 的 target 是 b 的 source) 不属自指.
+        let text = "[[entry]]\nsource = \"a\"\ntarget = \"b\"\n\n[[entry]]\nsource = \"b\"\ntarget = \"c\"\n";
+        let manifest = parse(text, &repo()).expect("跨条目重合不属自指");
+        assert_eq!(manifest.entries.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
     // 校验范围之外的形态: 必须被接受
     // -----------------------------------------------------------------------
 
@@ -576,17 +731,6 @@ mod tests {
             manifest.entries[1].on_conflict,
             OnConflict::ReplaceAndBackup
         );
-    }
-
-    #[test]
-    fn a_self_referential_manifest_is_still_valid() {
-        // 校验不比较 target 与 source: 二者的重合由判定阶段的 conflict 暴露
-        let text = "[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"shell/bashrc\"\n";
-        let entry = parse(text, &repo())
-            .expect("自指清单合法")
-            .entries
-            .remove(0);
-        assert_eq!(entry.source_path, entry.target_path);
     }
 
     #[test]

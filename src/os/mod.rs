@@ -1,6 +1,6 @@
 //! 符号链接, 路径规范化与归属判定的平台层.
 //!
-//! `normalize` 与 `link_is_inside_repo` 是纯组件运算, 可在任何平台编译;
+//! `normalize` 与 `is_inside_repo` 是纯组件运算, 可在任何平台编译;
 //! 三个符号链接原语在 unix 下由 `unix.rs` 提供, 其他平台给出可编译的空实现,
 //! 使二进制在 Windows 上仍能构建成功 (运行时由平台门禁拒绝, 见 `research.md` R6).
 
@@ -245,26 +245,14 @@ pub fn normalize(path: &Path) -> PathBuf {
     }
 }
 
-/// 判断 `link_path` 上的符号链接是否由本工具创建 (即落在 `repo_root` 之内).
+/// 判断链接的解析目标是否落在 `repo_root` 之内 (即该链接由本工具创建).
 ///
-/// 读链接原始文本 -> 解析为绝对路径 (相对链接以链接所在目录为基准) -> 两侧都过
-/// `normalize` -> 判断是否等于 `repo_root` 或落于其下. 读不到链接或该路径不是
-/// 符号链接时返回 false.
-pub fn link_is_inside_repo(link_path: &Path, repo_root: &Path) -> bool {
-    let Ok(raw) = read_link(link_path) else {
-        return false;
-    };
-    let absolute = if raw.is_absolute() {
-        raw
-    } else {
-        match link_path.parent() {
-            Some(parent) => parent.join(raw),
-            None => raw,
-        }
-    };
-    let link = normalize(&absolute);
-    let repo = normalize(repo_root);
-    link.starts_with(&repo)
+/// 归属分界 (research.md R2) 的唯一口径: 仓库内 -> 本工具的错误链接; 之外 -> 别人的
+/// 链接. 落在 `repo_root` 自身上也算在内. 两侧都必须已经过 [`normalize`] -- 链接目标
+/// 由调用方从链接文本解析得出, 仓库根由调用方每运行只算一次; 本判定纯词法,
+/// 不再访问文件系统 (链接文本也由调用方读取后传入其解析结果, 不重复 `read_link`).
+pub fn is_inside_repo(destination: &Path, repo_root: &Path) -> bool {
+    destination.starts_with(repo_root)
 }
 
 #[cfg(test)]
@@ -444,10 +432,18 @@ mod tests {
     }
 
     #[test]
-    fn link_is_inside_repo_is_false_when_not_a_symlink() {
-        assert!(!link_is_inside_repo(
-            Path::new("/nonexistent"),
-            Path::new("/")
+    fn is_inside_repo_counts_the_root_itself_but_not_a_sibling_prefix() {
+        assert!(is_inside_repo(
+            Path::new("/repo/shell/bashrc"),
+            Path::new("/repo")
         ));
+        assert!(is_inside_repo(Path::new("/repo"), Path::new("/repo")));
+
+        // 逐段比较: `/repo-other` 不得以字符串前缀被误判为 `/repo` 之内.
+        assert!(!is_inside_repo(
+            Path::new("/repo-other/rc"),
+            Path::new("/repo")
+        ));
+        assert!(!is_inside_repo(Path::new("/etc/rc"), Path::new("/repo")));
     }
 }

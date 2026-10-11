@@ -2,8 +2,9 @@
 //!
 //! 破坏面被 `Current` 的取值直接限制住: 只有 `LinkedCorrect` 与 `LinkedWrong` 才意味着
 //! "这是本工具的链接", 其余取值 (尤其 `ForeignLink` / `ForeignFile` / `ForeignDir`)
-//! 一律不触碰. 因此本模块**不需要**再次调用 `os::link_is_inside_repo` -- 归属判定已经
-//! 被吸收进 `Current`, 重复判定既冗余, 又可能因两处规范化语义不同而引入分歧.
+//! 一律不触碰. 因此本模块**不需要**再次做归属判定 (`os::is_inside_repo`, 其入参需先过
+//! `os::normalize`) -- 归属判定已经被吸收进 `Current`, 重复判定既冗余, 又可能因两处
+//! 规范化语义不同而引入分歧.
 
 use std::path::Path;
 
@@ -269,7 +270,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            backup::find_latest_backup(&target),
+            backup::find_latest_backup(&target).unwrap(),
             None,
             ".partial 不得被认作可用备份"
         );

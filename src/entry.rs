@@ -30,7 +30,8 @@ pub struct Entry {
 /// 按 R5 的规则解析一条目的两侧路径.
 ///
 /// `target` 支持主目录简写 (`~` / `~/...`), 绝对路径与相对仓库根的路径;
-/// `source` 只接受仓库内相对路径. 两侧的裁决分别是 `expand_target` / `expand_source`.
+/// `source` 只接受仓库内的相对路径, 且解析与归一化后不得越出仓库根. 两侧路径形态的
+/// 裁决分别是 `expand_target` / `expand_source`, 越界判定在归一化之后.
 pub fn resolve(
     source: &str,
     target: &str,
@@ -39,6 +40,19 @@ pub fn resolve(
 ) -> Result<Entry> {
     let target_path = os::normalize(&expand_target(target, repo_root)?);
     let source_path = os::normalize(&expand_source(source, repo_root)?);
+
+    // 源条目解析与归一化后必须仍落在仓库根之内: `..` 段或仓库内的符号链接能把
+    // `repo_root.join(...)` 的结果带出仓库. 越出仓库的源建出的链接指向仓库外, 而
+    // `undo` 的归属判定要求链接文本落在仓库内才算本工具创建 (`os::link_is_inside_repo`),
+    // 于是自己的产物会被自己拒删 (`undo.rs` 的不变量). 与 `~` 前缀 / 绝对路径同一类
+    // 整体拒绝. 两侧都过 `os::normalize` 再比较: 祖先段解析符号链接的语义必须与归属
+    // 判定完全一致, 末段不解析 (`normalize` 的既有语义).
+    if !source_path.starts_with(os::normalize(repo_root)) {
+        return Err(Error::ManifestInvalid(format!(
+            "`{source}` 解析后落在仓库根之外: 源条目必须落在仓库根之内 (归一化后为 `{}`)",
+            source_path.display()
+        )));
+    }
 
     Ok(Entry {
         source: source.to_string(),
@@ -80,7 +94,8 @@ fn expand_target(written: &str, repo_root: &Path) -> Result<PathBuf> {
 ///
 /// 源条目必须是仓库内的相对路径 (`contracts/manifest.md` 的字段表; `research.md` R5:
 /// "源条目路径始终相对于清单文件所在目录解析"). `~` 前缀与绝对路径都不属于"仓库内
-/// 的相对路径", 按 V-4 / V-6 整体拒绝, 以维持"条目来自仓库"这一心智模型.
+/// 的相对路径", 按 V-4 / V-6 整体拒绝, 以维持"条目来自仓库"这一心智模型. 词法拼接
+/// 之后仍可能越出仓库 (见 `resolve` 中归一化后的越界判定), 那一半不在此处裁决.
 fn expand_source(written: &str, repo_root: &Path) -> Result<PathBuf> {
     if written.starts_with('~') || Path::new(written).is_absolute() {
         return Err(Error::ManifestInvalid(format!(
@@ -92,8 +107,9 @@ fn expand_source(written: &str, repo_root: &Path) -> Result<PathBuf> {
 
 /// 展开 `~` 所需的当前用户主目录.
 ///
-/// 无法确定时属于 FR-013 的整体拒绝场景 (退出码 2).
-fn home() -> Result<PathBuf> {
+/// 无法确定时属于 FR-013 的整体拒绝场景 (退出码 2). `manifest` 的 V-9 也用它识别
+/// "落点恰是主目录本身"的退化形态, 与 `~` 展开共用同一个来源.
+pub(crate) fn home() -> Result<PathBuf> {
     match std::env::var_os("HOME") {
         Some(value) if !value.is_empty() => Ok(PathBuf::from(value)),
         _ => Err(Error::ManifestInvalid(
@@ -177,6 +193,51 @@ mod tests {
             };
             assert!(message.contains(written), "说明应含书写形态: {message}");
         }
+    }
+
+    #[test]
+    fn source_resolving_outside_the_repo_is_rejected() {
+        // `..` 折叠后落到仓库根之外: 建出的链接指向仓库外, undo 的归属判定会拒删
+        // 自己的产物, 因此与 `~` / 绝对路径一样整体拒绝.
+        for written in ["../evil", "sub/../../evil"] {
+            let error = resolve(written, "link/x", OnConflict::Skip, &repo())
+                .expect_err("解析后落在仓库根之外的 source 必须被拒绝");
+            let Error::ManifestInvalid(message) = error else {
+                panic!("必须归入 ManifestInvalid");
+            };
+            assert!(message.contains(written), "说明应含书写形态: {message}");
+            assert!(message.contains("仓库根之外"), "说明应指出越界: {message}");
+        }
+    }
+
+    #[test]
+    fn source_escaping_through_a_symlink_inside_the_repo_is_rejected() {
+        // 仓库内的符号链接同样能把源带出仓库: `os::normalize` 解析祖先段的符号链接
+        // (末段不解析), 越界判定必须沿用同一语义.
+        let dir = tempfile::tempdir().expect("创建临时目录");
+        let root = std::fs::canonicalize(dir.path()).expect("临时目录的物理路径");
+        let repo_root = root.join("repo");
+        std::fs::create_dir_all(&repo_root).expect("创建仓库根");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).expect("创建仓库外目录");
+        std::os::unix::fs::symlink(&outside, repo_root.join("escape")).expect("建立逃逸链接");
+
+        let error = resolve("escape/evil", "link/x", OnConflict::Skip, &repo_root)
+            .expect_err("经仓库内符号链接逃逸的 source 必须被拒绝");
+        let Error::ManifestInvalid(message) = error else {
+            panic!("必须归入 ManifestInvalid");
+        };
+        assert!(
+            message.contains("escape/evil"),
+            "说明应含书写形态: {message}"
+        );
+    }
+
+    #[test]
+    fn parent_segments_that_fold_back_inside_the_repo_are_accepted() {
+        // 仓库内的 `..` 折叠 (`a/../b` 形态) 归一化后仍在仓库内, 不得被越界规则误伤.
+        let entry = resolve("a/../b", "link/x", OnConflict::Skip, &repo()).unwrap();
+        assert_eq!(entry.source_path, PathBuf::from("/repo/b"));
     }
 
     #[test]

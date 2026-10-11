@@ -1,10 +1,10 @@
 //! FR-013 / FR-015 / FR-020: 清单校验失败的整体拒绝 (tasks.md 的 T038).
 //!
-//! 本文件的职责是 T038 的**端到端矩阵**: V-1 至 V-8 逐条的"退出码 2 + 文件系统零
+//! 本文件的职责是 T038 的**端到端矩阵**: V-1 至 V-10 逐条的"退出码 2 + 文件系统零
 //! 改动", 外加 T038 的四条补充 (FR-015 不向上搜索 / 当前工作目录不可用 / 主目录无法
 //! 确定 / `Unreadable` 不是校验失败).
 //!
-//! 与 `src/manifest.rs` 的单元测试分工: 那里以纯函数形式断言 V-1 到 V-8 的**校验逻辑
+//! 与 `src/manifest.rs` 的单元测试分工: 那里以纯函数形式断言 V-1 到 V-10 的**校验逻辑
 //! 本身** (能直接看到条目下标与错误值); 这里经**真实二进制**断言校验失败对外承担的
 //! 契约 -- 退出码与零改动 -- 以及单测覆盖不到的"从当前工作目录取清单"这一步.
 //!
@@ -15,31 +15,16 @@
 mod support;
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
-use support::TempEnv;
+use support::{
+    Run, TempEnv, entry_line_count, env_with_locked_target, line_for, run, running_as_root,
+    snapshot_all, token_of,
+};
 
-/// V-1 到 V-8 逐条: 四条命令都必须拒绝, 且拒绝必须是零改动.
+/// V-1 到 V-10 逐条: 四条命令都必须拒绝, 且拒绝必须是零改动.
 const COMMANDS: [&str; 4] = ["preview", "apply", "status", "undo"];
-
-/// 一次命令调用的观测结果.
-struct Run {
-    code: i32,
-    stdout: String,
-    stderr: String,
-}
-
-/// 运行 `dotlink <args...>` (cwd = 仓库根, HOME = 临时主目录).
-fn run(env: &TempEnv, args: &[&str]) -> Run {
-    let assert = env.cmd().args(args).assert();
-    let output = assert.get_output();
-    Run {
-        code: output.status.code().unwrap_or(-1),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    }
-}
 
 /// 在指定的 **cwd** 下运行 `dotlink <args...>`, 其余环境同夹具.
 fn run_in(env: &TempEnv, cwd: &Path, args: &[&str]) -> Run {
@@ -105,53 +90,11 @@ fn observe(output: std::process::Output) -> Run {
     }
 }
 
-/// 仓库 + HOME 的递归快照 (路径 + 文件内容 / 链接文本).
-fn snapshot_all(env: &TempEnv) -> Vec<(PathBuf, String)> {
-    let mut rows = env.snapshot(env.repo());
-    rows.extend(env.snapshot(env.home()));
-    rows.sort();
-    rows
-}
-
-/// 该行是否是逐条目行 (`<序号>/<总数> ...`).
-fn is_entry_line(line: &str) -> bool {
-    match line
-        .split_whitespace()
-        .next()
-        .and_then(|word| word.split_once('/'))
-    {
-        Some((index, total)) => index.parse::<usize>().is_ok() && total.parse::<usize>().is_ok(),
-        None => false,
-    }
-}
-
-/// 含 `needle` 的那一行.
-#[track_caller]
-fn line_for<'a>(stdout: &'a str, needle: &str) -> &'a str {
-    stdout
-        .lines()
-        .find(|line| line.contains(needle))
-        .unwrap_or_else(|| panic!("输出中没有含 {needle} 的行:\n{stdout}"))
-}
-
-/// 行内的 token (第 2 个字段).
-#[track_caller]
-fn token_of(line: &str) -> &str {
-    line.split_whitespace()
-        .nth(1)
-        .unwrap_or_else(|| panic!("行内没有 token: {line}"))
-}
-
-/// 逐条目行数.
-fn entry_line_count(stdout: &str) -> usize {
-    stdout.lines().filter(|line| is_entry_line(line)).count()
-}
-
 /// 一条清单违规的完整断言: 四条命令都退 2, 标准输出为空, 标准错误指出 `needle`,
 /// 且整个过程**零改动**.
 ///
-/// `needle` 对应 `src/manifest.rs` 中该条规则的说明措辞 (V-1 到 V-8 各有一条), 因此
-/// 断言锁定的不是自由文本的措辞, 而是"哪一条规则被触发".
+/// `needle` 对应 `src/manifest.rs` 中该条规则的说明措辞 (V-1 到 V-10 的规则各有一
+/// 组措辞), 因此断言锁定的不是自由文本的措辞, 而是"哪一条规则被触发".
 #[track_caller]
 fn assert_all_commands_reject(env: &TempEnv, needle: &str) {
     let before = snapshot_all(env);
@@ -307,6 +250,70 @@ fn v4_a_source_outside_the_repo_shape_is_rejected() {
     }
 }
 
+#[test]
+fn v4_a_source_that_resolves_outside_the_repo_is_rejected() {
+    let env = env_with_source();
+    // `..` 折叠能把 `repo_root.join(source)` 带出仓库: 建出的链接指向仓库外,
+    // undo 的归属判定 (落在仓库内才算本工具创建) 会拒删自己的产物, 因此与
+    // `~` / 绝对路径一样整体拒绝.
+    for written in ["../evil", "sub/../../evil"] {
+        env.write_manifest(&format!(
+            "[[entry]]\nsource = \"{written}\"\ntarget = \"~/.bashrc\"\n"
+        ));
+
+        assert_all_commands_reject(&env, "仓库根之外");
+
+        let run = run(&env, &["preview"]);
+        assert!(
+            run.stderr.contains("entry[0]") && run.stderr.contains(written),
+            "必须指出条目下标与书写形态 {}: {}",
+            written,
+            run.stderr
+        );
+    }
+}
+
+#[test]
+fn v4_a_source_escaping_through_a_repo_symlink_is_rejected() {
+    let env = env_with_source();
+    // 仓库内的符号链接同样能把源带出仓库: `os::normalize` 解析祖先段的符号链接,
+    // 越界判定沿用同一语义.
+    let outside = tempfile::tempdir().expect("创建仓库外目录");
+    let outside = fs::canonicalize(outside.path()).expect("仓库外目录的物理路径");
+    std::os::unix::fs::symlink(&outside, env.repo().join("escape")).expect("建立逃逸链接");
+
+    env.write_manifest("[[entry]]\nsource = \"escape/evil\"\ntarget = \"~/.bashrc\"\n");
+
+    assert_all_commands_reject(&env, "仓库根之外");
+
+    let run = run(&env, &["preview"]);
+    assert!(
+        run.stderr.contains("entry[0]") && run.stderr.contains("escape/evil"),
+        "必须指出条目下标与书写形态: {}",
+        run.stderr
+    );
+}
+
+#[test]
+fn v4_parent_segments_that_fold_back_inside_the_repo_are_accepted() {
+    let env = env_with_source();
+    // 仓库内的 `..` 折叠 (`a/../b` 形态) 归一化后仍在仓库内, 不得被越界规则误伤.
+    env.write_manifest(
+        "[[entry]]\nsource = \"shell/../shell/bashrc\"\ntarget = \"~/sub/bashrc\"\n",
+    );
+
+    let run = run(&env, &["apply"]);
+    assert_eq!(
+        run.code, 0,
+        "折叠后仍在仓库内的源必须被接受:\nstdout:\n{}\nstderr:\n{}",
+        run.stdout, run.stderr
+    );
+    env.assert_symlink_to(
+        &env.home().join("sub/bashrc"),
+        &env.repo().join("shell/bashrc"),
+    );
+}
+
 // ---------------------------------------------------------------------------
 // V-5: 不存在两个条目声明同一个目标路径
 // ---------------------------------------------------------------------------
@@ -431,6 +438,121 @@ fn v8_an_unknown_top_level_table_is_rejected() {
     assert!(
         run.stderr.contains("顶层"),
         "V-8 必须指出键名与所在层级: {}",
+        run.stderr
+    );
+}
+
+// ---------------------------------------------------------------------------
+// V-9: 目标落点不得退化 (文件系统根 / 当前用户主目录 / 仓库根本身或其祖先)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn v9_the_file_system_root_target_is_rejected() {
+    let env = env_with_source();
+    // 落点是整个文件系统根: 一旦落地 (`replace_and_backup` 尤甚) 毁掉的是一整棵树.
+    env.write_manifest("[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"/\"\n");
+
+    assert_all_commands_reject(&env, "文件系统根");
+
+    let run = run(&env, &["preview"]);
+    assert!(
+        run.stderr.contains("entry[0]") && run.stderr.contains("`/`"),
+        "V-9 必须指出条目下标与书写形态: {}",
+        run.stderr
+    );
+}
+
+#[test]
+fn v9_the_home_target_is_rejected() {
+    let env = env_with_source();
+    // 裸 `~` 与书成绝对路径的等价形态都指向主目录本身.
+    for written in ["~".to_string(), env.home().display().to_string()] {
+        env.write_manifest(&format!(
+            "[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"{written}\"\n"
+        ));
+
+        assert_all_commands_reject(&env, "主目录");
+
+        let run = run(&env, &["preview"]);
+        assert!(
+            run.stderr.contains("entry[0]") && run.stderr.contains(&format!("`{written}`")),
+            "V-9 必须指出条目下标与书写形态 {written}: {}",
+            run.stderr
+        );
+    }
+}
+
+#[test]
+fn v9_the_repo_root_and_its_ancestors_are_rejected() {
+    let env = env_with_source();
+    // `.` 归一化后是仓库本身, `..` 是它的祖先: 命中源仓库的落点一旦被
+    // `replace_and_backup` 替换备份, 毁掉的就是整个仓库.
+    for written in [".", ".."] {
+        env.write_manifest(&format!(
+            "[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"{written}\"\n"
+        ));
+
+        assert_all_commands_reject(&env, "仓库根本身或其祖先");
+
+        let run = run(&env, &["preview"]);
+        assert!(
+            run.stderr.contains("entry[0]") && run.stderr.contains(&format!("`{written}`")),
+            "V-9 必须指出条目下标与书写形态 {written}: {}",
+            run.stderr
+        );
+    }
+}
+
+#[test]
+fn v9_legal_target_shapes_are_not_harmed() {
+    let env = env_with_source();
+    env.write_source("git/gitconfig", "managed\n");
+    // 三种合法形态不得被误伤: 主目录之下的 `~/sub`, `/etc/hosts` 这类绝对路径
+    // (此处取仓库与 HOME 之外的一个临时目录), 以及相对仓库根的 `link/bashrc`.
+    let outside = tempfile::tempdir().expect("创建仓库外目录");
+    let outside = fs::canonicalize(outside.path()).expect("仓库外目录的物理路径");
+    env.write_manifest(&format!(
+        "[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"~/sub/bashrc\"\n\n\
+         [[entry]]\nsource = \"git/gitconfig\"\ntarget = \"{}/abs/gitconfig\"\n\n\
+         [[entry]]\nsource = \"shell/bashrc\"\ntarget = \"link/bashrc\"\n",
+        outside.display()
+    ));
+
+    let run = run(&env, &["apply"]);
+    assert_eq!(
+        run.code, 0,
+        "合法落点不得被误伤:\nstdout:\n{}\nstderr:\n{}",
+        run.stdout, run.stderr
+    );
+    env.assert_symlink_to(
+        &env.home().join("sub/bashrc"),
+        &env.repo().join("shell/bashrc"),
+    );
+    env.assert_symlink_to(
+        &outside.join("abs/gitconfig"),
+        &env.repo().join("git/gitconfig"),
+    );
+    env.assert_symlink_to(
+        &env.repo().join("link/bashrc"),
+        &env.repo().join("shell/bashrc"),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// V-10: 目标不得指向本条目自己的 source (自指链接恒为断链)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn v10_a_self_referential_target_is_rejected() {
+    let env = env_with_source();
+    env.write_manifest("[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"shell/bashrc\"\n");
+
+    assert_all_commands_reject(&env, "自指");
+
+    let run = run(&env, &["preview"]);
+    assert!(
+        run.stderr.contains("entry[0]") && run.stderr.contains("`shell/bashrc`"),
+        "V-10 必须指出条目下标与书写形态: {}",
         run.stderr
     );
 }
@@ -565,41 +687,6 @@ fn a_target_that_does_not_need_home_is_accepted_without_the_home_variable() {
 // ---------------------------------------------------------------------------
 // T038 补充 4: `Unreadable` 不是校验失败 (退出码 1, 非 2/3)
 // ---------------------------------------------------------------------------
-
-/// 以 root 运行时权限位无效 (chmod 000 不阻止读取), 依赖 `EACCES` 的断言必须跳过.
-fn running_as_root() -> bool {
-    let probe = std::env::temp_dir().join(format!("dotlink-root-probe-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&probe);
-    if fs::create_dir_all(&probe).is_err() {
-        return false;
-    }
-    let locked = probe.join("locked");
-    let outcome = fs::create_dir_all(&locked)
-        .and_then(|()| {
-            fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o000))
-        })
-        .and_then(|()| fs::read_dir(&locked).map(|_| ()));
-    let as_root = outcome.is_ok();
-    let _ = fs::remove_dir_all(&probe);
-    as_root
-}
-
-/// 一份"目标父目录不可进入"的清单: 第二条的目标落在 chmod 000 的目录里.
-fn env_with_locked_target() -> (TempEnv, PathBuf) {
-    let env = TempEnv::new();
-    env.write_source("shell/bashrc", "managed\n");
-    env.write_source("shell/zshrc", "managed-zsh\n");
-    env.write_manifest(
-        "[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"~/.bashrc\"\n\n\
-         [[entry]]\nsource = \"shell/zshrc\"\ntarget = \"~/.locked/rc\"\n",
-    );
-
-    let locked = env.home().join(".locked");
-    fs::create_dir_all(&locked).expect("创建目标父目录");
-    fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o000))
-        .expect("设置权限位");
-    (env, locked)
-}
 
 #[test]
 fn an_unreadable_entry_is_a_failure_not_a_validation_error() {

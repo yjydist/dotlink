@@ -10,73 +10,9 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use support::TempEnv;
-
-/// 一次命令调用的观测结果.
-struct Run {
-    code: i32,
-    stdout: String,
-    stderr: String,
-}
-
-/// 运行 `dotlink <args...>` (cwd = 仓库根, HOME = 临时主目录).
-fn run(env: &TempEnv, args: &[&str]) -> Run {
-    let assert = env.cmd().args(args).assert();
-    let output = assert.get_output();
-    Run {
-        code: output.status.code().unwrap_or(-1),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    }
-}
-
-/// 构造清单: 每个条目为 `(source, target, on_conflict)`, 策略写 `"-"` 表示缺省.
-fn manifest_of(entries: &[(&str, &str, &str)]) -> String {
-    let mut text = String::new();
-    for (source, target, policy) in entries {
-        text.push_str("[[entry]]\n");
-        text.push_str(&format!("source = \"{source}\"\n"));
-        text.push_str(&format!("target = \"{target}\"\n"));
-        if *policy != "-" {
-            text.push_str(&format!("on_conflict = \"{policy}\"\n"));
-        }
-    }
-    text
-}
-
-/// 该行是否是逐条目行 (`<序号>/<总数> ...`).
-fn is_entry_line(line: &str) -> bool {
-    match line
-        .split_whitespace()
-        .next()
-        .and_then(|word| word.split_once('/'))
-    {
-        Some((index, total)) => index.parse::<usize>().is_ok() && total.parse::<usize>().is_ok(),
-        None => false,
-    }
-}
-
-/// 全部逐条目行 (排除末尾汇总行).
-fn entry_lines(stdout: &str) -> Vec<&str> {
-    stdout.lines().filter(|line| is_entry_line(line)).collect()
-}
-
-/// 含 `needle` 的那一行.
-#[track_caller]
-fn line_for<'a>(stdout: &'a str, needle: &str) -> &'a str {
-    stdout
-        .lines()
-        .find(|line| line.contains(needle))
-        .unwrap_or_else(|| panic!("输出中没有含 {needle} 的行:\n{stdout}"))
-}
-
-/// 行内的 token (第 2 个字段).
-#[track_caller]
-fn token_of(line: &str) -> &str {
-    line.split_whitespace()
-        .nth(1)
-        .unwrap_or_else(|| panic!("行内没有 token: {line}"))
-}
+use support::{
+    Run, TempEnv, entry_lines, line_for, manifest_of, physical_repo, run, snapshot_all, token_of,
+};
 
 /// 某条目的 token (`status` 输出中按 target 定位).
 #[track_caller]
@@ -94,23 +30,6 @@ fn assert_status_code(env: &TempEnv, expected: i32) {
         "status 期望退出码 {expected}; stdout:\n{}\nstderr:\n{}",
         run.stdout, run.stderr
     );
-}
-
-/// 仓库 + HOME 的递归快照 (路径 + 文件内容 / 链接文本).
-fn snapshot_all(env: &TempEnv) -> Vec<(PathBuf, String)> {
-    let mut rows = env.snapshot(env.repo());
-    rows.extend(env.snapshot(env.home()));
-    rows.sort();
-    rows
-}
-
-/// 仓库根的**物理**路径.
-///
-/// 子进程的 `std::env::current_dir()` 返回物理路径 (macOS 上临时目录位于
-/// `/var/folders/...`, 即 `/private/var/folders/...`), 而 `TempEnv::repo()` 返回的是
-/// 未解析的那一份. 判定以物理路径为基准, 因此手工构造链接时必须用同一基准.
-fn physical_repo(env: &TempEnv) -> PathBuf {
-    fs::canonicalize(env.repo()).expect("解析仓库根的物理路径")
 }
 
 /// 建立"正确链接" (指向清单声明的源).
@@ -447,11 +366,10 @@ fn a_link_text_containing_parent_dir_segments_is_still_ok() {
 /// 文件, 因此必须报 `ok` 而非 `foreign` -- 这正是 R2 中"归属判定必须对两侧都做
 /// 规范化"的判据.
 ///
-/// 注意: 该断言当前是**红的且不是测试缺陷** -- `os::normalize` 是纯词法规范化
-/// (只消除 `.` 与 `..`, 不解析符号链接), 而别名与物理路径的差异只能靠解析符号
-/// 链接消除. R2 声称"macOS 路径别名与悬空链接这两类情形被同一条规则覆盖", 这只在
-/// 两侧都写成别名形态时成立 (见 `src/classify.rs` 的同名单元测试, 它两侧都用
-/// `/tmp/...`, 因此必然通过). 本用例把这一要求放到真实进程上, 使该缺口可见.
+/// 判据依赖 `os::normalize` 的实际语义: 它在**祖先段**解析符号链接 (末段不解析),
+/// 因此别名形态与物理形态会折叠到同一路径, 该链接才得以报 `ok`. 本用例把这一要求
+/// 放到真实进程上 (子进程的 cwd 是物理形态, 链接文本是别名形态), 使"规范化退回纯
+/// 词法"这类回归直接可见.
 #[test]
 fn a_link_written_with_the_tmp_alias_is_still_ok() {
     let Some(dir) = tempfile::Builder::new().tempdir_in("/tmp").ok() else {
