@@ -7,11 +7,13 @@
 //!
 //! 两处不变量由本模块独自承担:
 //!
-//! - **完整性**: 复制先落到 `<时间戳>.partial`, 全部复制成功后才原子改名为最终名,
-//!   因此一个"名字看起来完整"的备份必然是完整内容 (中断残留只能是 `.partial`, 失败
-//!   清理会尽力移除它).
+//! - **完整性**: 复制先落到**进程级唯一**的暂存名 (`<时间戳>.<pid>.partial`), 全部
+//!   复制成功后才原子改名为最终名, 因此一个"名字看起来完整"的备份必然是完整内容
+//!   (中断残留只能是暂存名, 失败清理会尽力移除它).
 //! - **唯一性**: 最终名已被占用时追加序号 (`.2`, `.3` ...) 消歧, 单进程内绝不覆盖
-//!   既有备份. 并发下 `write_backup` 的 check-then-rename 留有窄窗口, 详见那里的注释.
+//!   既有备份. 暂存名带进程号, 并发进程对同一目标备份时各写各的暂存文件, 不会因
+//!   共用暂存名而产出内容交错的备份; 但 `write_backup` 的 check-then-rename 仍留有
+//!   窄窗口, 详见那里的注释.
 
 use std::cmp::Ordering;
 use std::ffi::{OsStr, OsString};
@@ -122,7 +124,9 @@ pub fn find_latest_backup(target: &Path) -> Result<Option<PathBuf>> {
 /// (data-model.md 第 4 节的"先复制后删除的硬顺序"). 失败时不留下最终名.
 pub(crate) fn write_backup(object: &Path) -> Result<PathBuf> {
     let final_path = backup_path_for(object);
-    let partial = with_suffix(&final_path, PARTIAL_SUFFIX);
+    // 暂存名带进程号: 并发进程对同一目标备份时各写各的暂存文件, 不会交错写入同一
+    // 文件而产出一个内容损坏的备份.
+    let partial = with_suffix(&final_path, &unique_staging_suffix(PARTIAL_SUFFIX));
 
     copy_object(object, &partial)?;
 
@@ -151,12 +155,15 @@ pub(crate) fn write_backup(object: &Path) -> Result<PathBuf> {
     )))
 }
 
-/// 把 `backup` 的内容恢复到 `target` (调用者已确保 `target` 当前不存在).
+/// 把 `backup` 的内容恢复到 `target`.
 ///
-/// 先复制到临时名再改名: 目录恢复在中途失败时不会在原路径留下半成品. 恢复成功后
-/// **不删除备份文件本身** (`contracts/cli.md` 的"幂等").
+/// 调用者保证 `target` 当前不存在, 或是一个将被原子替换的符号链接 (`undo` 的恢复
+/// 路径): 复制先落到**进程级唯一**的临时名, 全部复制成功后再改名到 `target`, 因此
+/// 目录恢复中途失败不会在原路径留下半成品, 改名失败时 `target` 上的原链接也原样
+/// 保留 (下一次 `undo` 可重试). 恢复成功后**不删除备份文件本身**
+/// (`contracts/cli.md` 的"幂等").
 pub(crate) fn restore_backup(target: &Path, backup: &Path) -> Result<()> {
-    let partial = with_suffix(target, RESTORE_SUFFIX);
+    let partial = with_suffix(target, &unique_staging_suffix(RESTORE_SUFFIX));
 
     copy_object(backup, &partial)?;
 
@@ -314,6 +321,13 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
         .to_os_string();
     name.push(suffix);
     directory.join(name)
+}
+
+/// 进程级唯一的暂存后缀: 并发进程对同一路径操作时不得共用同一暂存名, 否则两次复制
+/// 会交错写入同一文件, 产出一个内容损坏的备份或恢复结果. 进程号足以区分并发进程;
+/// 单进程内同一路径的暂存操作串行, 不会重叠.
+fn unique_staging_suffix(suffix: &str) -> String {
+    format!(".{}{suffix}", std::process::id())
 }
 
 /// 统一的条目级错误措辞 (含底层 io 错误).
@@ -498,6 +512,24 @@ mod tests {
         .unwrap();
 
         assert_eq!(find_latest_backup(&target).unwrap(), Some(complete));
+    }
+
+    /// 进程级暂存名: 带进程号, 且不得被 `find_latest_backup` 认作"已完整命名"的备份.
+    #[test]
+    fn staging_names_are_process_unique_and_never_look_like_complete_backups() {
+        let suffix = unique_staging_suffix(PARTIAL_SUFFIX);
+        assert!(
+            suffix.contains(&std::process::id().to_string()),
+            "暂存后缀必须带进程号: {suffix}"
+        );
+        assert!(suffix.ends_with(PARTIAL_SUFFIX), "{suffix}");
+
+        let name = format!("bashrc{MARKER}20260101T000000{suffix}");
+        let after_marker = name.strip_prefix(&format!("bashrc{MARKER}")).unwrap();
+        assert!(
+            complete_suffix_of(after_marker).is_none(),
+            "暂存名 {name} 不得被认作完整备份"
+        );
     }
 
     #[test]
