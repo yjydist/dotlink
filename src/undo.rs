@@ -5,8 +5,13 @@
 //! 一律不触碰. 因此本模块**不需要**再次做归属判定 (`os::is_inside_repo`, 其入参需先过
 //! `os::normalize`) -- 归属判定已经被吸收进 `Current`, 重复判定既冗余, 又可能因两处
 //! 规范化语义不同而引入分歧.
+//!
+//! 有备份时恢复走"先把链接原子移到暂存名 -> 复制备份就位 -> 失败则把链接移回":
+//! 复制失败时链接原样保留, 因此该条目在下一次 `undo` 仍可重试, 不会留下"链接已删而
+//! 备份没恢复"的半成品状态.
 
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use crate::backup;
 use crate::classify::{Current, EntryState};
@@ -25,12 +30,12 @@ pub fn undo_entry(entry: &Entry, state: &EntryState, backup: Option<&Path>) -> R
     let target = entry.target_path.as_path();
 
     match state.current {
-        // 本工具创建的链接 (二者都蕴含链接文本落在仓库根之内): 移除后按快照有无
-        // 备份决定是否恢复.
-        Current::LinkedCorrect | Current::LinkedWrong => {
-            remove_link(target)?;
-            restore_backup_at(target, backup)
-        }
+        // 本工具创建的链接 (二者都蕴含链接文本落在仓库根之内): 动手前先复核身份,
+        // 再按快照有无备份决定"移除链接"还是"恢复备份".
+        Current::LinkedCorrect | Current::LinkedWrong => match backup {
+            Some(backup) => replace_link_with_backup(target, backup),
+            None => remove_link(target),
+        },
         // 非本工具创建的内容: 绝不删除 (`contracts/cli.md` 的 `undo` 分支表).
         Current::ForeignLink | Current::ForeignFile | Current::ForeignDir => Ok(()),
         // 该路径本就没有本工具创建的链接 (含已撤销干净的第二次运行).
@@ -40,13 +45,13 @@ pub fn undo_entry(entry: &Entry, state: &EntryState, backup: Option<&Path>) -> R
     }
 }
 
-/// 移除目标路径上的符号链接.
+/// 复核目标路径仍是符号链接.
 ///
-/// 判定与撤销之间目标可能被替换: `remove_file` 对普通文件与目录同样有效, 不复核
-/// 身份就会把用户数据当成"本工具的链接"删掉. 因此移除前以 `symlink_metadata` 复核,
-/// 已不是符号链接的一律拒绝 (与 apply 在实况变化时失败对偶).
-fn remove_link(target: &Path) -> Result<()> {
-    let metadata = std::fs::symlink_metadata(target).map_err(|error| {
+/// 判定与撤销之间目标可能被替换: `remove_file` 与 `rename` 对普通文件与目录同样有效,
+/// 不复核身份就会把用户数据当成"本工具的链接"删除或覆盖. 因此动手前以
+/// `symlink_metadata` 复核, 已不是符号链接的一律拒绝 (与 apply 在实况变化时失败对偶).
+fn ensure_still_a_link(target: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(target).map_err(|error| {
         Error::EntryFailed(format!("移除链接 {} 失败: {error}", target.display()))
     })?;
     if !metadata.file_type().is_symlink() {
@@ -55,22 +60,52 @@ fn remove_link(target: &Path) -> Result<()> {
             target.display()
         )));
     }
+    Ok(())
+}
 
-    std::fs::remove_file(target)
+/// 移除目标路径上的符号链接 (先复核身份).
+fn remove_link(target: &Path) -> Result<()> {
+    ensure_still_a_link(target)?;
+    fs::remove_file(target)
         .map_err(|error| Error::EntryFailed(format!("移除链接 {} 失败: {error}", target.display())))
 }
 
-/// 移除链接后, 把调用方快照指定的备份恢复到原路径; 快照为 `None` 则无事可做.
+/// 移除链接并把快照指定的备份恢复到原路径.
 ///
-/// 链接已被移除, 原路径空着, 直接把备份内容写回即可; 目录的恢复在 `restore_backup`
-/// 内部走"临时名 -> 改名", 中途失败不会在原路径留下半成品. 恢复成功后**不删除备份
-/// 文件本身** (`contracts/cli.md` 的"幂等"): "消费"意为"不再参与恢复", 而非"从磁盘
-/// 移除".
-fn restore_backup_at(target: &Path, backup: Option<&Path>) -> Result<()> {
-    match backup {
-        Some(backup) => backup::restore_backup(target, backup),
-        None => Ok(()),
+/// 顺序刻意拆成三步, 使失败发生在"移除链接"之前:
+///
+/// 1. 复核目标仍是符号链接;
+/// 2. 把链接**原子移到同目录的暂存名**, 使原路径空出;
+/// 3. 复制备份到原路径 (`restore_backup` 内部走"临时名 -> 改名", 目录恢复中途失败
+///    不会留下半成品). 失败时把链接移回原路径 -- 该条目保持"未撤销"的原状, 下一次
+///    `undo` 可重试, 不会留下"链接已删而备份没恢复"的半成品.
+fn replace_link_with_backup(target: &Path, backup: &Path) -> Result<()> {
+    ensure_still_a_link(target)?;
+
+    let aside = aside_path(target);
+    fs::rename(target, &aside).map_err(|error| {
+        Error::EntryFailed(format!("暂存链接 {} 失败: {error}", target.display()))
+    })?;
+
+    match backup::restore_backup(target, backup) {
+        Ok(()) => {
+            // 恢复已就位; 旧链接副本的清理失败只是残留, 不外抛.
+            let _ = fs::remove_file(&aside);
+            Ok(())
+        }
+        Err(error) => {
+            // 恢复失败: 把链接移回原路径, 恢复"未撤销"的原状.
+            let _ = fs::rename(&aside, target);
+            Err(error)
+        }
     }
+}
+
+/// 链接在恢复期间被移到的同目录暂存名 (进程级唯一).
+fn aside_path(target: &Path) -> PathBuf {
+    let mut name = target.as_os_str().to_os_string();
+    name.push(format!(".{}.dotlink-undo.partial", std::process::id()));
+    PathBuf::from(name)
 }
 
 #[cfg(all(test, unix))]
@@ -342,8 +377,11 @@ mod tests {
         );
     }
 
+    /// 恢复出的是普通文件, 不是链接: 真实的第二次 `undo` 会由 `classify` 判为
+    /// `ForeignFile` 并报 `skip` (见 `contracts/cli.md` 的幂等说明). 这里直接以
+    /// `Absent` 调用, 只锁定"`Absent` 不触碰文件系统"这一行.
     #[test]
-    fn undo_twice_is_idempotent() {
+    fn undo_entry_is_a_noop_when_the_target_is_already_absent() {
         let dir = tempfile::tempdir().unwrap();
         let (target, entry) = deployed(dir.path(), "bashrc", "managed");
         let backup_path = target
@@ -355,8 +393,48 @@ mod tests {
         undo_entry(&entry, &state(Current::LinkedCorrect), Some(&backup_path)).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "original");
 
-        // 第二次运行时 `Current` 由 classify 判为 `Absent` (恢复出的是普通文件, 不是链接).
         undo_entry(&entry, &state(Current::Absent), None).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "original");
+        assert!(fs::symlink_metadata(&backup_path).is_ok());
+    }
+
+    /// 恢复失败时链接必须原样保留: 恢复先把链接移到暂存名再复制备份, 复制阶段失败
+    /// 会把链接移回, 因此下一次 `undo` 仍可重试, 不留下"链接已删而备份没恢复"的
+    /// 半成品.
+    #[test]
+    fn a_failed_restore_keeps_the_link_so_undo_can_be_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let (target, entry) = deployed(dir.path(), "bashrc", "managed");
+
+        let backup_path = target
+            .parent()
+            .unwrap()
+            .join("bashrc.dotlink-backup.20260101T000000");
+        fs::write(&backup_path, "original").unwrap();
+        // 备份不可读 -> 复制到暂存名阶段失败.
+        fs::set_permissions(&backup_path, fs::Permissions::from_mode(0o000)).unwrap();
+
+        // 以 root 运行时权限位无效, 无法构造"复制必然失败"的场景, 只能跳过.
+        if fs::read_to_string(&backup_path).is_ok() {
+            fs::set_permissions(&backup_path, fs::Permissions::from_mode(0o644)).unwrap();
+            eprintln!("以 root 运行: chmod 000 不生效, 跳过恢复失败的原子性断言");
+            return;
+        }
+
+        let error =
+            undo_entry(&entry, &state(Current::LinkedCorrect), Some(&backup_path)).unwrap_err();
+        assert!(matches!(error, Error::EntryFailed(_)));
+        assert!(
+            fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "恢复失败时链接必须保留, 以便重试"
+        );
+
+        // 恢复权限后重试: 链接仍在, 因此能走通恢复.
+        fs::set_permissions(&backup_path, fs::Permissions::from_mode(0o644)).unwrap();
+        undo_entry(&entry, &state(Current::LinkedCorrect), Some(&backup_path)).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "original");
         assert!(fs::symlink_metadata(&backup_path).is_ok());
     }

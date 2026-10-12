@@ -155,13 +155,11 @@ pub(crate) fn write_backup(object: &Path) -> Result<PathBuf> {
     )))
 }
 
-/// 把 `backup` 的内容恢复到 `target`.
+/// 把 `backup` 的内容恢复到 `target` (调用者已确保 `target` 当前不存在).
 ///
-/// 调用者保证 `target` 当前不存在, 或是一个将被原子替换的符号链接 (`undo` 的恢复
-/// 路径): 复制先落到**进程级唯一**的临时名, 全部复制成功后再改名到 `target`, 因此
-/// 目录恢复中途失败不会在原路径留下半成品, 改名失败时 `target` 上的原链接也原样
-/// 保留 (下一次 `undo` 可重试). 恢复成功后**不删除备份文件本身**
-/// (`contracts/cli.md` 的"幂等").
+/// 复制先落到**进程级唯一**的临时名, 全部复制成功后再改名到 `target`: 目录恢复中途
+/// 失败不会在原路径留下半成品. 恢复成功后**不删除备份文件本身** (`contracts/cli.md`
+/// 的"幂等").
 pub(crate) fn restore_backup(target: &Path, backup: &Path) -> Result<()> {
     let partial = with_suffix(target, &unique_staging_suffix(RESTORE_SUFFIX));
 
