@@ -58,7 +58,7 @@ T048 / T046 / T047 只需写测试并**确认失败**, 不要求此时全绿 -- 
 
 - [X] T048 **先于 T004**: 编写 `tests/exit_codes.rs`, 锁定 `contracts/cli.md` 的退出码契约 (FR-020).这是全清单唯一一处跨故事的两个条件规则 ("目标谓词成立" **且** "无遗留待办"), 必须在实现退出码计算之前有失败测试. 该测试的**第一条链**直接对 T004 的 `exit_code_for` 做断言 (喂入构造的逐条结果), 因此它在 T004 之前即为红并在 T004 之后立即转绿; 端到端链约束 T015 / T016 / T031 / T034 / T036 的真实命令接入, 在本阶段之后才逐步转绿:
   - `preview` 与 `apply` 共用同一目标谓词但求值时刻不同: 未部署的清单上 `preview` 退 1 而紧随其后的 `apply` 退 0; 已符合期望的清单上二者同为 0
-  - `undo` 的目标谓词与 `apply` 相反: 刚部署好的清单上 `apply` 退 0 而 `undo` 退 1; 撤销干净后再运行 `undo` 退 0 (幂等)
+  - `undo` 的目标谓词与 `apply` 相反: 刚部署好的清单上 `apply` 退 0 而 `undo` 退 1; 撤销后目标为空时再运行 `undo` 退 0 (幂等)
   - **条件 2 单独生效的场景**: 清单含 `SourceMissing` 条目时, 四条命令一律退 1 (该条目计入"失败"列), 即使 `undo` 的目标谓词在它身上已成立
   - `undo` 遇到真实目录占用 (`skip`) 时退 1, 即使目标谓词成立
   这些断言不得依赖自由文本, 只用退出码与 token
@@ -156,8 +156,8 @@ T048 / T046 / T047 只需写测试并**确认失败**, 不要求此时全绿 -- 
 
 ### Implementation for User Story 3
 
-- [X] T023 [US3] 实现备份路径构造与查找于 `src/backup.rs` (`research.md` R4): 备份位于**被覆盖路径的同一目录**, 名称为 `<原名>.dotlink-backup.<YYYYMMDDThhmmss>` (本地时区, 秒级, 用 `time` crate).提供 `fn backup_path_for(target: &Path) -> PathBuf` 与 `fn find_latest_backup(target: &Path) -> Option<PathBuf>` (取同目录下名称以 `<原名>.dotlink-backup.` 开头者中**字典序最大**的一个).**命名消歧** (见 `data-model.md` 第 4 节的"唯一性"): `backup_path_for` 若发现算出的名字已存在, 必须追加序号 `.2`, `.3`... 直到未占用, 绝不覆盖既有备份; 同一秒内对同一路径的两次替换因此产生两个并存备份, 而非后者覆盖前者
-- [X] T024 [US3] 实现"复制被覆盖对象"于 `src/backup.rs`: 原对象是文件/目录时递归复制; 原对象是**符号链接时必须复制链接本身而不跟随** (`std::fs::read_link` + `create_symlink`), 否则会备份到链接指向的内容. **写入必须是两步** (见 `data-model.md` 第 4 节的完整性规则): 先复制到 `<原名>.dotlink-backup.<YYYYMMDDThhmmss>.partial`, 全部复制成功后再原子改名为最终名; 任何中途失败都不得留下一个被误认为完整的备份. `find_latest_backup` 只接受已完整命名的备份 (不含 `.partial`)
+- [X] T023 [US3] 实现备份路径构造与查找于 `src/backup.rs` (`research.md` R4): 备份位于**被覆盖路径的同一目录**, 名称为 `<原名>.dotlink-backup.<YYYYMMDDThhmmss>` (本地时区, 秒级, 用 `time` crate).提供 `fn backup_path_for(target: &Path) -> PathBuf` 与 `fn find_latest_backup(target: &Path) -> Result<Option<PathBuf>>` (取同目录下名称以 `<原名>.dotlink-backup.` 开头者中**最新**的一个: 先比时间戳, 同一秒内再比序号数值, 不按整名字典序).**命名消歧** (见 `data-model.md` 第 4 节的"唯一性"): `backup_path_for` 若发现算出的名字已存在, 必须追加序号 `.2`, `.3`... 直到未占用, 绝不覆盖既有备份; 同一秒内对同一路径的两次替换因此产生两个并存备份, 而非后者覆盖前者
+- [X] T024 [US3] 实现"复制被覆盖对象"于 `src/backup.rs`: 原对象是文件/目录时递归复制; 原对象是**符号链接时必须复制链接本身而不跟随** (`std::fs::read_link` + `create_symlink`), 否则会备份到链接指向的内容. **写入必须是两步** (见 `data-model.md` 第 4 节的完整性规则): 先复制到进程级唯一的暂存名 `<原名>.dotlink-backup.<YYYYMMDDThhmmss>.<pid>.partial`, 全部复制成功后再原子改名为最终名; 任何中途失败都不得留下一个被误认为完整的备份. `find_latest_backup` 只接受已完整命名的备份 (不含 `.partial`)
 - [X] T025 [US3] 实现 `Action::ReplaceAndBackup` 于 `src/apply.rs`: 顺序严格为"先备份 → 确认备份**完整落定并被改名** → 再删除/替换原对象 → 建立新链接"."完整落定"指 `data-model.md` 第 4 节的两步写入已完成 (复制到 `.partial` 后成功改名为最终名); 它未成立之前**绝不允许**删除原对象. 本任务不变量 (由 `tests/conflict.rs` 的 T022(h) 之一断言): 该顺序颠倒时, 递归复制**目录**中途失败会让唯一副本同时消失, 直接违反 SC-004. **若备份失败则不得删除原对象**, 该条目报告 `fail` 并保留原状
 - [X] T026 [US3] 在 `src/lib.rs` 中接入 `Action::RefuseConflict`: 不产生任何文件系统改动, 报告 `conflict` 并说明原因是"目标被非本工具创建的内容占用", 退出码 1 (FR-007)
 - [X] T027 [US3] 在仓库根运行 `cargo test --test conflict` (对应 `tests/conflict.rs`), 确认 T022 全部通过

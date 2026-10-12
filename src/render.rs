@@ -281,8 +281,9 @@ fn status_token(current: Current) -> EntryOutcome {
 /// `LinkedCorrect` / `LinkedWrong` 的 token 由同目录**有无备份**决定 -- 与 `Current`
 /// 是哪一个无关 (后者只决定"是否允许移除", 前者决定"移除后是否恢复").
 ///
-/// `Absent` -> `Ok` 是幂等的关键行: 它使"已撤销干净的清单上再次运行 `undo`"落入
-/// "已是最新"列并退 0; 若误归为 `skip`, 第二次 `undo` 将退 1.
+/// `Absent` -> `Ok` 是幂等的关键行: 它使"撤销后目标为空的清单上再次运行 `undo`"落入
+/// "已是最新"列并退 0; 若误归为 `skip`, 第二次 `undo` 将退 1. 若上一次恢复过备份,
+/// 目标被原内容占用而判为冲突类, 第二次 `undo` 报 `skip` 并退 1 (状态不变, 但不退 0).
 fn undo_token(current: Current, has_backup: bool) -> EntryOutcome {
     match current {
         Current::LinkedCorrect | Current::LinkedWrong => {

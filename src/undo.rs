@@ -38,7 +38,7 @@ pub fn undo_entry(entry: &Entry, state: &EntryState, backup: Option<&Path>) -> R
         },
         // 非本工具创建的内容: 绝不删除 (`contracts/cli.md` 的 `undo` 分支表).
         Current::ForeignLink | Current::ForeignFile | Current::ForeignDir => Ok(()),
-        // 该路径本就没有本工具创建的链接 (含已撤销干净的第二次运行).
+        // 该路径本就没有本工具创建的链接 (含撤销后目标为空的第二次运行).
         Current::Absent => Ok(()),
         // 源缺失是终态; `Unreadable` 是环境故障. 二者都无文件系统改动.
         Current::SourceMissing | Current::Unreadable => Ok(()),
