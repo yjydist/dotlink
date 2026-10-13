@@ -254,6 +254,31 @@ fn a_second_apply_is_idempotent_and_produces_no_new_files() {
     );
 }
 
+#[test]
+fn a_missing_segment_before_an_alias_keeps_apply_idempotent() {
+    for policy in ["-", "replace_and_backup"] {
+        let env = TempEnv::new();
+        env.write_source("actual/rc", "managed\n");
+        std::os::unix::fs::symlink("actual", env.repo().join("alias")).unwrap();
+        assert!(fs::symlink_metadata(env.repo().join("missing")).is_err());
+        env.write_manifest(&manifest_of(&[("missing/../alias/rc", "~/.rc", policy)]));
+
+        let first = run(&env, &["apply"]);
+        assert_code(&first, 0);
+        assert_all_tokens(&first, "create");
+        env.assert_content(&env.home().join(".rc"), "managed\n");
+        let before = snapshot_all(&env);
+
+        for command in ["status", "preview", "apply"] {
+            let result = run(&env, &[command]);
+            assert_code(&result, 0);
+            assert_all_tokens(&result, "ok");
+            assert_eq!(snapshot_all(&env), before, "{policy}: {command}");
+        }
+        assert!(!has_backup_file(&snapshot_all(&env)));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // T013 (f): 增量 -- 新增条目后只有新条目为 create
 // ---------------------------------------------------------------------------

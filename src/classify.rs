@@ -144,8 +144,7 @@ fn classify_entry(entry: &Entry, repo_root: &Path) -> EntryState {
         }
     };
     let actual = link_destination(&entry.target_path, &link_text);
-    // `source_path` 已在 entry 层过 `os::normalize` (两侧同一套规范化语义, 见
-    // `entry.rs`), 直接比较即可, 不在循环里重复规范化.
+    // `source_path` 已在 entry 层过 `os::normalize`, 与链接目标使用同一形态.
     if actual == entry.source_path {
         return new_state(
             Current::LinkedCorrect,

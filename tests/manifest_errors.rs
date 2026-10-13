@@ -295,6 +295,33 @@ fn v4_a_source_escaping_through_a_repo_symlink_is_rejected() {
 }
 
 #[test]
+fn a_missing_segment_cannot_hide_an_escaping_source_alias() {
+    let env = env_with_source();
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(outside.path().join("rc"), "outside").unwrap();
+    std::os::unix::fs::symlink(outside.path(), env.repo().join("alias")).unwrap();
+    for source in ["missing/../alias/rc", "missing/nested/../../alias/rc"] {
+        env.write_manifest(&format!(
+            "[[entry]]\nsource = \"{source}\"\ntarget = \"~/.rc\"\n"
+        ));
+        assert_all_commands_reject(&env, "仓库根之外");
+    }
+    assert_eq!(
+        fs::read_to_string(outside.path().join("rc")).unwrap(),
+        "outside"
+    );
+}
+
+#[test]
+fn target_aliases_after_missing_segments_still_count_as_duplicates() {
+    let env = env_with_source();
+    fs::create_dir(env.repo().join("actual")).unwrap();
+    std::os::unix::fs::symlink("actual", env.repo().join("alias")).unwrap();
+    env.write_manifest("[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"missing/../alias/rc\"\n\n[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"actual/rc\"\n");
+    assert_all_commands_reject(&env, "同一个目标路径");
+}
+
+#[test]
 fn v4_parent_segments_that_fold_back_inside_the_repo_are_accepted() {
     let env = env_with_source();
     // 仓库内的 `..` 折叠 (`a/../b` 形态) 归一化后仍在仓库内, 不得被越界规则误伤.

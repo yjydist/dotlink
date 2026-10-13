@@ -92,13 +92,14 @@ fn steps_of(path: &Path) -> VecDeque<Step> {
 /// 逐段解析状态: 输出栈 + 已按物理形态解析的**前缀**.
 ///
 /// `stack` 是词法结果的段列表 (输出用它); `base` 是这些段实际对应的物理路径 (符号
-/// 链接段已被其链接文本取代, 故两者的段不一一对应). `base` 为 `None` 表示物理链已
-/// 断, 其后所有段只做词法处理.
+/// 链接段已被其链接文本取代, 故两者的段不一一对应). `lexical_depth` 记录尚未解析的
+/// 尾段数, 使 `..` 退回已知祖先时可以恢复物理解析. 相对路径无物理前缀.
 struct Resolver {
     prefix: Option<OsString>,
     rooted: bool,
     stack: Vec<OsString>,
     base: Option<PathBuf>,
+    lexical_depth: usize,
     depth: usize,
 }
 
@@ -110,12 +111,18 @@ impl Resolver {
             rooted: false,
             stack: Vec::new(),
             base: None,
+            lexical_depth: 0,
             depth: 0,
         }
     }
 
     /// 进入一个普通段.
     fn enter(&mut self, part: &OsStr, pending: &mut VecDeque<Step>) {
+        if self.lexical_depth > 0 {
+            self.stack.push(part.to_os_string());
+            self.lexical_depth += 1;
+            return;
+        }
         let Some(parent) = self.base.as_ref() else {
             self.stack.push(part.to_os_string());
             return;
@@ -133,7 +140,7 @@ impl Resolver {
         }
         if self.depth >= MAX_SYMLINK_DEPTH {
             self.stack.push(part.to_os_string());
-            self.base = None;
+            self.lexical_depth = 1;
             return;
         }
 
@@ -141,9 +148,9 @@ impl Resolver {
         match std::fs::symlink_metadata(&candidate) {
             Ok(meta) if meta.file_type().is_symlink() => {
                 let Ok(text) = std::fs::read_link(&candidate) else {
-                    // 读不到链接文本: 按字面保留该段, 物理链就此断开.
+                    // 读不到的尾段保留原样, 已验证的祖先仍可供后续 `..` 回退.
                     self.stack.push(part.to_os_string());
-                    self.base = None;
+                    self.lexical_depth = 1;
                     return;
                 };
                 self.depth += 1;
@@ -166,11 +173,10 @@ impl Resolver {
                 self.stack.push(part.to_os_string());
                 self.base = Some(candidate);
             }
-            // 不存在的段 (及其后所有段): 只做词法处理, 不再访问文件系统. 这是 R2 的
-            // 硬性要求 -- 指向仓库内但已失效的悬空链接必须仍能归入仓库内.
+            // 未消去的缺失尾段保持词法形态, 因而悬空链接仍能判定归属.
             Err(_) => {
                 self.stack.push(part.to_os_string());
-                self.base = None;
+                self.lexical_depth = 1;
             }
         }
     }
@@ -179,7 +185,9 @@ impl Resolver {
     ///
     /// 返回是否弹出了段; 相对路径的起点处返回 false, 由调用方记入 `leading`.
     fn leave(&mut self) -> bool {
-        if let Some(base) = self.base.as_mut() {
+        if self.lexical_depth > 0 {
+            self.lexical_depth -= 1;
+        } else if let Some(base) = self.base.as_mut() {
             // `base` 是已解析过的物理前缀 (无 `.` / `..` / 链接段), 其父目录即它的
             // `..`; 退到根后不再回退.
             base.pop();
@@ -203,8 +211,8 @@ impl Resolver {
 /// 末段**不解析**: 它往往正是被判定的那个部署链接, 穿透它会让 `Absent` /
 /// `LinkedWrong` / `ForeignLink` 三者全部失真. 只解析祖先段已足以消除别名差异.
 ///
-/// 一旦某段不存在, 该段及其后所有段都不再访问文件系统, 只做词法处理 -- 指向仓库内
-/// 但已失效的**悬空链接**必须仍被归类为"落在仓库内" (research.md R2).
+/// 不存在的尾段只做词法处理; `..` 消去全部缺失段后恢复祖先解析. 未消去的缺失尾段
+/// 保留原样, 指向仓库内但已失效的**悬空链接**仍归类为"落在仓库内" (research.md R2).
 ///
 /// 不得改用 `Path::canonicalize` -- 它对悬空链接返回 `Err` (实测已确认), 会把
 /// 一个指向仓库内但已失效的链接误判为落在仓库外, 使 `undo` 拒绝清理自己的产物.
@@ -444,6 +452,31 @@ mod tests {
         std::os::unix::fs::symlink(&b, &a).expect("建立 a -> b");
         std::os::unix::fs::symlink(&a, &b).expect("建立 b -> a");
         assert_eq!(normalize(&a.join("x")), a.join("x"));
+    }
+
+    #[test]
+    fn parent_steps_out_of_a_missing_tail_resume_physical_resolution() {
+        let (_dir, root) = physical_tempdir();
+        std::fs::create_dir(root.join("actual")).unwrap();
+        std::os::unix::fs::symlink("actual", root.join("alias")).unwrap();
+        for written in [
+            "missing/../alias/rc",
+            "missing/nested/../../alias/rc",
+            "missing/../absent/../alias/rc",
+            "alias/missing/../../alias/rc",
+        ] {
+            let resolved = normalize(&root.join(written));
+            assert_eq!(resolved, root.join("actual/rc"), "{written}");
+            assert_eq!(normalize(&resolved), resolved, "{written}");
+        }
+        assert_eq!(
+            normalize(&root.join("missing/alias/rc")),
+            root.join("missing/alias/rc")
+        );
+        assert_eq!(
+            normalize(&root.join("missing/../alias")),
+            root.join("alias")
+        );
     }
 
     #[test]
