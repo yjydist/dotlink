@@ -6,10 +6,9 @@ rust-version = "1.97"
 
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }
-serde = { version = "1.0", features = ["derive"] }
 toml = "1.1"
 thiserror = "2.0"
-time = { version = "0.3", features = ["formatting", "local-offset"] }
+time = { version = "0.3", features = ["local-offset"] }
 
 [target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
 rustix = { version = "1.1", features = ["fs"] }

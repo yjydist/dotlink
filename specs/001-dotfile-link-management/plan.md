@@ -30,7 +30,7 @@
 
 **Language/Version**: Rust 1.97.0 (edition 2024).本机实测 `rustc 1.97.0 (2d8144b78 2026-07-07)`
 
-**Primary Dependencies**: `clap` 4.6 (derive, CLI 解析), `serde` 1.0 + `toml` 1.1 (清单解析), `thiserror` 2.0 (库错误类型), `time` 0.3 (备份文件名的可读时间戳).已在本机解析确认可用的精确版本 (`Cargo.lock` 实测): `clap` 4.6.7, `toml` 1.1.8+spec-1.1.0, `serde` 1.0.229, `thiserror` 2.0.21, `time` 0.3.55 (features `formatting`, `local-offset`)
+**Primary Dependencies**: `clap` 4.6 (derive, CLI 解析), `toml` 1.1 (清单解析), `thiserror` 2.0 (库错误类型), `time` 0.3 (local-offset, 备份时间戳), macOS/Linux 下的 `rustix` 1.1 (fs, 原子不覆盖移动). 锁定版本: `clap` 4.6.7, `toml` 1.1.8+spec-1.1.0, `thiserror` 2.0.21, `time` 0.3.55, `rustix` 1.1.5. 未使用的直接 `serde` 依赖及 `time/formatting` 已移除.
 
 **Storage**: 无数据库,无状态文件.唯一持久化产物是被覆盖内容的备份副本, 存放在被覆盖路径的同一目录下, 文件名形如 `<原名>.dotlink-backup.<YYYYMMDDThhmmss>`.清单位置与仓库根目录也没有配置面: 二者都由"当前工作目录下的 `dotlink.toml`"唯一确定 (FR-015)
 
@@ -61,7 +61,7 @@
 | III. TDD (不可协商) | 测试先于实现并确认失败; 合同测试先于实现 | PASS | `tasks.md` 把每个故事的测试任务置于该故事实现之前; `tests/` 直接断言 `contracts/cli.md` 的退出码与状态 token 契约.**顺序约束**: 覆盖 `classify` 的单元测试与覆盖清单校验 (V-1 到 V-7) 的契约测试必须先于 `src/classify.rs` / `src/manifest.rs` 完成并确认失败 |
 | IV. 代码即文档 | 命名表达意图; 函数单一职责; 结构替代注释 | PASS | 模块按"变化原因"而非"行数"命名 (解析 / 判定 / 动作 / 呈现); `backup_path_for` / `find_latest_backup` / `link_is_inside_repo` 等函数名自解释 |
 | V. 最小注释 | 只解释代码表达不了的"为什么" | PASS | 设计中确实需要注释的只有两处非显而易见的"为什么" -- `research.md` R2 的规范化陷阱与 R6 的"可编译 + 运行时拒绝"组合; 二者记于设计文档, 不散落为代码注释 |
-| VI. 简单性与反抽象 | 不超过 3 个项目; 不包装框架; 无投机抽象 | PASS | 单一 crate (lib + bin), 1 个项目; 直接使用 `clap` / `serde` / `toml`, 未做包装; 无 trait 抽象层,无工厂,无输出格式开关 |
+| VI. 简单性与反抽象 | 不超过 3 个项目; 不包装框架; 无投机抽象 | PASS | 单一 crate (lib + bin), 1 个项目; 直接使用 `clap` / `toml`, 未做包装; 无 trait 抽象层,无工厂,无输出格式开关 |
 | VII. 集成优先测试 | 真实实例而非 mock; 合同测试先于实现; 验证真实行为 | PASS | 测试用真实文件系统与真实二进制进程 (`assert_cmd` + 临时 `HOME`), 不 mock 文件系统; 本工具无外部服务可 mock; `tests/manifest_errors.rs` 逐条验证 `cli.md` 的退出码契约 |
 | VIII. 持续精炼 | 规范 / 计划 / 代码持续一致; 歧义回写最上游 | PASS | 本次规划已修正并回写 spec / data-model / cli / quickstart 之间的四处实质矛盾, 见下方"设计修正" |
 
@@ -181,7 +181,7 @@ tests/
 | TDD (不可协商) | PASS | `T048` / `T046` / `T047` 三批红测试均先于其实现 (`exit_code_for` / `manifest` / `classify`) 完成并确认失败, 顺序约束记录于 `tasks.md` Phase 2 的硬性先后关系 |
 | 代码即文档 | PASS | `backup_path_for` / `find_latest_backup` / `link_is_inside_repo` / `exit_code_for` 等命名自解释; 模块按"变化原因"划分 (解析 / 判定 / 动作 / 呈现) |
 | 最小注释 | PASS | 注释集中于两处非显而易见的原因: `os::normalize` 的"为何不得用 `canonicalize`"与"为何不解析末端段", 以及 `os/mod.rs` 的"可编译空实现 + 运行时拒绝"组合 |
-| 简单性与反抽象 | PASS | 单一 crate (1 个项目); 直接使用 `clap` / `serde` / `toml`, 无包装; 无 trait 抽象层与工厂.复查中移除了无消费者的 `os::is_symlink` (T007 曾要求), 与 `source_kind` 的处置同理 |
+| 简单性与反抽象 | PASS | 单一 crate (1 个项目); 直接使用 `clap` / `toml`, 无包装; 无 trait 抽象层与工厂.复查中移除了无消费者的 `os::is_symlink` (T007 曾要求), 与 `source_kind` 的处置同理 |
 | 集成优先测试 | PASS | 测试用真实文件系统与真实二进制进程 (`assert_cmd` + 临时 `HOME`), 不 mock 文件系统; 无外部服务可 mock |
 | 持续精炼 | PASS | 六轮审查的修正均回写至最上游文档; 本轮 (`os::normalize` 语义与 T040 夹具) 已同步回写 `research.md` / `data-model.md` / `tasks.md` |
 
