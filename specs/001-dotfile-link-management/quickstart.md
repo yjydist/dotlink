@@ -6,20 +6,26 @@
 
 - macOS 或 Linux; Rust 工具链 1.97 或更高.
 - 构建: `cargo build` (产物 `target/debug/dotlink`).
+- 先用 `bash --noprofile --norc` 打开独立 Bash 会话, 从项目源码目录开始, 完成后 `exit` 返回原会话.
 - **所有场景都必须在临时目录中执行**, 且用临时目录作为 `HOME`, 以免触及真实主目录:
 
   ```sh
-  export D=/tmp/dotlink-demo && rm -rf "$D" && mkdir -p "$D/repo/shell" "$D/home/.config"
+  export DOTLINK_PROJECT="$PWD"
+  export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+  export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+  D=$(mktemp -d "${TMPDIR:-/tmp}/dotlink-demo.XXXXXX")
+  export D
+  mkdir -p "$D/repo/shell" "$D/home/.config"
   export HOME="$D/home"          # 关键: 隔离主目录
   export PATH="$PWD/target/debug:$PATH"
   printf 'export EDITOR=vim\n' > "$D/repo/shell/bashrc"
-  mkdir -p "$D/repo/nvim" && printf 'set number\n' > "$D/repo/nvim/init.lua"
+  mkdir -p "$D/repo/nvim" && printf 'vim.opt.number = true\n' > "$D/repo/nvim/init.lua"
   cd -P "$D/repo"
   ```
 
   后续所有清单内容都写入 `$D/repo/dotlink.toml`, 命令都在 `$D/repo` 下执行.
 
-  **`$D` 的路径形态是固定的, 不要改变**: 在 macOS 上 `/tmp` 是指向 `/private/tmp` 的符号链接, `cd -P "$D/repo"` 会进入物理路径 `/private/tmp/dotlink-demo/repo`. 本文件里展示的输出与 `readlink` 期望值都按这个形态书写 (例如 `readlink "$HOME/.config/nvim"` 期望 `/private/tmp/dotlink-demo/nvim`). 若你的 shell 把 `cd` 实现为逻辑切换 (保留 `/tmp` 形态, 如 zsh 的默认设置), 则场景 1 的 `readlink` 输出会是 `/tmp/dotlink-demo/nvim`, 这是同一个位置, 属正常差异. 由于 `$HOME` 与仓库同被 `/tmp` 前缀覆盖, 二者的规范化结果一致, 归属判定不受影响 (这正是 `research.md` R2 的实测情形).
+  链接指向物理路径: macOS 的 `/tmp` 等路径可能是符号链接, 因此以 `pwd -P` 的输出作为仓库根来比较 `readlink` 结果, 不要硬编码临时目录名.
 
   **状态是累积的**: 各场景依次在前一个场景结束时留下的状态上继续, 因此每个场景的"期望"只在**上一个场景确实按文档执行完**时才成立. 下表是各场景的起始状态, 供手工分步执行时对照:
 
@@ -38,7 +44,7 @@
   | 11 | 场景 10 结束时两条链接均为本工具创建 (其中 `$HOME/.bashrc` 的链接文本含 `..`) |
   | 12 | **需重置**: 清单复原为 2 条, 两条路径删除后重新部署 |
   | 13 | 与场景 12 结束时相同 (本场景只跑 `cargo check`, 不碰仓库) |
-  | 14 | 场景 12 末尾的 `preview || apply` 已把两条链接重新部署好; 本场景换成只含一个源缺失条目的清单 |
+  | 14 | 场景 12 末尾按退出码分支的部署步骤已把两条链接重新部署好; 本场景换成只含一个源缺失条目的清单 |
 
   累积有三类, 都必须重置:
 
@@ -64,8 +70,8 @@ target = "~/.config/nvim"
 EOF
 
 dotlink apply; echo "exit=$?"        # 期望 exit=0, 2 个条目: 2 成功, 0 已是最新, 0 未处理, 0 失败
-ls -l "$HOME/.bashrc"                # 期望: 符号链接 -> /private/tmp/dotlink-demo/repo/shell/bashrc
-ls -l "$HOME/.config/nvim"           # 期望: 符号链接 -> /private/tmp/dotlink-demo/repo/nvim
+ls -l "$HOME/.bashrc"                # 期望: 符号链接 -> $(pwd -P)/shell/bashrc
+ls -l "$HOME/.config/nvim"           # 期望: 符号链接 -> $(pwd -P)/nvim
 cat "$HOME/.bashrc"                  # 期望: export EDITOR=vim
 ```
 
@@ -147,7 +153,7 @@ dotlink apply; echo "exit=$?"
 
 注意不要用 `sed -i.bak 's|...|<内容含 \\n>|'` 来做这件事: `sed` 的替换串里 `\n` 的展开行为依实现而异, 且 `-i.bak` 在 GNU sed 下会被解析为"`-i` 的脚本是 `.bak`"而非"备份后缀为 `.bak`", 结果不是预期的改文件. 需要一份新清单时直接重写整个文件最稳.
 
-**期望**: `1/2` 行为 `replace` 且说明中给出备份文件的完整路径; 该路径内容为 `my precious notes`; `$HOME/.bashrc` 已成为指向 `/private/tmp/dotlink-demo/repo/shell/bashrc` 的链接; 汇总为 `2 个条目: 1 成功, 1 已是最新, 0 未处理, 0 失败`, 退出码 0.
+**期望**: `1/2` 行为 `replace` 且说明中给出备份文件的完整路径; 该路径内容为 `my precious notes`; `$HOME/.bashrc` 已成为指向 `$(pwd -P)/shell/bashrc` 的链接; 汇总为 `2 个条目: 1 成功, 1 已是最新, 0 未处理, 0 失败`, 退出码 0.
 
 ## 场景 5 (SC-006, US2): 预览与实际一致, 且只读
 
@@ -411,23 +417,27 @@ dotlink undo;    echo "undo=$?"      # 期望 0: 已撤销干净 (两行均为 o
 # 因此这里无需再手工删除任何路径: 两个条目此时都是 Absent -> 有活要干.
 dotlink preview; echo "preview=$?"   # 期望 1: 有活要干
 dotlink status;  echo "status=$?"    # 期望 1: 存在偏离
-dotlink preview || dotlink apply     # 期望: preview 退出 1, 故 apply 被执行
+if dotlink preview; then
+  echo "无需部署"
+else
+  dotlink_code=$?
+  case "$dotlink_code" in
+    1) dotlink apply ;;             # 本场景有待创建链接, apply 退出 0
+    *) exit "$dotlink_code" ;;
+  esac
+fi
 ```
 
 **关键**: 同一份"已部署好"的清单上 `apply`/`preview` 退 0, 而 `undo` 退 1 -- 二者目标相反, 这是预期而非缺陷.
 
-在 `set -e` 脚本中的推荐写法 (避免裸调只读命令导致中断):
-
-```sh
-if dotlink preview >/dev/null; then echo "无需部署"; else dotlink apply; fi
-if dotlink undo    >/dev/null; then echo "无需撤销"; else dotlink undo; fi
-```
+`set -e` 的脚本整合示例见 [README](../../README.md#在-set--e-脚本中使用). 退出 1 也可能含失败条目, 应保留报告; `undo` 只调用一次即可执行撤销并获取结果. 不要在此额外执行撤销, 以免改变后续场景的起始状态.
 
 ## 场景 13 (FR-019): 平台门禁
 
 ```sh
 rustup target add x86_64-pc-windows-gnu      # 若该 target 尚未安装
-cargo check --target x86_64-pc-windows-gnu   # 期望: 通过 (证明非 unix 分支可编译)
+cargo check --locked --manifest-path "$DOTLINK_PROJECT/Cargo.toml" --target x86_64-pc-windows-gnu
+# 期望: 通过 (证明非 unix 分支可编译)
 ```
 
 **必须用 `cargo check` 而非 `cargo build`**: 链接 Windows 二进制需要 mingw-w64 工具链 (`x86_64-w64-mingw32-dlltool` 等), 本机 (实测) 未安装, `cargo build` 会以 `error calling dlltool` 失败 -- 那是环境缺工具, 不是代码问题. `cargo check` 只做类型与借用检查, 已足够证明"非 unix 分支的源码在 Windows 上可编译", 即 `os/unix.rs` 的 `#[cfg(unix)]` 与空实现分支划分正确.
@@ -440,7 +450,7 @@ Windows 上的**运行时**行为无法在本机验证, 需在 Windows 环境或
 
 `contracts/cli.md` 的退出码规则由两个条件合成: **目标谓词成立** 且 **无遗留待办**. 本场景专门验证第二个条件单独生效 -- 源缺失条目计入汇总的"失败"列, 因此即使某条命令的目标谓词在它身上已成立, 也必须退 1 而非 0.
 
-**起始状态**: 场景 12 末尾的 `dotlink preview || dotlink apply` 已把两条链接重新部署好 (场景 13 只跑 `cargo check`, 不改仓库). 本场景把清单整体改写为只含一个源缺失条目; 由于 `SourceMissing` 的判定优先于目标侧的一切 (源不存在时无从谈起"已是最新"或"冲突"), 该条目在四条命令下一律为 `missing`:
+**起始状态**: 场景 12 末尾按退出码分支的部署步骤已把两条链接重新部署好 (场景 13 只跑 `cargo check`, 不改仓库). 本场景把清单整体改写为只含一个源缺失条目; 由于 `SourceMissing` 的判定优先于目标侧的一切 (源不存在时无从谈起"已是最新"或"冲突"), 该条目在四条命令下一律为 `missing`:
 
 ```sh
 cat > dotlink.toml <<'EOF'
@@ -465,5 +475,7 @@ dotlink undo;    echo "undo=$?"      # 期望 1: 目标谓词已成立 (无我�
 ## 完成后清理
 
 ```sh
-rm -rf "$D"; cd /; unset D HOME
+cd /
+rm -rf "$D"
+exit  # 退出前置步骤打开的独立 Bash 会话, 恢复原会话的 HOME 等环境
 ```

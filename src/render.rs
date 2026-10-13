@@ -94,7 +94,7 @@ fn row_for(entry: &Entry, token: EntryOutcome, note: String) -> ReportRow {
 
 /// 由同一次判定同时产出 token 与说明.
 ///
-/// 命令接入时**应当用本函数而不是分别调用 [`token_for`] 与 [`note_for`]**:
+/// 命令接入时**应当用本函数而不是分别调用 [`token_for`] 与 `note_for`**:
 /// 说明的分支由 token 驱动, 若分别调用则同一行可能带着与 token 不符的措辞.
 pub fn row_from_state(
     command: Command,

@@ -6,10 +6,10 @@
 
 ## 安装
 
+获取源码后, 在项目源码目录运行:
+
 ```sh
-git clone <dotlink 仓库>
-cd dotlink
-cargo install --path .           # 安装到 ~/.cargo/bin; 或者只 cargo build --release, 产物为 target/release/dotlink
+cargo install --path . --locked  # 安装到 ~/.cargo/bin
 ```
 
 要求 Rust 1.97 或更高; 受支持平台为 macOS 与 Linux. 安装完成后, dotlink 在你的 dotfiles 仓库中运行 (下节的 `~/dotfiles` 即该仓库).
@@ -24,7 +24,7 @@ cargo install --path .           # 安装到 ~/.cargo/bin; 或者只 cargo build
 cd ~/dotfiles                        # 仓库根目录, 也是 dotlink.toml 所在处
 mkdir -p shell nvim
 printf 'export EDITOR=vim\n' > shell/bashrc
-printf 'set number\n' > nvim/init.lua
+printf 'vim.opt.number = true\n' > nvim/init.lua
 ```
 
 **1. 编写清单** `~/dotfiles/dotlink.toml`:
@@ -52,7 +52,7 @@ $ echo $?
 1
 ```
 
-退出码 1 的含义是"有活要干", 不是出错.
+这里退出 1 表示有链接待创建; 其他情况下也可能表示冲突、源缺失或失败, 需结合逐条结果判断.
 
 **3. 部署**:
 
@@ -207,31 +207,34 @@ $ echo $?
 
 ## 在 `set -e` 脚本中使用
 
-退出 1 表示"有待办", **不代表出错**. 因此裸调只读命令会让 `set -e` 的脚本中断在"其实还有活要干"这一步上, 而不是中断在真正的错误上. 请改用条件形态:
+退出 1 既可能表示有待办, 也可能包含跳过或失败的条目. 保留逐条输出, 并区分 1 与清单错误 2、平台错误 3. 以下示例在 `preview` 退出 1 时尝试部署, 将最终结果交给 `apply` 判断:
 
 ```sh
 set -e
-if dotlink preview >/dev/null; then
+if dotlink preview; then
   echo "已完全符合期望, 无需部署"
 else
-  dotlink apply
+  dotlink_code=$?
+  case "$dotlink_code" in
+    1) dotlink apply ;;
+    *) exit "$dotlink_code" ;;
+  esac
 fi
 ```
 
-`undo` 同理:
+`undo` 会直接执行撤销, 成功移除链接也可能退出 1. 只调用一次, 查看逐条结果, 并保留原退出码供调用者判断:
 
 ```sh
-if dotlink undo >/dev/null; then echo "无需撤销"; else dotlink undo; fi
-```
-
-只在关心失败时, 用退出码区分三种结局:
-
-```sh
-dotlink status || case $? in
-  1) echo "有偏离或待办, 需要处理" ;;
-  2) echo "清单有问题, 先修清单" ;;
+set -e
+dotlink_code=0
+dotlink undo || dotlink_code=$?
+case "$dotlink_code" in
+  0) echo "无需撤销" ;;
+  1) echo "请检查上方结果: 已执行撤销, 或有跳过、源缺失或失败的条目" ;;
+  2) echo "清单校验或调用方式错误" ;;
   3) echo "平台不受支持" ;;
 esac
+exit "$dotlink_code"
 ```
 
 ## 平台
@@ -255,14 +258,8 @@ cargo fmt --check
 
 ## 已知限制
 
-- **并发**: 不保证并发调用串行化. 同一清单的并发 `apply` 可能产生重复备份文件, 但单个条目层面的链接创建/替换是原子的, 不会产生指向错误位置的链接.
+- **并发**: 不保证并发调用串行化. 单次链接创建与不覆盖移动是原子操作, 但整个 `apply` / `undo` 不是事务; 替换期间目标可能暂时不存在, 多步操作可能部分失败. 并发修改源或父目录没有完整隔离, 并发调用可能产生重复备份.
 - **备份不自动回收**: `undo` 恢复后备份文件仍留在原地, 更早的备份不会被自动使用或删除, 需自行清理; 复制中断留下的 `.partial` 残留也不会被 `undo` 消费.
 - **`undo` 只恢复最新备份**: 同目录下按"先比时间戳, 同一秒内再比消歧序号的数值"取最新的一份; 更早的备份保留但不被自动使用.
 
-## 文档审阅记录
-
-以下三条成功标准为主观判断项, 由本文件的作者逐条复核, 结论留痕于此.
-
-- **SC-008** (新用户只读快速上手即可在 5 分钟内完成全流程): 通过. 快速上手给出 4 个编号步骤, 共 6 条命令 (`cd` / `mkdir` + `printf` + `printf` 建素材, `preview`, `apply`, `status` 验证), 期望输出逐条列出且与实测一致, 无需查阅其他文档.
-- **SC-007** (仅凭命令行输出即可判断每个条目的结果与下一步动作): 通过. 实测构造的 `conflict` / `skip` / `missing` / `fail` / `foreign` / `wrong` 各行之说明均含原因, `replace` / `restore` 行含备份文件完整路径, `foreign` / `wrong` 行含占用物类型与实际指向.
-- **SC-010** (解释命令该在哪里运行所需的文字不超过一句话): 通过. 全文只有"快速上手"开头引用块的一句陈述运行位置, 句子数计 1; 安装与清单格式两节不涉及运行位置.
+更多可执行验证场景见 [端到端验证指南](specs/001-dotfile-link-management/quickstart.md).

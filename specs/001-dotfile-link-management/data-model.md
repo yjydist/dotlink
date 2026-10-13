@@ -151,23 +151,20 @@
 
 ### 3.4 状态迁移 (以单条目为视角)
 
-```text
-                 +--------------------------------------------+
-                 |                                            |
-   [Absent] --apply/Create--> [LinkedCorrect]                |
-      ^                            |                         |
-      |                            | apply 后用户手工改坏了   |
-      |                            v                         |
-      |                     [ForeignFile] <-/ForeignDir/     |
-      |                            |        ForeignLink       |
-      |                            |                         |
-      |   undo (移除链接,           | apply/ReplaceAndBackup |
-      |   若有备份则恢复)           v                         |
-      +---------------------- [LinkedCorrect] ---------------+
-                               (备份留存于同目录)
-
-   [SourceMissing] 是终态: 在源条目被补回仓库之前, 任何 apply/undo 都不改变它.
+```mermaid
+flowchart TD
+    Absent -->|apply / Create| LinkedCorrect
+    LinkedCorrect -->|用户修改目标| Foreign[ForeignFile / ForeignDir / ForeignLink]
+    Foreign -->|apply / ReplaceAndBackup| LinkedCorrect
+    LinkedWrong -->|apply / ReplaceAndBackup| LinkedCorrect
+    LinkedCorrect -->|undo 无备份| Absent
+    LinkedWrong -->|undo 无备份| Absent
+    LinkedCorrect -->|undo 有备份| Restored[恢复原对象, 按实况重新判定]
+    LinkedWrong -->|undo 有备份| Restored
+    SourceMissing -->|源未补回时 apply / undo 不改变状态| SourceMissing
 ```
+
+图中展示成功操作的迁移; `skip` 策略保留占用物, 失败结果另行报告. 恢复的备份也可能是指向仓库内的链接, 不能一概视为 `Absent` 或外部占用物.
 
 撤销的语义边界 (FR-009 / FR-010): `undo` 只在 `Current` 属于 `LinkedCorrect` / `LinkedWrong` 时才移除链接; 其余情况 (含 `ForeignLink`) 一律跳过并报告原因, 绝不删除.这正是"绝不触碰非本工具创建的路径"由 `Current` 的类型直接保证 -- 外部链接落在 `ForeignLink`, 而 `undo` 的分支不包含它.移除链接后, 若同目录存在 `<原名>.dotlink-backup.*`, 恢复最新一个.
 
@@ -185,9 +182,9 @@
 | 内容 | 原对象的一份副本.原对象是文件/目录则递归复制; 原对象是符号链接则复制**链接本身** (不跟随) |
 | 查找 | 撤销时取同目录下名称以 `<原名>.dotlink-backup.` 开头者中"最新"的一个: 先比 15 位时间戳, 同一秒内再比消歧序号的**数值** (裸名视为 0). 不是整名字典序 -- 序号 `10` 的字典序小于 `9` |
 
-**完整性 (写入顺序)**: 递归复制一个目录可能在中途被中断, 而"取最新者"这一查找规则无法分辨完整与不完整的备份. 因此备份的写入必须是**两步**: 先复制到进程级唯一的临时名 `<原名>.dotlink-backup.<YYYYMMDDThhmmss>.<pid>.partial`, 全部复制成功后再原子改名为最终名. 最终改名成功即视为该备份"已完整". 与 R8 的"符号链接创建本身即原子"是同一原则: 不向外暴露半成品状态.
+**完整性 (写入顺序)**: 递归复制一个目录可能在中途被中断, 而"取最新者"这一查找规则无法分辨完整与不完整的备份. 因此备份的写入必须是**两步**: 先排他创建临时名 `<原名>.dotlink-backup.<YYYYMMDDThhmmss>.<pid>.partial`, 占用时在 `.partial` 前追加序号重试; 全部复制成功后再以原子不覆盖移动发布最终名, 冲突则递增最终名序号. PID 本身不保证唯一性. 最终改名成功即视为该备份"已完整", 不向撤销查找暴露半成品; 这不等于断电持久性或整个操作的事务保证.
 
-**查找规则因此收窄**: `find_latest_backup` **只接受已完整命名的备份** (名称不含 `.partial` 后缀). 中断残留的 `.partial` 文件既不参与"取最新", 也不被 `undo` 消费; 它们与原备份一样留在磁盘上, 由用户自行清理. 该残留路径计入 `research.md` R4 的"已知限制".
+**查找规则因此收窄**: `BackupFinder` 在每次撤销动作之前, 按目录扫描一次并复用内存快照, **只接受已完整命名的备份** (名称不含 `.partial` 后缀). 中断残留的 `.partial` 文件既不参与"取最新", 也不被 `undo` 消费; 它们与原备份一样留在磁盘上, 由用户自行清理. 该残留路径计入 `research.md` R4 的"已知限制".
 
 **先复制后删除的硬顺序**: 备份的**全部**内容在磁盘上落定并被改名之后, 才允许删除/替换原对象. 递归复制一个**目录**可能在中途失败 (权限, 磁盘满, 中断), 而原对象是唯一的副本; 若先删除再复制, 一次中途失败就是不可恢复的数据丢失, 直接违反 SC-004 与 US3 的立项目标. 因此顺序严格为: 复制到 `.partial` -> 复制成功 -> 改名为最终名 -> 删除原对象 -> 建立链接. 任一步在此之前失败, 原对象必须原样保留, 该条目报 `fail` 并说明原因 (对应 `tasks.md` 的 T025).
 

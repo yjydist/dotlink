@@ -92,11 +92,19 @@ dotlink: 不支持当前平台 (仅支持 macOS 与 Linux)
 
 **`undo` 的谓词在动手之前求值**: 这一点必须明说, 否则会被读成"撤销后再看还剩多少链接" (那样任何情况都恒为 0). `undo` 的谓词问的是"**本次要撤销的清单**上是否还有本工具创建的链接", 在动作**之前**取一次值. 因此刚部署好的清单上该谓词为假 -> 退 1; 对一份本就没有本工具链接的清单 (含撤销后目标为空的再次运行) 该谓词为真; 谓词为真时若条件 2 也通过 (无 `skip` / `missing` 等残留) 则退 0. 同时, 撤销过程中新暴露出的 `skip` / `missing` 等条目仍会通过条件 2 让退出码为 1, 这正是"条件 2 独立于条件 1"的作用.
 
-由此 `preview` 在一个尚未部署的仓库上退出 1, 语义是"有活要干", 可用作部署前置检查:
+`preview` 退出 1 可能表示待部署, 也可能包含冲突、源缺失或失败. 可在保留逐条报告的前提下尝试 `apply`, 但清单错误 2 和平台错误 3 应直接传给调用者:
 
 ```sh
-dotlink preview && echo "已完全符合期望, 无需部署"
-dotlink preview || dotlink apply    # 仅在有变化时才部署
+set -e
+if dotlink preview; then
+  echo "已完全符合期望, 无需部署"
+else
+  dotlink_code=$?
+  case "$dotlink_code" in
+    1) dotlink apply ;;
+    *) exit "$dotlink_code" ;;
+  esac
+fi
 ```
 
 ## 输出契约

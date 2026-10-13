@@ -25,10 +25,12 @@ macro_rules! long_about {
             $head,
             "\n\
 \n\
-set -e 脚本中不要裸调本命令: 退出 1 表示 '有待办', 不代表出错, 但裸调会让 set -e\n\
-的脚本中断. 应改用条件形态 (见 README):\n\
+退出 1 可能表示有待办, 也可能包含跳过或失败. set -e 脚本应保留输出并按退出码分支\n\
+(见 README); undo 会直接执行撤销, 不要为了检查结果而重复调用:\n\
 \n\
-  if dotlink preview >/dev/null; then ...; else dotlink apply; fi\n\
+  if dotlink preview; then echo '无需部署'; else\n\
+    code=$?; case \"$code\" in 1) dotlink apply ;; *) exit \"$code\" ;; esac\n\
+  fi\n\
 \n\
 退出码 0 当且仅当本命令的目标已达成**且**没有遗留待办; 有待办时 (含只读命令) 退 1.\n\
 退出码 2 有两重含义: '清单校验失败' 或 '子命令缺失/拼错', 前者报 'dotlink: 无法\n\
