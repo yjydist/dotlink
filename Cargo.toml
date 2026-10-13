@@ -29,3 +29,8 @@ all = "warn"
 
 [lints.rust]
 unsafe_code = "forbid"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
