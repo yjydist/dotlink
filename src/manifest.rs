@@ -1,5 +1,6 @@
 //! 清单解析与全量校验 (V-1 到 V-10).
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::entry::{self, Entry, OnConflict};
@@ -99,6 +100,10 @@ pub fn parse(text: &str, repo_root: &Path) -> Result<Manifest> {
     // V-9 的仓库形态比较基准与 `entry::resolve_with` 的越界判定同源.
     let repo = os::normalize(repo_root);
     let home = entry::home().ok().map(|path| os::normalize(&path));
+    // V-5 的重复检测: 目标路径 -> 首次声明它的条目下标. 用哈希表把逐条目两两比较的
+    // O(N^2) 降到 O(N), 并保持"报第一对冲突"的语义 (get 返回的是最早的下标).
+    let mut first_declared_at: HashMap<std::path::PathBuf, usize> =
+        HashMap::with_capacity(written_entries.len());
 
     for (index, written) in written_entries.iter().enumerate() {
         let Some(table) = written.as_table() else {
@@ -160,12 +165,9 @@ pub fn parse(text: &str, repo_root: &Path) -> Result<Manifest> {
             ));
         }
 
-        // V-5: 比较 `os::normalize` 之后的 `target_path` (由 `resolve` 产出).
+        // V-5: 比较 `os::normalize` 之后的 `target_path` (由 `resolve_with` 产出).
         // 不得用 `Path::canonicalize`: 待部署的目标通常尚不存在.
-        if let Some(previous) = entries
-            .iter()
-            .position(|existing| existing.target_path == resolved.target_path)
-        {
+        if let Some(&previous) = first_declared_at.get(resolved.target_path.as_path()) {
             return Err(Error::ManifestInvalid(format!(
                 "条目 `{}` 与条目 `{}` 声明了同一个目标路径: {}",
                 entry_label(previous),
@@ -173,6 +175,7 @@ pub fn parse(text: &str, repo_root: &Path) -> Result<Manifest> {
                 resolved.target_path.display()
             )));
         }
+        first_declared_at.insert(resolved.target_path.clone(), index);
 
         entries.push(resolved);
     }
