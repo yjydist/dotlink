@@ -245,16 +245,23 @@ Windows 上的运行时拒绝**未在任何环境验证** (`cargo check --target
 
 ## 开发
 
-要求 Rust 1.97 或更高 (edition 2024). 常用命令:
+要求 Rust 1.97 或更高 (edition 2024), 并安装当前工具链的 `rustfmt` 与 `clippy` 组件. 运行本地完整检查:
 
 ```sh
-cargo build --release                        # 产物在 target/release/dotlink
-cargo test                                   # 单元测试 + 端到端测试 (真实二进制 + 临时 HOME)
-cargo clippy --all-targets -- -D warnings    # 与提交要求一致
-cargo fmt --check
+./scripts/check.sh
 ```
 
-设计文档 (规格, 契约, 数据模型, 验证场景) 在 `specs/001-dotfile-link-management/`. 跨平台可编译性用 `cargo check --target x86_64-pc-windows-gnu` 验证, 运行时拒绝行为需在 Windows 环境确认 (见"平台").
+脚本自动定位项目根目录, 依次执行格式检查、全套测试、Clippy、将警告视为错误的 rustdoc 构建和 release 构建, 任一步失败即停止. 检查不修改源码; 构建产物位于 `target/`, 二进制为 `target/release/dotlink`. 脚本使用锁文件, 不安装工具链或交叉编译目标.
+
+按需验证最低 Rust 版本及跨平台编译 (需事先通过 `rustup` 安装对应工具链和目标):
+
+```sh
+cargo +1.97.0 test --locked
+cargo check --locked --target x86_64-unknown-linux-gnu
+cargo check --locked --target x86_64-pc-windows-gnu
+```
+
+设计文档 (规格, 契约, 数据模型, 验证场景) 在 `specs/001-dotfile-link-management/`. 交叉编译检查不能代替目标平台的运行时验证; Windows 拒绝行为仍需在 Windows 环境确认 (见"平台").
 
 ## 已知限制
 
