@@ -39,7 +39,7 @@ pub fn resolve(
     repo_root: &Path,
 ) -> Result<Entry> {
     let repo = os::normalize(repo_root);
-    let home = home().ok().map(|path| os::normalize(&path));
+    let home = home().map(|path| os::normalize(&path));
     resolve_with(
         source,
         target,
@@ -56,8 +56,8 @@ pub fn resolve(
 /// 接受仓库内的相对路径, 且解析与归一化后不得越出仓库根. 两侧路径形态的裁决分别是
 /// `expand_target` / `expand_source`, 越界判定在归一化之后.
 ///
-/// `repo` 必须等于 `os::normalize(repo_root)`; `home` 是 `Some(os::normalize(HOME))`,
-/// `HOME` 不可用时为 `None`. `manifest::parse` 在整个条目循环之外只算一次, 因此条目
+/// `repo` 必须等于 `os::normalize(repo_root)`; `home` 是已规范化的有效主目录或错误.
+/// `manifest::parse` 在整个条目循环之外只算一次, 因此条目
 /// 再多也不会重复规范化这两个固定路径 (它们与条目数无关).
 pub(crate) fn resolve_with(
     source: &str,
@@ -65,7 +65,7 @@ pub(crate) fn resolve_with(
     on_conflict: OnConflict,
     repo_root: &Path,
     repo: &Path,
-    home: Option<&Path>,
+    home: std::result::Result<&Path, &Error>,
 ) -> Result<Entry> {
     let target_path = os::normalize(&expand_target(target, repo_root, home)?);
     let source_path = os::normalize(&expand_source(source, repo_root)?);
@@ -99,7 +99,11 @@ pub(crate) fn resolve_with(
 /// 既非主目录简写也不是绝对路径 -- 若放行会落到"相对仓库根"分支, 在受版本控制的
 /// 仓库里静默建出名为 `~.bashrc` 的路径 (`contracts/manifest.md` 的 V-6). 与 V-8 的
 /// 立场一致, 一律整体拒绝并指出书写形态.
-fn expand_target(written: &str, repo_root: &Path, home: Option<&Path>) -> Result<PathBuf> {
+fn expand_target(
+    written: &str,
+    repo_root: &Path,
+    home: std::result::Result<&Path, &Error>,
+) -> Result<PathBuf> {
     if let Some(rest) = written.strip_prefix("~/") {
         return Ok(require_home(home)?.join(rest));
     }
@@ -134,8 +138,8 @@ fn expand_source(written: &str, repo_root: &Path) -> Result<PathBuf> {
     Ok(repo_root.join(written))
 }
 
-/// `HOME` 缺失时的统一说明 (`home` 与 [`require_home`] 共用).
-const HOME_MISSING: &str = "无法确定主目录: 环境变量 HOME 未设置 (无法把 `~` 解析为绝对路径)";
+/// `HOME` 缺失时的说明.
+const HOME_MISSING: &str = "无法确定主目录: 环境变量 HOME 未设置或为空 (无法把 `~` 解析为绝对路径)";
 
 /// 展开 `~` 所需的当前用户主目录 (原始形态, 未规范化).
 ///
@@ -143,17 +147,26 @@ const HOME_MISSING: &str = "无法确定主目录: 环境变量 HOME 未设置 (
 /// "落点恰是主目录本身"的退化形态, 与 `~` 展开共用同一个来源.
 pub(crate) fn home() -> Result<PathBuf> {
     match std::env::var_os("HOME") {
-        Some(value) if !value.is_empty() => Ok(PathBuf::from(value)),
+        Some(value) if !value.is_empty() => {
+            let path = PathBuf::from(value);
+            if !path.is_absolute() {
+                return Err(Error::ManifestInvalid(format!(
+                    "无法确定主目录: 环境变量 HOME 必须是绝对路径 (实际为 `{}`)",
+                    path.display()
+                )));
+            }
+            Ok(path)
+        }
         _ => Err(Error::ManifestInvalid(HOME_MISSING.to_string())),
     }
 }
 
-/// 取已规范化的主目录; 缺失时报与 [`home`] 相同的错误.
+/// 取已规范化的主目录; 不可用时保留其具体原因.
 ///
 /// `expand_target` 只在确实需要展开 `~` 时才要求主目录, 因此把"是否存在"与"展开"
 /// 分开: 循环外预取一次, 绝对路径与相对路径不受 `HOME` 缺失影响.
-fn require_home(home: Option<&Path>) -> Result<&Path> {
-    home.ok_or_else(|| Error::ManifestInvalid(HOME_MISSING.to_string()))
+fn require_home<'a>(home: std::result::Result<&'a Path, &Error>) -> Result<&'a Path> {
+    home.map_err(|error| Error::ManifestInvalid(error.to_string()))
 }
 
 #[cfg(test)]

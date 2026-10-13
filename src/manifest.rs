@@ -99,7 +99,7 @@ pub fn parse(text: &str, repo_root: &Path) -> Result<Manifest> {
     // 仓库根与主目录在整个解析中不变: 各规范化一次即可, 不随条目数重复访问文件系统.
     // V-9 的仓库形态比较基准与 `entry::resolve_with` 的越界判定同源.
     let repo = os::normalize(repo_root);
-    let home = entry::home().ok().map(|path| os::normalize(&path));
+    let home = entry::home().map(|path| os::normalize(&path));
     // V-5 的重复检测: 目标路径 -> 首次声明它的条目下标. 用哈希表把逐条目两两比较的
     // O(N^2) 降到 O(N), 并保持"报第一对冲突"的语义 (get 返回的是最早的下标).
     let mut first_declared_at: HashMap<std::path::PathBuf, usize> =
@@ -152,7 +152,7 @@ pub fn parse(text: &str, repo_root: &Path) -> Result<Manifest> {
         })?;
 
         // V-9: 目标落点不得退化 (文件系统根 / 主目录 / 仓库根本身或其祖先).
-        reject_degenerate_target(index, &resolved, &repo, home.as_deref())?;
+        reject_degenerate_target(index, &resolved, &repo, home.as_deref().ok())?;
         // V-10: 目标不得指向本条目自己的 source -- 归一化后重合时建出的链接指向
         // 自己, 恒为断链. 只与**本条目**比较: 跨条目的重合属判定阶段的冲突.
         if resolved.target_path == resolved.source_path {

@@ -694,6 +694,47 @@ fn home_is_unresolvable_without_the_home_variable() {
 }
 
 #[test]
+fn tilde_targets_reject_empty_or_relative_home_before_any_writes() {
+    let env = env_with_source();
+    env.write_manifest("[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"link/rc\"\n\n[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"~/.rc\"\n");
+    let before = snapshot_all(&env);
+    for home in ["", "relative-home", ".", "../home"] {
+        for command in COMMANDS {
+            let result = observe(env.cmd().env("HOME", home).arg(command).output().unwrap());
+            assert_eq!(result.code, 2, "{home:?}/{command}: {}", result.stdout);
+            assert!(result.stdout.is_empty());
+            assert!(
+                result.stderr.contains("HOME") && result.stderr.contains("entry[1]"),
+                "{}",
+                result.stderr
+            );
+            if !home.is_empty() {
+                assert!(
+                    result.stderr.contains("HOME 必须是绝对路径"),
+                    "{}",
+                    result.stderr
+                );
+            }
+            assert_eq!(snapshot_all(&env), before);
+        }
+    }
+}
+
+#[test]
+fn targets_without_tilde_do_not_require_valid_home() {
+    for home in ["", "relative-home"] {
+        let env = env_with_source();
+        env.write_manifest("[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"link/rc\"\n");
+        let result = observe(env.cmd().env("HOME", home).arg("apply").output().unwrap());
+        assert_eq!(result.code, 0, "{}", result.stderr);
+        env.assert_symlink_to(
+            &env.repo().join("link/rc"),
+            &env.repo().join("shell/bashrc"),
+        );
+    }
+}
+
+#[test]
 fn a_target_that_does_not_need_home_is_accepted_without_the_home_variable() {
     let env = env_with_source();
     // 绝对路径的目标不依赖 HOME: 该清单在无 HOME 时仍必须被接受 (否则上一条断言
