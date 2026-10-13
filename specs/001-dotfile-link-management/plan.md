@@ -14,7 +14,7 @@
 
 **Language/Version**: Rust 1.97.0 (edition 2024).本机实测 `rustc 1.97.0 (2d8144b78 2026-07-07)`
 
-**Primary Dependencies**: `clap` 4.6 (derive, CLI 解析), `serde` 1.0 + `toml` 1.1 (清单解析), `thiserror` 2.0 (库错误类型), `time` 0.3 (备份文件名的可读时间戳).已在本机解析确认可用的精确版本 (`Cargo.lock` 实测): `clap` 4.6.7, `toml` 1.1.6+spec-1.1.0, `serde` 1.0.229, `thiserror` 2.0.20, `time` 0.3.55 (features `formatting`, `local-offset`)
+**Primary Dependencies**: `clap` 4.6 (derive, CLI 解析), `serde` 1.0 + `toml` 1.1 (清单解析), `thiserror` 2.0 (库错误类型), `time` 0.3 (备份文件名的可读时间戳).已在本机解析确认可用的精确版本 (`Cargo.lock` 实测): `clap` 4.6.7, `toml` 1.1.8+spec-1.1.0, `serde` 1.0.229, `thiserror` 2.0.21, `time` 0.3.55 (features `formatting`, `local-offset`)
 
 **Storage**: 无数据库,无状态文件.唯一持久化产物是被覆盖内容的备份副本, 存放在被覆盖路径的同一目录下, 文件名形如 `<原名>.dotlink-backup.<YYYYMMDDThhmmss>`.清单位置与仓库根目录也没有配置面: 二者都由"当前工作目录下的 `dotlink.toml`"唯一确定 (FR-015)
 
