@@ -1,6 +1,6 @@
-//! 清单解析与全量校验 (V-1 到 V-10).
+//! 清单解析与全量校验 (V-1 到 V-11).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use crate::entry::{self, Entry, OnConflict};
@@ -60,9 +60,8 @@ pub fn load() -> Result<Manifest> {
 /// V-9 (目标落点不得退化) 与 V-10 (目标不得自指) 是其后新增的两条落点校验,
 /// 定义见 `contracts/manifest.md`.
 ///
-/// 不校验的三件事: 源条目在仓库中是否存在 (那是运行时状态 `SourceMissing`),
-/// `target` 是否与**其他条目**的 `source` 指向同一路径 (与本条目自己的 `source`
-/// 重合已由 V-10 整体拒绝), 以及条目数量上限.
+/// V-11 在全部条目解析后检查目标之间、目标与源之间的路径隔离.
+/// 不校验源条目是否存在 (那是运行时状态 `SourceMissing`) 或条目数量上限.
 pub fn parse(text: &str, repo_root: &Path) -> Result<Manifest> {
     // 手工从 `toml::Table` 读而不是反序列化进一个 `#[derive(Deserialize)]` 的中间
     // 结构: `#[serde(deny_unknown_fields)]` 的错误里没有条目下标, 而 V-4 到 V-8 都
@@ -154,7 +153,7 @@ pub fn parse(text: &str, repo_root: &Path) -> Result<Manifest> {
         // V-9: 目标落点不得退化 (文件系统根 / 主目录 / 仓库根本身或其祖先).
         reject_degenerate_target(index, &resolved, &repo, home.as_deref().ok())?;
         // V-10: 目标不得指向本条目自己的 source -- 归一化后重合时建出的链接指向
-        // 自己, 恒为断链. 只与**本条目**比较: 跨条目的重合属判定阶段的冲突.
+        // 自己, 恒为断链. 跨条目和祖先关系由全量 V-11 校验处理.
         if resolved.target_path == resolved.source_path {
             return Err(invalid_entry(
                 index,
@@ -180,10 +179,55 @@ pub fn parse(text: &str, repo_root: &Path) -> Result<Manifest> {
         entries.push(resolved);
     }
 
+    reject_overlapping_paths(&entries, &first_declared_at)?;
+
     Ok(Manifest {
         repo_root: repo_root.to_path_buf(),
         entries,
     })
+}
+
+fn reject_overlapping_paths(
+    entries: &[Entry],
+    targets: &HashMap<std::path::PathBuf, usize>,
+) -> Result<()> {
+    let mut sources = BTreeMap::new();
+    for (index, entry) in entries.iter().enumerate() {
+        sources.entry(entry.source_path.as_path()).or_insert(index);
+    }
+
+    for (index, entry) in entries.iter().enumerate() {
+        for ancestor in entry.target_path.ancestors().skip(1) {
+            if let Some(&other) = targets.get(ancestor) {
+                return Err(path_overlap(index, entry, other, TARGET_KEY, ancestor));
+            }
+        }
+        for ancestor in entry.target_path.ancestors() {
+            if let Some(&other) = sources.get(ancestor) {
+                return Err(path_overlap(index, entry, other, SOURCE_KEY, ancestor));
+            }
+        }
+        // Path 按组件排序: 若存在以 target 为祖先的源, 下界的第一项即在该子树内.
+        if let Some((&source, &other)) = sources.range(entry.target_path.as_path()..).next()
+            && source.starts_with(&entry.target_path)
+        {
+            return Err(path_overlap(index, entry, other, SOURCE_KEY, source));
+        }
+    }
+    Ok(())
+}
+
+fn path_overlap(index: usize, entry: &Entry, other: usize, kind: &str, path: &Path) -> Error {
+    invalid_entry(
+        index,
+        format!(
+            "目标 `{}` ({}) 与条目 `{}` 的 {kind} `{}` 存在路径重叠: 目标不得相互嵌套, 也不得与任一源路径重合或互相包含",
+            entry.target,
+            entry.target_path.display(),
+            entry_label(other),
+            path.display()
+        ),
+    )
 }
 
 /// V-2: 把 TOML 解析错误转成含**出错位置**与**原因**的单行说明.
@@ -724,11 +768,15 @@ mod tests {
     }
 
     #[test]
-    fn v10_a_target_that_differs_from_its_source_is_accepted() {
-        // 只与本条目比较: 跨条目的重合 (a 的 target 是 b 的 source) 不属自指.
+    fn v11_a_target_cannot_replace_another_entries_source() {
         let text = "[[entry]]\nsource = \"a\"\ntarget = \"b\"\n\n[[entry]]\nsource = \"b\"\ntarget = \"c\"\n";
-        let manifest = parse(text, &repo()).expect("跨条目重合不属自指");
-        assert_eq!(manifest.entries.len(), 2);
+        assert_invalid(text, &["entry[0]", "entry[1]", "source", "路径重叠"]);
+    }
+
+    #[test]
+    fn v11_compares_path_components_and_allows_shared_sources() {
+        let text = "[[entry]]\nsource = \"config\"\ntarget = \"config-extra\"\n\n[[entry]]\nsource = \"config\"\ntarget = \"config.link/rc\"\n\n[[entry]]\nsource = \"z\"\ntarget = \"config-extra-extra\"\n";
+        assert_eq!(parse(text, &repo()).unwrap().entries.len(), 3);
     }
 
     // -----------------------------------------------------------------------

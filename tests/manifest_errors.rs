@@ -584,6 +584,50 @@ fn v10_a_self_referential_target_is_rejected() {
     );
 }
 
+#[test]
+fn overlapping_source_and_target_paths_are_rejected_before_writes() {
+    let env = env_with_source();
+    env.make_source_dir("nvim");
+    env.write_source("nvim/init.lua", "original");
+    for (source, target) in [("shell/bashrc", "shell"), ("nvim", "nvim/child")] {
+        for policy in ["skip", "replace_and_backup"] {
+            env.write_manifest(&format!("[[entry]]\nsource = \"{source}\"\ntarget = \"{target}\"\non_conflict = \"{policy}\"\n"));
+            assert_all_commands_reject(&env, "路径重叠");
+        }
+    }
+    for target in ["nvim", "nvim/init.lua", "nvim/child"] {
+        let first = format!(
+            "[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"{target}\"\non_conflict = \"replace_and_backup\"\n"
+        );
+        let second = "[[entry]]\nsource = \"nvim\"\ntarget = \"~/.config/nvim\"\n";
+        for text in [format!("{first}\n{second}"), format!("{second}\n{first}")] {
+            env.write_manifest(&text);
+            assert_all_commands_reject(&env, "路径重叠");
+            let result = run(&env, &["preview"]);
+            assert!(result.stderr.contains("entry[0]") && result.stderr.contains("entry[1]"));
+        }
+    }
+}
+
+#[test]
+fn nested_targets_are_rejected_regardless_of_order_or_existing_aliases() {
+    let env = env_with_source();
+    env.make_source_dir("nvim");
+    let parent = "[[entry]]\nsource = \"nvim\"\ntarget = \"~/.config/nvim\"\n";
+    let child = "[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"~/.config/nvim/rc\"\n";
+    for deployed in [false, true] {
+        if deployed {
+            fs::create_dir_all(env.home().join(".config")).unwrap();
+            std::os::unix::fs::symlink(env.repo().join("nvim"), env.home().join(".config/nvim"))
+                .unwrap();
+        }
+        for text in [format!("{parent}\n{child}"), format!("{child}\n{parent}")] {
+            env.write_manifest(&text);
+            assert_all_commands_reject(&env, "路径重叠");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // T038 补充 1: FR-015 不向上搜索父目录
 // ---------------------------------------------------------------------------
