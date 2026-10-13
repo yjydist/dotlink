@@ -41,7 +41,7 @@ const RESTORE_SUFFIX: &str = ".dotlink-restore.partial";
 /// 返回 false, 会误判为未占用), 追加序号 `.2`, `.3` ... 直到未占用. 同一秒内对
 /// 同一路径的两次替换因此产生两个并存的备份, 而不是后者覆盖前者.
 pub fn backup_path_for(target: &Path) -> PathBuf {
-    let directory = target.parent().unwrap_or_else(|| Path::new("."));
+    let directory = parent_dir(target);
     let base = backup_base(target);
     // 时间戳在整个消歧过程中只算一次: 每次重试都重算的话, 跨秒的重试会拿到新时间戳
     // 的名字 (`<新时间戳>.2`) 而跳过该秒的裸名.
@@ -79,9 +79,7 @@ pub fn backup_path_for(target: &Path) -> PathBuf {
 /// 目录读取失败不是"无备份"而是**环境故障**, 原样上抛 (调用者按 `Unreadable` 的
 /// 先例报 `fail` 并给出底层原因); 只有目录不存在 (`NotFound`) 才算没有备份.
 pub fn find_latest_backup(target: &Path) -> Result<Option<PathBuf>> {
-    let Some(directory) = target.parent() else {
-        return Ok(None);
-    };
+    let directory = parent_dir(target);
     let Some(prefix) = backup_base(target).to_str().map(str::to_owned) else {
         return Ok(None);
     };
@@ -226,6 +224,18 @@ fn backup_base(target: &Path) -> OsString {
     base
 }
 
+/// `path` 的父目录; 无父目录 (`/`) 或父目录为空 (裸文件名) 时退回当前目录 `.`.
+///
+/// `Path::parent` 对 `bashrc` 这样的裸文件名返回 `Some("")` 而非 `None`, 因此
+/// `unwrap_or_else(|| Path::new("."))` 这类兜底对空父目录不生效, 会让备份名落到
+/// 相对路径上. 备份与恢复都要求与目标同目录, 这里统一把空父目录视作 `.`.
+fn parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
 /// 本地时区的秒级时间戳 `YYYYMMDDThhmmss`.
 ///
 /// `now_local()` 在容器等环境下会失败 (无本地时区信息), 此时退化到 UTC: 秒级精度与
@@ -312,7 +322,7 @@ fn is_timestamp(text: &str) -> bool {
 
 /// 在同目录内给 `path` 追加一个后缀.
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    let directory = parent_dir(path);
     let mut name = path
         .file_name()
         .unwrap_or_else(|| OsStr::new(""))
@@ -381,6 +391,37 @@ mod tests {
         let backup = backup_path_for(&target);
         let name = backup.file_name().unwrap().to_string_lossy().into_owned();
         assert!(name.starts_with("nvim.dotlink-backup."), "实际为 {name}");
+    }
+
+    /// 裸文件名 (`bashrc`) 的 `parent()` 是 `Some("")` 而非 `None`: 备份名必须落在
+    /// 当前目录 `.`, 而不是退化成相对名.
+    #[test]
+    fn a_bare_file_name_backs_up_into_the_current_directory() {
+        let target = Path::new("bashrc");
+        assert_eq!(parent_dir(target), Path::new("."));
+
+        let backup = backup_path_for(target);
+        assert_eq!(backup.parent(), Some(Path::new(".")));
+        assert!(
+            backup
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("bashrc.dotlink-backup."),
+            "实际为 {}",
+            backup.display()
+        );
+
+        let staged = with_suffix(target, PARTIAL_SUFFIX);
+        assert_eq!(staged.parent(), Some(Path::new(".")));
+    }
+
+    /// `parent_dir` 对无父目录与普通父目录都必须给出确定结果, 不返回空目录.
+    #[test]
+    fn parent_dir_never_returns_an_empty_directory() {
+        assert_eq!(parent_dir(Path::new("/")), Path::new("."));
+        assert_eq!(parent_dir(Path::new("dir/bashrc")), Path::new("dir"));
+        assert_eq!(parent_dir(Path::new("/tmp/bashrc")), Path::new("/tmp"));
     }
 
     #[test]
