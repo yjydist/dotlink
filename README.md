@@ -222,6 +222,25 @@ esac
 
 Windows 上的运行时拒绝**未在任何环境验证** (`cargo check --target x86_64-pc-windows-gnu` 只能证明源码可编译, 不能证明运行时行为).
 
+## 开发
+
+要求 Rust 1.97 或更高 (edition 2024). 常用命令:
+
+```sh
+cargo build --release                        # 产物在 target/release/dotlink
+cargo test                                   # 单元测试 + 端到端测试 (真实二进制 + 临时 HOME)
+cargo clippy --all-targets -- -D warnings    # 与提交要求一致
+cargo fmt --check
+```
+
+设计文档 (规格, 契约, 数据模型, 验证场景) 在 `specs/001-dotfile-link-management/`. 跨平台可编译性用 `cargo check --target x86_64-pc-windows-gnu` 验证, 运行时拒绝行为需在 Windows 环境确认 (见"平台").
+
+## 已知限制
+
+- **并发**: 不保证并发调用串行化. 同一清单的并发 `apply` 可能产生重复备份文件, 但单个条目层面的链接创建/替换是原子的, 不会产生指向错误位置的链接.
+- **备份不自动回收**: `undo` 恢复后备份文件仍留在原地, 更早的备份不会被自动使用或删除, 需自行清理; 复制中断留下的 `.partial` 残留也不会被 `undo` 消费.
+- **`undo` 只恢复最新备份**: 同目录下按"先比时间戳, 同一秒内再比消歧序号的数值"取最新的一份; 更早的备份保留但不被自动使用.
+
 ## 文档审阅记录
 
 以下三条成功标准为主观判断项, 由本文件的作者逐条复核, 结论留痕于此.
