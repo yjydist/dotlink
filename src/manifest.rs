@@ -95,8 +95,10 @@ pub fn parse(text: &str, repo_root: &Path) -> Result<Manifest> {
     }
 
     let mut entries: Vec<Entry> = Vec::with_capacity(written_entries.len());
-    // V-9 的仓库形态比较基准: 归一化后的仓库根 (与 `entry::resolve` 的越界判定同源).
+    // 仓库根与主目录在整个解析中不变: 各规范化一次即可, 不随条目数重复访问文件系统.
+    // V-9 的仓库形态比较基准与 `entry::resolve_with` 的越界判定同源.
     let repo = os::normalize(repo_root);
+    let home = entry::home().ok().map(|path| os::normalize(&path));
 
     for (index, written) in written_entries.iter().enumerate() {
         let Some(table) = written.as_table() else {
@@ -126,19 +128,26 @@ pub fn parse(text: &str, repo_root: &Path) -> Result<Manifest> {
         // V-7: 取值属于 {skip, replace_and_backup}, 缺省为 skip.
         let on_conflict = parse_on_conflict(table, index)?;
 
-        // V-6: `entry::resolve` 是路径形态"能否解析"的唯一裁决处 (`~` 展开 / 相对
-        // 仓库根的挂接 / 源侧只接受相对路径都在那里); 这里只补上条目下标与两个书写
-        // 形态. `error` 自身已说明是哪一侧、哪种形态非法, 因此不再加统一前缀.
-        let resolved =
-            entry::resolve(&source, &target, on_conflict, repo_root).map_err(|error| {
-                invalid_entry(
-                    index,
-                    format!("{error} ({SOURCE_KEY} = `{source}`, {TARGET_KEY} = `{target}`)"),
-                )
-            })?;
+        // V-6: `entry::resolve_with` 是路径形态"能否解析"的唯一裁决处 (`~` 展开 /
+        // 相对仓库根的挂接 / 源侧只接受相对路径都在那里); 这里只补上条目下标与两个
+        // 书写形态. `error` 自身已说明是哪一侧、哪种形态非法, 因此不再加统一前缀.
+        let resolved = entry::resolve_with(
+            &source,
+            &target,
+            on_conflict,
+            repo_root,
+            &repo,
+            home.as_deref(),
+        )
+        .map_err(|error| {
+            invalid_entry(
+                index,
+                format!("{error} ({SOURCE_KEY} = `{source}`, {TARGET_KEY} = `{target}`)"),
+            )
+        })?;
 
         // V-9: 目标落点不得退化 (文件系统根 / 主目录 / 仓库根本身或其祖先).
-        reject_degenerate_target(index, &resolved, &repo)?;
+        reject_degenerate_target(index, &resolved, &repo, home.as_deref())?;
         // V-10: 目标不得指向本条目自己的 source -- 归一化后重合时建出的链接指向
         // 自己, 恒为断链. 只与**本条目**比较: 跨条目的重合属判定阶段的冲突.
         if resolved.target_path == resolved.source_path {
@@ -268,7 +277,12 @@ fn entry_label(index: usize) -> String {
 /// 远超单个链接范围的内容: 文件系统根或主目录本身被替换备份, 毁掉的是一整棵树;
 /// 仓库根本身或其祖先被替换备份, 毁掉的是源仓库. `.` / `..` / 裸 `~` 都是极易写出
 /// 的笔误形态, 与 V-6 的立场一致, 静默放行比报错危险得多.
-fn reject_degenerate_target(index: usize, entry: &Entry, repo: &Path) -> Result<()> {
+fn reject_degenerate_target(
+    index: usize,
+    entry: &Entry,
+    repo: &Path,
+    home: Option<&Path>,
+) -> Result<()> {
     let written = &entry.target;
     let landing = &entry.target_path;
 
@@ -282,8 +296,8 @@ fn reject_degenerate_target(index: usize, entry: &Entry, repo: &Path) -> Result<
     }
     // 主目录: 裸 `~` 与书成绝对路径的等价形态. HOME 无法确定时不作比较 -- 需要
     // HOME 的 `~` 形态已由 V-6 报错, 绝对路径不得因缺 HOME 而被拒.
-    if let Ok(home) = entry::home()
-        && landing.as_path() == os::normalize(&home).as_path()
+    if let Some(home) = home
+        && landing.as_path() == home
     {
         return Err(invalid_entry(
             index,

@@ -27,18 +27,47 @@ pub struct Entry {
     pub target_path: PathBuf,
 }
 
-/// 按 R5 的规则解析一条目的两侧路径.
+/// 测试用的单条目便捷入口: 内部把仓库根与主目录各规范化一次.
 ///
-/// `target` 支持主目录简写 (`~` / `~/...`), 绝对路径与相对仓库根的路径;
-/// `source` 只接受仓库内的相对路径, 且解析与归一化后不得越出仓库根. 两侧路径形态的
-/// 裁决分别是 `expand_target` / `expand_source`, 越界判定在归一化之后.
+/// 生产路径 (逐条目) 走 [`resolve_with`], 复用循环外算好的形态; 本函数只为单测
+/// 提供"一步解析"的写法, 不参与生产二进制.
+#[cfg(test)]
 pub fn resolve(
     source: &str,
     target: &str,
     on_conflict: OnConflict,
     repo_root: &Path,
 ) -> Result<Entry> {
-    let target_path = os::normalize(&expand_target(target, repo_root)?);
+    let repo = os::normalize(repo_root);
+    let home = home().ok().map(|path| os::normalize(&path));
+    resolve_with(
+        source,
+        target,
+        on_conflict,
+        repo_root,
+        &repo,
+        home.as_deref(),
+    )
+}
+
+/// [`resolve`] 的形态复用版: 由调用方传入已规范化的仓库根与主目录.
+///
+/// `target` 支持主目录简写 (`~` / `~/...`), 绝对路径与相对仓库根的路径; `source` 只
+/// 接受仓库内的相对路径, 且解析与归一化后不得越出仓库根. 两侧路径形态的裁决分别是
+/// `expand_target` / `expand_source`, 越界判定在归一化之后.
+///
+/// `repo` 必须等于 `os::normalize(repo_root)`; `home` 是 `Some(os::normalize(HOME))`,
+/// `HOME` 不可用时为 `None`. `manifest::parse` 在整个条目循环之外只算一次, 因此条目
+/// 再多也不会重复规范化这两个固定路径 (它们与条目数无关).
+pub(crate) fn resolve_with(
+    source: &str,
+    target: &str,
+    on_conflict: OnConflict,
+    repo_root: &Path,
+    repo: &Path,
+    home: Option<&Path>,
+) -> Result<Entry> {
+    let target_path = os::normalize(&expand_target(target, repo_root, home)?);
     let source_path = os::normalize(&expand_source(source, repo_root)?);
 
     // 源条目解析与归一化后必须仍落在仓库根之内: `..` 段或仓库内的符号链接能把
@@ -47,7 +76,7 @@ pub fn resolve(
     // 于是自己的产物会被自己拒删 (`undo.rs` 的不变量). 与 `~` 前缀 / 绝对路径同一类
     // 整体拒绝. 两侧都过 `os::normalize` 再比较: 祖先段解析符号链接的语义必须与归属
     // 判定完全一致, 末段不解析 (`normalize` 的既有语义).
-    if !source_path.starts_with(os::normalize(repo_root)) {
+    if !source_path.starts_with(repo) {
         return Err(Error::ManifestInvalid(format!(
             "`{source}` 解析后落在仓库根之外: 源条目必须落在仓库根之内 (归一化后为 `{}`)",
             source_path.display()
@@ -70,12 +99,12 @@ pub fn resolve(
 /// 既非主目录简写也不是绝对路径 -- 若放行会落到"相对仓库根"分支, 在受版本控制的
 /// 仓库里静默建出名为 `~.bashrc` 的路径 (`contracts/manifest.md` 的 V-6). 与 V-8 的
 /// 立场一致, 一律整体拒绝并指出书写形态.
-fn expand_target(written: &str, repo_root: &Path) -> Result<PathBuf> {
+fn expand_target(written: &str, repo_root: &Path, home: Option<&Path>) -> Result<PathBuf> {
     if let Some(rest) = written.strip_prefix("~/") {
-        return Ok(home()?.join(rest));
+        return Ok(require_home(home)?.join(rest));
     }
     if written == "~" {
-        return home();
+        return Ok(require_home(home)?.to_path_buf());
     }
     if written.starts_with('~') {
         return Err(Error::ManifestInvalid(format!(
@@ -105,17 +134,26 @@ fn expand_source(written: &str, repo_root: &Path) -> Result<PathBuf> {
     Ok(repo_root.join(written))
 }
 
-/// 展开 `~` 所需的当前用户主目录.
+/// `HOME` 缺失时的统一说明 (`home` 与 [`require_home`] 共用).
+const HOME_MISSING: &str = "无法确定主目录: 环境变量 HOME 未设置 (无法把 `~` 解析为绝对路径)";
+
+/// 展开 `~` 所需的当前用户主目录 (原始形态, 未规范化).
 ///
 /// 无法确定时属于 FR-013 的整体拒绝场景 (退出码 2). `manifest` 的 V-9 也用它识别
 /// "落点恰是主目录本身"的退化形态, 与 `~` 展开共用同一个来源.
 pub(crate) fn home() -> Result<PathBuf> {
     match std::env::var_os("HOME") {
         Some(value) if !value.is_empty() => Ok(PathBuf::from(value)),
-        _ => Err(Error::ManifestInvalid(
-            "无法确定主目录: 环境变量 HOME 未设置 (无法把 `~` 解析为绝对路径)".to_string(),
-        )),
+        _ => Err(Error::ManifestInvalid(HOME_MISSING.to_string())),
     }
+}
+
+/// 取已规范化的主目录; 缺失时报与 [`home`] 相同的错误.
+///
+/// `expand_target` 只在确实需要展开 `~` 时才要求主目录, 因此把"是否存在"与"展开"
+/// 分开: 循环外预取一次, 绝对路径与相对路径不受 `HOME` 缺失影响.
+fn require_home(home: Option<&Path>) -> Result<&Path> {
+    home.ok_or_else(|| Error::ManifestInvalid(HOME_MISSING.to_string()))
 }
 
 #[cfg(test)]
