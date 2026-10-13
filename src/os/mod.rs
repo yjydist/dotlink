@@ -1,8 +1,7 @@
 //! 符号链接, 路径规范化与归属判定的平台层.
 //!
-//! `normalize` 与 `is_inside_repo` 是纯组件运算, 可在任何平台编译;
-//! 三个符号链接原语在 unix 下由 `unix.rs` 提供, 其他平台给出可编译的空实现,
-//! 使二进制在 Windows 上仍能构建成功 (运行时由平台门禁拒绝, 见 `research.md` R6).
+//! 链接原语在 unix 下由 `unix.rs` 提供, 不覆盖落点的原子移动仅支持 macOS/Linux.
+//! 其他平台提供可编译的拒绝实现 (运行时由平台门禁拒绝, 见 `research.md` R6).
 
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
@@ -45,6 +44,22 @@ mod stub {
 
 #[cfg(not(unix))]
 pub use stub::{create_symlink, read_link};
+
+/// 原子移动对象, 落点已存在 (含悬空链接) 时拒绝覆盖.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn rename_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+
+    renameat_with(CWD, source, CWD, destination, RenameFlags::NOREPLACE).map_err(Into::into)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub(crate) fn rename_noreplace(_source: &Path, _destination: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "当前平台不支持不覆盖落点的原子移动",
+    ))
+}
 
 /// 符号链接解析的深度上限.
 ///

@@ -7,16 +7,18 @@
 //! 规范化语义不同而引入分歧.
 //!
 //! 有备份时恢复走"先把链接原子移到暂存名 -> 复制备份就位 -> 失败则把链接移回":
-//! 复制失败时链接原样保留, 因此该条目在下一次 `undo` 仍可重试, 不会留下"链接已删而
-//! 备份没恢复"的半成品状态.
+//! 复制失败且原路径仍为空时回滚链接, 因此下一次 `undo` 仍可重试; 路径被重新占用时
+//! 保留占用物和暂存链接, 并报告暂存位置.
 
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use crate::backup;
 use crate::classify::{Current, EntryState};
 use crate::entry::Entry;
 use crate::error::{Error, Result};
+use crate::os;
 
 /// 撤销单个条目.
 ///
@@ -72,20 +74,11 @@ fn remove_link(target: &Path) -> Result<()> {
 
 /// 移除链接并把快照指定的备份恢复到原路径.
 ///
-/// 顺序刻意拆成三步, 使失败发生在"移除链接"之前:
-///
-/// 1. 复核目标仍是符号链接;
-/// 2. 把链接**原子移到同目录的暂存名**, 使原路径空出;
-/// 3. 复制备份到原路径 (`restore_backup` 内部走"临时名 -> 改名", 目录恢复中途失败
-///    不会留下半成品). 失败时把链接移回原路径 -- 该条目保持"未撤销"的原状, 下一次
-///    `undo` 可重试, 不会留下"链接已删而备份没恢复"的半成品.
+/// 暂存, 恢复落位及失败回滚都拒绝覆盖落点. 回滚冲突时链接留在暂存名, 错误中给出
+/// 位置, 避免为了恢复原状而覆盖期间新建的用户内容.
 fn replace_link_with_backup(target: &Path, backup: &Path) -> Result<()> {
     ensure_still_a_link(target)?;
-
-    let aside = aside_path(target);
-    fs::rename(target, &aside).map_err(|error| {
-        Error::EntryFailed(format!("暂存链接 {} 失败: {error}", target.display()))
-    })?;
+    let aside = stage_link(target)?;
 
     match backup::restore_backup(target, backup) {
         Ok(()) => {
@@ -93,22 +86,44 @@ fn replace_link_with_backup(target: &Path, backup: &Path) -> Result<()> {
             let _ = fs::remove_file(&aside);
             Ok(())
         }
-        Err(error) => {
-            // 恢复失败: 把链接移回原路径, 恢复"未撤销"的原状. 回滚本身也可能失败
-            // (例如目标路径在两次改名之间被占用), 此时链接会暂存在 `aside`, 必须把
-            // 这一层原因一并报告, 不能吞掉后只报恢复失败.
-            match fs::rename(&aside, target) {
-                Ok(()) => Err(error),
-                Err(rollback) => Err(Error::EntryFailed(format!(
-                    "{error}; 且回滚链接失败, 链接暂存于 {}: {rollback}",
-                    aside.display()
-                ))),
-            }
-        }
+        Err(error) => Err(rollback_link(target, &aside, error)),
     }
 }
 
-/// 链接在恢复期间被移到的同目录暂存名 (进程级唯一).
+fn stage_link(target: &Path) -> Result<PathBuf> {
+    let base = aside_path(target);
+    for serial in 1_u64.. {
+        let mut name = base.as_os_str().to_os_string();
+        if serial > 1 {
+            name.push(format!(".{serial}"));
+        }
+        let aside = PathBuf::from(name);
+        match os::rename_noreplace(target, &aside) {
+            Ok(()) => return Ok(aside),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(Error::EntryFailed(format!(
+                    "暂存链接 {} 到 {} 失败: {error}",
+                    target.display(),
+                    aside.display()
+                )));
+            }
+        }
+    }
+    unreachable!("序号消歧必然终止")
+}
+
+fn rollback_link(target: &Path, aside: &Path, error: Error) -> Error {
+    match os::rename_noreplace(aside, target) {
+        Ok(()) => error,
+        Err(rollback) => Error::EntryFailed(format!(
+            "{error}; 且回滚链接失败, 链接暂存于 {}: {rollback}",
+            aside.display()
+        )),
+    }
+}
+
+/// 同目录暂存候选的基础名; PID 不保证未被占用, 由 `stage_link` 原子尝试并消歧.
 fn aside_path(target: &Path) -> PathBuf {
     let mut name = target.as_os_str().to_os_string();
     name.push(format!(".{}.dotlink-undo.partial", std::process::id()));
@@ -119,7 +134,7 @@ fn aside_path(target: &Path) -> PathBuf {
 mod tests {
 
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::PathBuf;
 
     use super::*;
@@ -253,6 +268,146 @@ mod tests {
             fs::symlink_metadata(&backup_path).is_ok(),
             "备份文件本身必须保留"
         );
+    }
+
+    #[test]
+    fn undo_preserves_occupied_staging_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let (target, entry) = deployed(dir.path(), "bashrc", "managed");
+        let backup = target.with_file_name("bashrc.dotlink-backup.20260101T000000");
+        fs::write(&backup, "original").unwrap();
+
+        let base = aside_path(&target);
+        let mut occupied = vec![base.clone()];
+        for serial in 2..=4 {
+            let mut name = base.as_os_str().to_os_string();
+            name.push(format!(".{serial}"));
+            occupied.push(PathBuf::from(name));
+        }
+        fs::write(&occupied[0], "user file").unwrap();
+        os::create_symlink(Path::new("managed"), &occupied[1]).unwrap();
+        os::create_symlink(Path::new("missing"), &occupied[2]).unwrap();
+        fs::create_dir(&occupied[3]).unwrap();
+        fs::write(occupied[3].join("nested"), "user directory").unwrap();
+        let inodes: Vec<_> = occupied
+            .iter()
+            .map(|path| fs::symlink_metadata(path).unwrap().ino())
+            .collect();
+
+        undo_entry(&entry, &state(Current::LinkedCorrect), Some(&backup)).unwrap();
+
+        for (path, inode) in occupied.iter().zip(inodes) {
+            assert_eq!(fs::symlink_metadata(path).unwrap().ino(), inode);
+        }
+        assert_eq!(fs::read_to_string(&occupied[0]).unwrap(), "user file");
+        assert_eq!(fs::read_link(&occupied[1]).unwrap(), Path::new("managed"));
+        assert_eq!(fs::read_link(&occupied[2]).unwrap(), Path::new("missing"));
+        assert_eq!(
+            fs::read_to_string(occupied[3].join("nested")).unwrap(),
+            "user directory"
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "original");
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "original");
+        let residue = fs::read_dir(target.parent().unwrap())
+            .unwrap()
+            .map(|item| item.unwrap().path())
+            .filter(|path| path.to_string_lossy().contains(".dotlink-undo.partial"))
+            .count();
+        assert_eq!(residue, occupied.len(), "只清理本次取得的暂存名");
+    }
+
+    #[test]
+    fn rollback_preserves_an_occupied_target_and_the_aside() {
+        for kind in ["file", "link", "dangling", "directory"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (target, _) = deployed(dir.path(), "bashrc", "managed");
+            let aside = aside_path(&target);
+            fs::rename(&target, &aside).unwrap();
+            let link_text = fs::read_link(&aside).unwrap();
+            match kind {
+                "file" => fs::write(&target, "new user content").unwrap(),
+                "link" => os::create_symlink(Path::new("managed"), &target).unwrap(),
+                "dangling" => os::create_symlink(Path::new("missing"), &target).unwrap(),
+                "directory" => {
+                    fs::create_dir(&target).unwrap();
+                    fs::write(target.join("nested"), "new user content").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let inode = fs::symlink_metadata(&target).unwrap().ino();
+
+            let error = rollback_link(
+                &target,
+                &aside,
+                Error::EntryFailed("恢复备份失败: 原始原因".to_string()),
+            );
+
+            assert_eq!(
+                fs::symlink_metadata(&target).unwrap().ino(),
+                inode,
+                "{kind}"
+            );
+            match kind {
+                "file" => assert_eq!(fs::read_to_string(&target).unwrap(), "new user content"),
+                "link" => assert_eq!(fs::read_link(&target).unwrap(), Path::new("managed")),
+                "dangling" => assert_eq!(fs::read_link(&target).unwrap(), Path::new("missing")),
+                "directory" => assert_eq!(
+                    fs::read_to_string(target.join("nested")).unwrap(),
+                    "new user content"
+                ),
+                _ => unreachable!(),
+            }
+            assert_eq!(fs::read_link(&aside).unwrap(), link_text);
+            let detail = error.to_string();
+            assert!(detail.contains("恢复备份失败: 原始原因"), "{detail}");
+            assert!(detail.contains("回滚链接失败"), "{detail}");
+            assert!(detail.contains(&aside.display().to_string()), "{detail}");
+        }
+    }
+
+    #[test]
+    fn rollback_restores_relative_and_dangling_links_to_an_empty_target() {
+        for raw in ["managed", "missing"] {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("bashrc");
+            let aside = aside_path(&target);
+            fs::write(dir.path().join("managed"), "managed").unwrap();
+            os::create_symlink(Path::new(raw), &aside).unwrap();
+            let inode = fs::symlink_metadata(&aside).unwrap().ino();
+
+            let error = rollback_link(
+                &target,
+                &aside,
+                Error::EntryFailed("恢复备份失败: 原始原因".to_string()),
+            );
+
+            assert_eq!(error.to_string(), "恢复备份失败: 原始原因");
+            assert_eq!(fs::read_link(&target).unwrap(), Path::new(raw));
+            assert_eq!(fs::symlink_metadata(&target).unwrap().ino(), inode);
+            assert_eq!(
+                fs::symlink_metadata(&aside).unwrap_err().kind(),
+                std::io::ErrorKind::NotFound
+            );
+        }
+    }
+
+    #[test]
+    fn undo_can_retry_after_a_missing_backup_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let (target, entry) = deployed(dir.path(), "bashrc", "managed");
+        let backup = target.with_file_name("bashrc.dotlink-backup.20260101T000000");
+        let link_text = fs::read_link(&target).unwrap();
+
+        let error = undo_entry(&entry, &state(Current::LinkedCorrect), Some(&backup)).unwrap_err();
+
+        assert!(error.to_string().contains(&backup.display().to_string()));
+        assert_eq!(fs::read_link(&target).unwrap(), link_text);
+        assert!(fs::symlink_metadata(aside_path(&target)).is_err());
+        fs::write(&backup, "original").unwrap();
+        undo_entry(&entry, &state(Current::LinkedCorrect), Some(&backup)).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "original");
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "original");
+        assert!(fs::symlink_metadata(aside_path(&target)).is_err());
     }
 
     #[test]

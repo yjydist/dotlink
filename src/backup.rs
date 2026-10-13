@@ -153,7 +153,7 @@ pub(crate) fn write_backup(object: &Path) -> Result<PathBuf> {
     )))
 }
 
-/// 把 `backup` 的内容恢复到 `target` (调用者已确保 `target` 当前不存在).
+/// 把 `backup` 的内容恢复到已空出的 `target`, 拒绝覆盖期间新建的占用物.
 ///
 /// 复制先落到**进程级唯一**的临时名, 全部复制成功后再改名到 `target`: 目录恢复中途
 /// 失败不会在原路径留下半成品. 恢复成功后**不删除备份文件本身** (`contracts/cli.md`
@@ -163,7 +163,7 @@ pub(crate) fn restore_backup(target: &Path, backup: &Path) -> Result<()> {
 
     copy_object(backup, &partial)?;
 
-    fs::rename(&partial, target).map_err(|error| {
+    os::rename_noreplace(&partial, target).map_err(|error| {
         remove_any(&partial);
         failed("恢复备份到", target, &error)
     })
@@ -751,6 +751,69 @@ mod tests {
         assert!(
             fs::symlink_metadata(&backup).is_ok(),
             "恢复成功后不删除备份文件本身"
+        );
+    }
+
+    #[test]
+    fn restore_preserves_occupied_targets() {
+        use std::os::unix::fs::MetadataExt;
+
+        for kind in ["file", "link", "dangling", "directory"] {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("bashrc");
+            let backup = dir.path().join("bashrc.dotlink-backup.20260101T000000");
+            fs::write(&backup, "original").unwrap();
+            match kind {
+                "file" => fs::write(&target, "new user content").unwrap(),
+                "link" => os::create_symlink(Path::new("managed"), &target).unwrap(),
+                "dangling" => os::create_symlink(Path::new("missing"), &target).unwrap(),
+                "directory" => fs::create_dir(&target).unwrap(),
+                _ => unreachable!(),
+            }
+            fs::write(dir.path().join("managed"), "managed").unwrap();
+            let inode = fs::symlink_metadata(&target).unwrap().ino();
+
+            let error = restore_backup(&target, &backup).unwrap_err();
+
+            assert!(error.to_string().contains("恢复备份到"), "{error}");
+            assert_eq!(
+                fs::symlink_metadata(&target).unwrap().ino(),
+                inode,
+                "{kind}"
+            );
+            match kind {
+                "file" => assert_eq!(fs::read_to_string(&target).unwrap(), "new user content"),
+                "link" => assert_eq!(fs::read_link(&target).unwrap(), Path::new("managed")),
+                "dangling" => assert_eq!(fs::read_link(&target).unwrap(), Path::new("missing")),
+                "directory" => assert_eq!(fs::read_dir(&target).unwrap().count(), 0),
+                _ => unreachable!(),
+            }
+            assert_eq!(fs::read_to_string(&backup).unwrap(), "original");
+            assert!(fs::read_dir(dir.path()).unwrap().all(|item| {
+                !item
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(RESTORE_SUFFIX)
+            }));
+        }
+    }
+
+    #[test]
+    fn restore_preserves_an_empty_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("nvim");
+        let backup = dir.path().join("nvim.dotlink-backup.20260101T000000");
+        fs::create_dir(&target).unwrap();
+        fs::create_dir(&backup).unwrap();
+        fs::write(backup.join("init.lua"), "original").unwrap();
+
+        restore_backup(&target, &backup).unwrap_err();
+
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+        assert_eq!(
+            fs::read_to_string(backup.join("init.lua")).unwrap(),
+            "original"
         );
     }
 

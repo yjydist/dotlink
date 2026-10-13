@@ -1,5 +1,11 @@
 # Implementation Plan: 声明式 dotfile 软链接管理
 
+## 2026-10-13 审查回归修复
+
+- macOS/Linux 通过 `rustix` 的 `renameat_with(..., NOREPLACE)` 执行撤销暂存, 恢复落位及失败回滚; 其他平台提供拒绝实现. 暂存名称冲突时递增序号重试, 其他错误直接上报, 不使用可覆盖的回退操作.
+- 回滚冲突保留占用物与暂存链接, 同时报告恢复原因, 回滚原因及暂存位置. 回滚分支先原样提取为私有函数, 以真实文件系统稳定验证冲突, 不依赖线程计时或权限模拟.
+- 回归测试先确认旧行为失败; 完成后运行全套测试, clippy, 格式检查及 Linux/Windows 交叉编译检查.
+
 **Branch**: `001-dotfile-link-management` | **Date**: 2026-09-14 | **Spec**: [spec.md](./spec.md)
 
 **Input**: Feature specification from `/specs/001-dotfile-link-management/spec.md`

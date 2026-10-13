@@ -170,6 +170,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "predicates",
+ "rustix",
  "serde",
  "tempfile",
  "thiserror",
