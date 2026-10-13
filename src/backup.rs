@@ -10,10 +10,8 @@
 //! - **完整性**: 复制先落到**进程级唯一**的暂存名 (`<时间戳>.<pid>.partial`), 全部
 //!   复制成功后才原子改名为最终名, 因此一个"名字看起来完整"的备份必然是完整内容
 //!   (中断残留只能是暂存名, 失败清理会尽力移除它).
-//! - **唯一性**: 最终名已被占用时追加序号 (`.2`, `.3` ...) 消歧, 单进程内绝不覆盖
-//!   既有备份. 暂存名带进程号, 并发进程对同一目标备份时各写各的暂存文件, 不会因
-//!   共用暂存名而产出内容交错的备份; 但 `write_backup` 的 check-then-rename 仍留有
-//!   窄窗口, 详见那里的注释.
+//! - **唯一性**: 暂存对象排他创建, 最终名以原子不覆盖移动落位. 两者占用时均追加
+//!   序号消歧, 并发备份和遗留暂存对象都不会被覆盖或混入新备份.
 
 use std::cmp::Ordering;
 use std::ffi::{OsStr, OsString};
@@ -41,29 +39,22 @@ const RESTORE_SUFFIX: &str = ".dotlink-restore.partial";
 /// 返回 false, 会误判为未占用), 追加序号 `.2`, `.3` ... 直到未占用. 同一秒内对
 /// 同一路径的两次替换因此产生两个并存的备份, 而不是后者覆盖前者.
 pub fn backup_path_for(target: &Path) -> PathBuf {
-    let directory = parent_dir(target);
-    let base = backup_base(target);
-    // 时间戳在整个消歧过程中只算一次: 每次重试都重算的话, 跨秒的重试会拿到新时间戳
-    // 的名字 (`<新时间戳>.2`) 而跳过该秒的裸名.
-    let stamp = timestamp();
-    let mut candidate = base.clone();
-    candidate.push(&stamp);
+    backup_candidates(target)
+        .find(|path| fs::symlink_metadata(path).is_err())
+        .expect("序号消歧必然终止")
+}
 
-    if is_free(&candidate, directory) {
-        return directory.join(candidate);
-    }
-
-    for serial in 2.. {
-        let mut candidate = base.clone();
-        candidate.push(&stamp);
-        candidate.push(".");
-        candidate.push(serial.to_string());
-        if is_free(&candidate, directory) {
-            return directory.join(candidate);
+fn backup_candidates(target: &Path) -> impl Iterator<Item = PathBuf> {
+    let mut base = backup_base(target);
+    base.push(timestamp());
+    let base = parent_dir(target).join(base);
+    (1_u64..).map(move |serial| {
+        if serial == 1 {
+            base.clone()
+        } else {
+            with_suffix(&base, &format!(".{serial}"))
         }
-    }
-
-    unreachable!("序号消歧必然终止")
+    })
 }
 
 /// 取同目录下"最新"的那个备份.
@@ -121,36 +112,21 @@ pub fn find_latest_backup(target: &Path) -> Result<Option<PathBuf>> {
 /// 返回 `Ok` 意味着备份已完整落定并改名到最终名 -- 调用者此时才可以删除原对象
 /// (data-model.md 第 4 节的"先复制后删除的硬顺序"). 失败时不留下最终名.
 pub(crate) fn write_backup(object: &Path) -> Result<PathBuf> {
-    let final_path = backup_path_for(object);
-    // 暂存名带进程号: 并发进程对同一目标备份时各写各的暂存文件, 不会交错写入同一
-    // 文件而产出一个内容损坏的备份.
-    let partial = with_suffix(&final_path, &unique_staging_suffix(PARTIAL_SUFFIX));
+    let mut candidates = backup_candidates(object);
+    let first = candidates.next().expect("备份候选名非空");
+    let partial = copy_to_staging(object, &first, PARTIAL_SUFFIX)?;
 
-    copy_object(object, &partial)?;
-
-    // 复制期间最终名可能被并发者占用; 改名前的这道检查把冲突重新引向一个新名字. 但
-    // 检查与改名是两步 (check-then-rename), 之间的窄窗口里并发者放下的同名备份会被
-    // `rename` 静默覆盖. 重试把撞上窗口的概率压得很低, 但不消除该竞态: "绝不覆盖
-    // 既有备份"严格来说只在单进程下成立.
-    let mut final_path = final_path;
-    for _ in 0..8 {
-        if fs::symlink_metadata(&final_path).is_err() {
-            return match fs::rename(&partial, &final_path) {
-                Ok(()) => Ok(final_path),
-                Err(error) => {
-                    remove_any(&partial);
-                    Err(failed("备份改名", &final_path, &error))
-                }
-            };
+    for final_path in std::iter::once(first).chain(candidates) {
+        match os::rename_noreplace(&partial, &final_path) {
+            Ok(()) => return Ok(final_path),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                remove_any(&partial);
+                return Err(failed("备份改名", &final_path, &error));
+            }
         }
-        final_path = backup_path_for(object);
     }
-
-    remove_any(&partial);
-    Err(Error::EntryFailed(format!(
-        "备份 {} 失败: 无法为备份选定未被占用的名称",
-        object.display()
-    )))
+    unreachable!("序号消歧必然终止")
 }
 
 /// 把 `backup` 的内容恢复到已空出的 `target`, 拒绝覆盖期间新建的占用物.
@@ -159,9 +135,7 @@ pub(crate) fn write_backup(object: &Path) -> Result<PathBuf> {
 /// 失败不会在原路径留下半成品. 恢复成功后**不删除备份文件本身** (`contracts/cli.md`
 /// 的"幂等").
 pub(crate) fn restore_backup(target: &Path, backup: &Path) -> Result<()> {
-    let partial = with_suffix(target, &unique_staging_suffix(RESTORE_SUFFIX));
-
-    copy_object(backup, &partial)?;
+    let partial = copy_to_staging(backup, target, RESTORE_SUFFIX)?;
 
     os::rename_noreplace(&partial, target).map_err(|error| {
         remove_any(&partial);
@@ -169,49 +143,97 @@ pub(crate) fn restore_backup(target: &Path, backup: &Path) -> Result<()> {
     })
 }
 
-/// 把单个对象复制到 `dest`: 文件复制内容与权限位, 目录递归复制 (权限位在子项复制
-/// 完成后设置), 符号链接重建**链接本身**.
-///
-/// 失败时尽最大努力清除 `dest`, 使调用者不会看到一个半成品. 备份与恢复都使用与
-/// 原对象**同目录**的 `dest`, 因此链接文本 (可能是相对路径) 的解析基准不变.
-pub(crate) fn copy_object(source: &Path, dest: &Path) -> Result<()> {
-    match copy_inner(source, dest) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            remove_any(dest);
-            Err(error)
+fn copy_to_staging(source: &Path, base: &Path, suffix: &str) -> Result<PathBuf> {
+    for serial in 1_u64.. {
+        let suffix = if serial == 1 {
+            unique_staging_suffix(suffix)
+        } else {
+            format!(".{}.{serial}{suffix}", std::process::id())
+        };
+        let partial = with_suffix(base, &suffix);
+        match copy_object(source, &partial) {
+            Ok(()) => return Ok(partial),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(Error::EntryFailed(error.to_string())),
         }
     }
+    unreachable!("序号消歧必然终止")
 }
 
-/// 递归复制的主体.
-fn copy_inner(source: &Path, dest: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(source).map_err(|error| failed("读取", source, &error))?;
+/// 排他创建副本. 只有取得目的地所有权之后的失败才允许清理它.
+fn copy_object(source: &Path, dest: &Path) -> io::Result<()> {
+    let metadata =
+        fs::symlink_metadata(source).map_err(|error| copy_error("读取", source, error))?;
     let file_type = metadata.file_type();
-
-    // 符号链接必须用 read_link + create_symlink 复制链接本身: `fs::copy` 会跟随链接,
-    // 备份到的就是链接指向的内容, 与原对象不是同一个东西.
     if file_type.is_symlink() {
-        let raw = os::read_link(source).map_err(|error| failed("读取链接", source, &error))?;
-        return os::create_symlink(&raw, dest).map_err(|error| failed("备份链接", source, &error));
+        let raw = os::read_link(source).map_err(|error| copy_error("读取链接", source, error))?;
+        return os::create_symlink(&raw, dest).map_err(|error| copy_error("备份链接", dest, error));
     }
 
     if file_type.is_dir() {
-        fs::create_dir_all(dest).map_err(|error| failed("创建备份目录", dest, &error))?;
-        let entries = fs::read_dir(source).map_err(|error| failed("读取目录", source, &error))?;
-        for entry in entries {
-            let entry = entry.map_err(|error| failed("读取目录项", source, &error))?;
-            copy_inner(&entry.path(), &dest.join(entry.file_name()))?;
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
         }
-        // 权限位必须最后设置: 一个不可写的目录若先设权限就无法再接收子项 (而它恰恰
-        // 是"复制必然失败"这类用例的构造方式).
-        fs::set_permissions(dest, metadata.permissions())
-            .map_err(|error| failed("设置备份目录权限", dest, &error))?;
-        return Ok(());
+        builder
+            .create(dest)
+            .map_err(|error| copy_error("创建备份目录", dest, error))?;
+        let copied = (|| {
+            for entry in
+                fs::read_dir(source).map_err(|error| copy_error("读取目录", source, error))?
+            {
+                let entry = entry.map_err(|error| copy_error("读取目录项", source, error))?;
+                copy_object(&entry.path(), &dest.join(entry.file_name()))?;
+            }
+            // 子项复制完成后再收紧权限, 否则只读目录无法接收子项.
+            fs::set_permissions(dest, metadata.permissions())
+                .map_err(|error| copy_error("设置备份目录权限", dest, error))
+        })();
+        return finish_copy(dest, copied);
     }
 
-    fs::copy(source, dest).map_err(|error| failed("复制", source, &error))?;
-    Ok(())
+    if !file_type.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("无法复制特殊文件 {}", source.display()),
+        ));
+    }
+    let mut input = fs::File::open(source).map_err(|error| copy_error("读取", source, error))?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut output = options
+        .open(dest)
+        .map_err(|error| copy_error("创建备份文件", dest, error))?;
+    let copied = io::copy(&mut input, &mut output)
+        .map_err(|error| copy_error("复制", source, error))
+        .and_then(|_| {
+            output
+                .set_permissions(metadata.permissions())
+                .map_err(|error| copy_error("设置备份文件权限", dest, error))
+        });
+    finish_copy(dest, copied)
+}
+
+fn finish_copy(dest: &Path, result: io::Result<()>) -> io::Result<()> {
+    if result.is_err() {
+        remove_any(dest);
+    }
+    result
+}
+
+fn copy_error(context: &str, path: &Path, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!("{context} {} 失败: {error}", path.display()),
+    )
 }
 
 /// `target` 的备份名前缀: `<原名>.dotlink-backup.`
@@ -251,11 +273,6 @@ fn timestamp() -> String {
         now.minute(),
         now.second()
     )
-}
-
-/// 在 `directory` 中检测 `name` 是否未被占用 (lstat 语义).
-fn is_free(name: &OsStr, directory: &Path) -> bool {
-    fs::symlink_metadata(directory.join(name)).is_err()
 }
 
 /// 尽最大努力清除 `path` (普通文件 / 符号链接 / 目录均可), 失败不外抛.
@@ -331,9 +348,7 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     directory.join(name)
 }
 
-/// 进程级唯一的暂存后缀: 并发进程对同一路径操作时不得共用同一暂存名, 否则两次复制
-/// 会交错写入同一文件, 产出一个内容损坏的备份或恢复结果. 进程号足以区分并发进程;
-/// 单进程内同一路径的暂存操作串行, 不会重叠.
+/// PID 减少并发命名碰撞; 排他性由创建操作保证, 不能依赖 PID 未被复用.
 fn unique_staging_suffix(suffix: &str) -> String {
     format!(".{}{suffix}", std::process::id())
 }
@@ -925,5 +940,138 @@ mod tests {
             "keep",
             "目标上已有的内容不得被失败的恢复改动"
         );
+    }
+
+    #[test]
+    fn copying_never_changes_an_occupied_destination() {
+        use std::os::unix::fs::MetadataExt;
+
+        for source_kind in ["file", "directory", "link", "missing"] {
+            for destination_kind in ["file", "directory", "link", "dangling"] {
+                let dir = tempfile::tempdir().unwrap();
+                let source = dir.path().join("source");
+                let dest = dir.path().join("dest");
+                let sentinel = dir.path().join("sentinel");
+                fs::write(&sentinel, "unrelated content").unwrap();
+                match source_kind {
+                    "file" => fs::write(&source, "original").unwrap(),
+                    "directory" => {
+                        fs::create_dir(&source).unwrap();
+                        fs::write(source.join("child"), "original").unwrap();
+                    }
+                    "link" => os::create_symlink(Path::new("sentinel"), &source).unwrap(),
+                    "missing" => {}
+                    _ => unreachable!(),
+                }
+                match destination_kind {
+                    "file" => fs::write(&dest, "keep").unwrap(),
+                    "directory" => {
+                        fs::create_dir(&dest).unwrap();
+                        fs::write(dest.join("keep"), "keep").unwrap();
+                    }
+                    "link" => os::create_symlink(Path::new("sentinel"), &dest).unwrap(),
+                    "dangling" => os::create_symlink(Path::new("missing"), &dest).unwrap(),
+                    _ => unreachable!(),
+                }
+                let inode = fs::symlink_metadata(&dest).unwrap().ino();
+                assert!(
+                    copy_object(&source, &dest).is_err(),
+                    "{source_kind}/{destination_kind}"
+                );
+                assert_eq!(fs::symlink_metadata(&dest).unwrap().ino(), inode);
+                assert_eq!(fs::read_to_string(&sentinel).unwrap(), "unrelated content");
+                match destination_kind {
+                    "file" => assert_eq!(fs::read_to_string(&dest).unwrap(), "keep"),
+                    "directory" => {
+                        assert_eq!(fs::read_to_string(dest.join("keep")).unwrap(), "keep");
+                        assert_eq!(fs::read_dir(&dest).unwrap().count(), 1);
+                    }
+                    "link" => assert_eq!(fs::read_link(&dest).unwrap(), Path::new("sentinel")),
+                    "dangling" => assert_eq!(fs::read_link(&dest).unwrap(), Path::new("missing")),
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn restore_chooses_another_staging_name_without_following_or_merging_occupants() {
+        use std::os::unix::fs::MetadataExt;
+
+        for kind in ["file", "directory", "link", "dangling"] {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("rc");
+            let backup = dir.path().join("backup");
+            fs::write(&backup, "original").unwrap();
+            let sentinel = dir.path().join("sentinel");
+            fs::write(&sentinel, "unrelated content").unwrap();
+            let occupied = with_suffix(&target, &unique_staging_suffix(RESTORE_SUFFIX));
+            match kind {
+                "file" => fs::write(&occupied, "keep").unwrap(),
+                "directory" => {
+                    fs::create_dir(&occupied).unwrap();
+                    fs::write(occupied.join("keep"), "keep").unwrap();
+                }
+                "link" => os::create_symlink(Path::new("sentinel"), &occupied).unwrap(),
+                "dangling" => os::create_symlink(Path::new("missing"), &occupied).unwrap(),
+                _ => unreachable!(),
+            }
+            let inode = fs::symlink_metadata(&occupied).unwrap().ino();
+
+            restore_backup(&target, &backup).unwrap();
+
+            assert_eq!(fs::read_to_string(&sentinel).unwrap(), "unrelated content");
+            assert_eq!(fs::symlink_metadata(&occupied).unwrap().ino(), inode);
+            assert!(fs::symlink_metadata(&target).unwrap().is_file());
+            assert_eq!(fs::read_to_string(&target).unwrap(), "original");
+            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 4);
+        }
+    }
+
+    #[test]
+    fn a_copy_failure_cleans_only_its_own_partial_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let dest = dir.path().join("partial");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("file"), "original").unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(source.join("socket")).unwrap();
+
+        assert!(copy_object(&source, &dest).is_err());
+        assert!(!dest.exists());
+        assert_eq!(fs::read_to_string(source.join("file")).unwrap(), "original");
+    }
+
+    #[test]
+    fn concurrent_backups_keep_every_complete_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let object = dir.path().join("rc");
+        fs::write(&object, "original").unwrap();
+        let barrier = std::sync::Barrier::new(8);
+        let paths = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    let object = &object;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        (0..4)
+                            .map(|_| write_backup(object).unwrap())
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .flat_map(|thread| thread.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let distinct: std::collections::HashSet<_> = paths.iter().collect();
+        assert_eq!(distinct.len(), 32);
+        for path in paths {
+            assert_eq!(fs::read_to_string(&path).unwrap(), "original");
+            assert!(complete_suffix_of(&suffix_of(&object, &path)).is_some());
+        }
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 33);
     }
 }
