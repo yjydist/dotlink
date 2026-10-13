@@ -94,9 +94,16 @@ fn replace_link_with_backup(target: &Path, backup: &Path) -> Result<()> {
             Ok(())
         }
         Err(error) => {
-            // 恢复失败: 把链接移回原路径, 恢复"未撤销"的原状.
-            let _ = fs::rename(&aside, target);
-            Err(error)
+            // 恢复失败: 把链接移回原路径, 恢复"未撤销"的原状. 回滚本身也可能失败
+            // (例如目标路径在两次改名之间被占用), 此时链接会暂存在 `aside`, 必须把
+            // 这一层原因一并报告, 不能吞掉后只报恢复失败.
+            match fs::rename(&aside, target) {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(Error::EntryFailed(format!(
+                    "{error}; 且回滚链接失败, 链接暂存于 {}: {rollback}",
+                    aside.display()
+                ))),
+            }
         }
     }
 }
