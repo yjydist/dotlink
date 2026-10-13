@@ -29,6 +29,46 @@ fn deployed(env: &TempEnv, source: &str, target: &str) -> PathBuf {
     path
 }
 
+#[test]
+fn undo_restores_each_targets_latest_backup_from_shared_and_separate_directories() {
+    let env = TempEnv::new();
+    env.write_source("rc", "managed");
+    env.write_manifest(&manifest_of(&[
+        ("rc", "~/a", "-"),
+        ("rc", "~/b", "-"),
+        ("rc", "~/nested/a", "-"),
+    ]));
+    assert_eq!(run(&env, &["apply"]).code, 0);
+    for name in ["a", "b", "nested/a"] {
+        for serial in [9, 10] {
+            fs::write(
+                env.home()
+                    .join(format!("{name}.dotlink-backup.20260101T000000.{serial}")),
+                format!("{name}/{serial}"),
+            )
+            .unwrap();
+        }
+        fs::write(
+            env.home()
+                .join(format!("{name}.dotlink-backup.20990101T000000.partial")),
+            "incomplete",
+        )
+        .unwrap();
+    }
+    let result = run(&env, &["undo"]);
+    assert_eq!(result.code, 1, "{}", result.stdout);
+    for name in ["a", "b", "nested/a"] {
+        env.assert_content(&env.home().join(name), &format!("{name}/10"));
+        let backup = env
+            .home()
+            .join(format!("{name}.dotlink-backup.20260101T000000.10"));
+        assert!(backup.exists());
+        assert!(
+            line_for(&result.stdout, &format!("~/{name}")).contains(&backup.display().to_string())
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // (a) 已部署且曾有备份: 链接被移除, 原内容恢复到原路径, 行为 restore 且给出备份来源路径
 // ---------------------------------------------------------------------------

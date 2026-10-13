@@ -194,6 +194,7 @@ struct UndoItem<'a> {
 /// 因此这里先由判定结果取一份快照 (逐条 token + 备份), 再执行移除; 快照同时就是报告
 /// 与退出码的输入 -- 二者同源, 不需要第二份逻辑.
 fn undo(manifest: &Manifest, states: &[EntryState]) -> Vec<ReportRow> {
+    let mut backups = backup::BackupFinder::default();
     let mut plan: Vec<UndoItem> = manifest
         .entries
         .iter()
@@ -204,7 +205,7 @@ fn undo(manifest: &Manifest, states: &[EntryState]) -> Vec<ReportRow> {
             // 随行报告; 把它吞成"无备份"会让条目落进成功列的 `undo` 并移除链接.
             let snapshot = match state.current {
                 Current::LinkedCorrect | Current::LinkedWrong => {
-                    backup::find_latest_backup(&entry.target_path)
+                    backups.find_latest(&entry.target_path)
                 }
                 _ => Ok(None),
             };

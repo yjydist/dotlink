@@ -14,6 +14,7 @@
 //!   序号消歧, 并发备份和遗留暂存对象都不会被覆盖或混入新备份.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
@@ -32,6 +33,35 @@ const PARTIAL_SUFFIX: &str = ".partial";
 
 /// 恢复过程中使用的临时名后缀: 目录恢复写到临时名再改名, 避免半成品.
 const RESTORE_SUFFIX: &str = ".dotlink-restore.partial";
+
+#[derive(Default)]
+pub(crate) struct BackupFinder {
+    directories: HashMap<PathBuf, Result<DirectoryBackups>>,
+}
+
+type DirectoryBackups = HashMap<OsString, LatestBackup>;
+
+struct LatestBackup {
+    key: (String, String, String),
+    path: PathBuf,
+}
+
+/// 一次 undo 的目录快照, 在所有撤销动作开始前完成查询.
+impl BackupFinder {
+    pub(crate) fn find_latest(&mut self, target: &Path) -> Result<Option<PathBuf>> {
+        let directory = parent_dir(target);
+        let snapshot = self
+            .directories
+            .entry(directory.to_path_buf())
+            .or_insert_with(|| scan_backups(directory));
+        match snapshot {
+            Ok(backups) => Ok(backups
+                .get(target.file_name().unwrap_or_default())
+                .map(|backup| backup.path.clone())),
+            Err(error) => Err(Error::EntryFailed(error.to_string())),
+        }
+    }
+}
 
 /// 构造 `<原名>.dotlink-backup.<YYYYMMDDThhmmss>` 形态的备份路径.
 ///
@@ -57,7 +87,7 @@ fn backup_candidates(target: &Path) -> impl Iterator<Item = PathBuf> {
     })
 }
 
-/// 取同目录下"最新"的那个备份.
+/// 扫描目录, 为每个原始文件名选出最新完整备份.
 ///
 /// **(时间戳, 序号) 最大者胜出**: 跨时间戳取较晚者 (时间戳定长, 字典序即时间序),
 /// 同一时间戳内按序号的**数值**比较, 裸名视为序号 0. 不按整名字典序比较 -- 同一秒
@@ -69,26 +99,21 @@ fn backup_candidates(target: &Path) -> impl Iterator<Item = PathBuf> {
 ///
 /// 目录读取失败不是"无备份"而是**环境故障**, 原样上抛 (调用者按 `Unreadable` 的
 /// 先例报 `fail` 并给出底层原因); 只有目录不存在 (`NotFound`) 才算没有备份.
-pub fn find_latest_backup(target: &Path) -> Result<Option<PathBuf>> {
-    let directory = parent_dir(target);
-    let Some(prefix) = backup_base(target).to_str().map(str::to_owned) else {
-        return Ok(None);
-    };
-
+fn scan_backups(directory: &Path) -> Result<DirectoryBackups> {
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(HashMap::new()),
         Err(error) => return Err(failed("读取备份目录", directory, &error)),
     };
 
-    let mut latest: Option<((String, String, String), PathBuf)> = None;
+    let mut latest = DirectoryBackups::new();
     for entry in entries {
         let entry = entry.map_err(|error| failed("读取备份目录项", directory, &error))?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             continue;
         };
-        let Some(suffix) = name.strip_prefix(prefix.as_str()) else {
+        let Some((target, suffix)) = name.rsplit_once(MARKER) else {
             continue;
         };
         let Some((stamp, serial)) = complete_suffix_of(suffix) else {
@@ -96,14 +121,25 @@ pub fn find_latest_backup(target: &Path) -> Result<Option<PathBuf>> {
         };
         let key = (stamp.to_string(), serial.to_string(), name.to_string());
         if latest
-            .as_ref()
-            .is_none_or(|(best, _)| cmp_backup_key(&key, best) == Ordering::Greater)
+            .get(OsStr::new(target))
+            .is_none_or(|best| cmp_backup_key(&key, &best.key) == Ordering::Greater)
         {
-            latest = Some((key, entry.path()));
+            latest.insert(
+                OsString::from(target),
+                LatestBackup {
+                    key,
+                    path: entry.path(),
+                },
+            );
         }
     }
 
-    Ok(latest.map(|(_, path)| path))
+    Ok(latest)
+}
+
+#[cfg(test)]
+pub(crate) fn find_latest_backup(target: &Path) -> Result<Option<PathBuf>> {
+    BackupFinder::default().find_latest(target)
 }
 
 /// 把 `object` 备份到它的同目录, 返回备份的最终路径.
@@ -1073,5 +1109,72 @@ mod tests {
             assert!(complete_suffix_of(&suffix_of(&object, &path)).is_some());
         }
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 33);
+    }
+
+    #[test]
+    fn backup_lookup_uses_one_snapshot_per_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("a");
+        let second = dir.path().join("b");
+        let original = dir.path().join("b.dotlink-backup.20260101T000000.9");
+        fs::write(&original, "original").unwrap();
+        let mut finder = BackupFinder::default();
+        assert_eq!(finder.find_latest(&first).unwrap(), None);
+
+        let newer = dir.path().join("b.dotlink-backup.20260101T000000.10");
+        fs::write(&newer, "newer").unwrap();
+        assert_eq!(finder.find_latest(&second).unwrap(), Some(original));
+        assert_eq!(
+            BackupFinder::default().find_latest(&second).unwrap(),
+            Some(newer)
+        );
+
+        let other_dir = dir.path().join("other");
+        fs::create_dir(&other_dir).unwrap();
+        let other = other_dir.join("b.dotlink-backup.20260102T000000");
+        fs::write(&other, "other").unwrap();
+        assert_eq!(
+            finder.find_latest(&other_dir.join("b")).unwrap(),
+            Some(other)
+        );
+    }
+
+    #[test]
+    fn directory_backup_index_keeps_each_target_and_numeric_order_separate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut finder = BackupFinder::default();
+        for target in [
+            "rc",
+            "rc.extra",
+            "配置",
+            "rc.dotlink-backup.20260101T000000",
+        ] {
+            for serial in ["9", "10", "00010", "partial"] {
+                fs::write(
+                    dir.path()
+                        .join(format!("{target}.dotlink-backup.20260102T000000.{serial}")),
+                    serial,
+                )
+                .unwrap();
+            }
+        }
+        for target in [
+            "rc",
+            "rc.extra",
+            "配置",
+            "rc.dotlink-backup.20260101T000000",
+        ] {
+            assert_eq!(
+                finder.find_latest(&dir.path().join(target)).unwrap(),
+                Some(
+                    dir.path()
+                        .join(format!("{target}.dotlink-backup.20260102T000000.10"))
+                )
+            );
+        }
+        assert_eq!(
+            finder.find_latest(&dir.path().join("missing")).unwrap(),
+            None
+        );
     }
 }
