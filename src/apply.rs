@@ -66,9 +66,17 @@ fn create_dir_all(dir: &Path) -> Result<()> {
 fn replace_and_backup(entry: &Entry) -> Result<Option<PathBuf>> {
     let target = entry.target_path.as_path();
 
+    // 备份落定之后才允许删除原对象, 因此这两步的失败都发生在"原内容已被备份"之后:
+    // 错误里带上备份路径, 用户才知道去哪儿找回它 (FR-016).
     let backup_path = backup::write_backup(target)?;
-    remove_object(target)?;
-    create_link(entry)?;
+    remove_object(target)
+        .and_then(|()| create_link(entry))
+        .map_err(|error| {
+            Error::EntryFailed(format!(
+                "{error} (原内容已备份到 {})",
+                backup_path.display()
+            ))
+        })?;
 
     Ok(Some(backup_path))
 }
@@ -308,5 +316,54 @@ mod tests {
                 "{name} 不是 .partial 残留, 会被误认为完整备份"
             );
         }
+    }
+
+    /// 备份已落定、替换后续步骤失败时, 错误必须给出备份路径 (FR-016).
+    ///
+    /// 构造: 目标目录内含一个只读可进的子目录 (`0o555`), 备份能读取它, 但删除原对象
+    /// 时无法清空它 -- 于是备份成功而替换失败, 正是"原内容已备份但目标未就位"的情形.
+    #[test]
+    fn replace_and_backup_reports_the_backup_path_when_replacing_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        fs::write(repo.join("nvim.lua"), "managed").unwrap();
+
+        let target = repo.join("home/nvim");
+        let locked = target.join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(locked.join("secret"), "secret").unwrap();
+        fs::write(target.join("init.lua"), "old").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+
+        // 以 root 运行时权限位无效, 无法构造"删除必然失败"的场景, 只能跳过.
+        if fs::write(locked.join("probe"), "").is_ok() {
+            fs::remove_file(locked.join("probe")).unwrap();
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("以 root 运行: chmod 555 不生效, 跳过替换失败的备份路径断言");
+            return;
+        }
+
+        let entry = entry_for(repo, "nvim.lua", &target);
+        let error = apply_entry(&entry, &state(Action::ReplaceAndBackup)).unwrap_err();
+        assert!(matches!(error, Error::EntryFailed(_)));
+
+        let message = error.to_string();
+        let marker = "(原内容已备份到 ";
+        let start = message
+            .find(marker)
+            .unwrap_or_else(|| panic!("错误必须给出备份路径: {message}"))
+            + marker.len();
+        let end = message
+            .rfind(')')
+            .unwrap_or_else(|| panic!("备份路径应以 `)` 收尾: {message}"));
+        let backup_path = PathBuf::from(&message[start..end]);
+        assert!(
+            fs::symlink_metadata(&backup_path).is_ok(),
+            "错误里给出的备份路径 {} 必须存在",
+            backup_path.display()
+        );
+
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(fs::read_to_string(locked.join("secret")).unwrap(), "secret");
     }
 }
