@@ -45,6 +45,10 @@ mod stub {
 #[cfg(not(unix))]
 pub use stub::{create_symlink, read_link};
 
+mod metadata;
+
+pub(crate) use metadata::{copy_xattrs, set_mtime};
+
 /// 原子移动对象, 落点已存在 (含悬空链接) 时拒绝覆盖.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) fn rename_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {

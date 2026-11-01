@@ -224,9 +224,9 @@ fn copy_object(source: &Path, dest: &Path) -> io::Result<()> {
                 let entry = entry.map_err(|error| copy_error("读取目录项", source, error))?;
                 copy_object(&entry.path(), &dest.join(entry.file_name()))?;
             }
-            // 子项复制完成后再收紧权限, 否则只读目录无法接收子项.
-            fs::set_permissions(dest, metadata.permissions())
-                .map_err(|error| copy_error("设置备份目录权限", dest, error))
+            // 子项复制完成后再应用元数据: 创建子项会改变目录 mtime, 只读权限也会
+            // 阻止后续子项写入.
+            apply_metadata(source, dest, &metadata)
         })();
         return finish_copy(dest, copied);
     }
@@ -250,12 +250,31 @@ fn copy_object(source: &Path, dest: &Path) -> io::Result<()> {
         .map_err(|error| copy_error("创建备份文件", dest, error))?;
     let copied = io::copy(&mut input, &mut output)
         .map_err(|error| copy_error("复制", source, error))
-        .and_then(|_| {
-            output
-                .set_permissions(metadata.permissions())
-                .map_err(|error| copy_error("设置备份文件权限", dest, error))
-        });
+        .and_then(|_| apply_metadata(source, dest, &metadata));
     finish_copy(dest, copied)
+}
+
+/// 给普通文件或目录应用保真元数据, 顺序固定为**扩展属性 -> 权限位 -> mtime**.
+///
+/// 扩展属性必须最先设置: 目标此刻仍是创建时的 `0600` / `0700`, 最终权限若只读,
+/// `setxattr` 会返回 `EACCES` (macOS 实测). 权限位只改变 ctime, mtime 最后设置即可
+/// 覆盖前面所有写入 (目录还包括子项创建). 平台不支持某类元数据时返回 `Unsupported`,
+/// 视为该平台的降级, 不使备份失败.
+fn apply_metadata(source: &Path, dest: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+    skip_unsupported(os::copy_xattrs(source, dest))
+        .map_err(|error| copy_error("设置备份扩展属性", dest, error))?;
+    fs::set_permissions(dest, metadata.permissions())
+        .map_err(|error| copy_error("设置备份权限", dest, error))?;
+    skip_unsupported(os::set_mtime(metadata, dest))
+        .map_err(|error| copy_error("设置备份修改时间", dest, error))
+}
+
+/// 平台级"不支持"是降级而非失败; 其他错误原样上抛.
+fn skip_unsupported(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(error) if error.kind() == io::ErrorKind::Unsupported => Ok(()),
+        other => other,
+    }
 }
 
 fn finish_copy(dest: &Path, result: io::Result<()>) -> io::Result<()> {
@@ -397,7 +416,7 @@ fn failed(context: &str, path: &Path, error: &io::Error) -> Error {
 #[cfg(all(test, unix))]
 mod tests {
 
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     use super::*;
 
@@ -772,6 +791,9 @@ mod tests {
         // 恢复权限位后才能读回被锁住的子目录内容.
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(fs::read_to_string(locked.join("secret")).unwrap(), "secret");
+
+        // 失败不得发布最终名: `undo` 的查找看不见任何完整备份.
+        assert_eq!(find_latest_backup(&object).unwrap(), None);
 
         // 磁盘上不得存在最终名的备份: 中断残留只能是 `.partial`.
         let prefix = format!("nvim{}", MARKER);
@@ -1176,5 +1198,117 @@ mod tests {
             finder.find_latest(&dir.path().join("missing")).unwrap(),
             None
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 元数据保真: 目录 mtime, 恢复, 旧备份
+    // -----------------------------------------------------------------------
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn set_known_mtime(path: &Path, seconds: i64, nanoseconds: i64) {
+        use rustix::fs::Timespec;
+        use rustix::fs::{AtFlags, CWD, Timestamps, UTIME_OMIT, utimensat};
+
+        let times = Timestamps {
+            last_access: Timespec {
+                tv_sec: 0,
+                tv_nsec: UTIME_OMIT,
+            },
+            last_modification: Timespec {
+                tv_sec: seconds,
+                tv_nsec: nanoseconds,
+            },
+        };
+        utimensat(CWD, path, &times, AtFlags::empty()).expect("设置测试 mtime");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn user_xattr(path: &Path) -> Option<Vec<u8>> {
+        use rustix::fs::getxattr;
+
+        let mut buffer = vec![0_u8; 8 * 1024];
+        match getxattr(path, "user.test", &mut buffer[..]) {
+            Ok(length) => Some(buffer[..length].to_vec()),
+            Err(error) if is_missing_xattr(error) => None,
+            Err(error) => panic!("读取测试扩展属性失败: {error}"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn is_missing_xattr(error: rustix::io::Errno) -> bool {
+        error == rustix::io::Errno::NODATA || error == rustix::io::Errno::NOATTR
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn is_missing_xattr(error: rustix::io::Errno) -> bool {
+        error == rustix::io::Errno::NODATA
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn set_user_xattr(path: &Path, value: &[u8]) {
+        use rustix::fs::{XattrFlags, setxattr};
+
+        setxattr(path, "user.test", value, XattrFlags::empty()).expect("设置测试扩展属性");
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn write_backup_preserves_a_directories_mtime_after_copying_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let object = dir.path().join("nvim");
+        fs::create_dir_all(object.join("lua/plugins")).unwrap();
+        fs::write(object.join("lua/plugins/a.lua"), "a").unwrap();
+        set_known_mtime(&object, 1_600_000_000, 123_456_789);
+
+        let backup = write_backup(&object).unwrap();
+
+        let copied = fs::metadata(&backup).unwrap();
+        assert_eq!(copied.mtime(), 1_600_000_000);
+        assert_eq!(copied.mtime_nsec(), 123_456_789);
+        // 子项自身的时间戳同样保留.
+        let child = fs::metadata(backup.join("lua/plugins/a.lua")).unwrap();
+        assert_eq!(
+            child.mtime(),
+            fs::metadata(object.join("lua/plugins/a.lua"))
+                .unwrap()
+                .mtime()
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn restore_brings_back_the_mtime_and_user_xattrs_of_the_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("bashrc");
+        fs::write(&original, "original").unwrap();
+        set_known_mtime(&original, 1_577_836_800, 42);
+        set_user_xattr(&original, b"fidelity");
+
+        let backup = write_backup(&original).unwrap();
+        fs::remove_file(&original).unwrap();
+        restore_backup(&original, &backup).unwrap();
+
+        let restored = fs::metadata(&original).unwrap();
+        assert_eq!(restored.mtime(), 1_577_836_800);
+        assert_eq!(restored.mtime_nsec(), 42);
+        assert_eq!(user_xattr(&original), Some(b"fidelity".to_vec()));
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn restoring_an_old_backup_uses_the_backups_own_mtime() {
+        // 旧版本创建的备份不含保真元数据; 恢复应得到备份自身的 mtime, 而不是恢复时刻.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("bashrc");
+        let backup = dir.path().join("bashrc.dotlink-backup.20260101T000000");
+        fs::write(&backup, "original").unwrap();
+        set_known_mtime(&backup, 1_577_836_800, 999);
+
+        restore_backup(&target, &backup).unwrap();
+
+        let restored = fs::metadata(&target).unwrap();
+        assert_eq!(restored.mtime(), 1_577_836_800);
+        assert_eq!(restored.mtime_nsec(), 999);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "original");
     }
 }
