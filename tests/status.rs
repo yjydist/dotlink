@@ -600,3 +600,45 @@ fn the_fixture_pins_cwd_and_home_for_the_child_process() {
     assert!(fs::symlink_metadata(link).is_ok());
     assert_status_code(&env, 0);
 }
+
+// ---------------------------------------------------------------------------
+// 输出契约: 文件系统返回的控制字符同样转义 (cli-contract 的"报告中的控制字符必须转义")
+// ---------------------------------------------------------------------------
+
+#[test]
+fn status_escapes_control_characters_in_the_actual_target() {
+    let env = TempEnv::new();
+    env.write_source("shell/bashrc", "managed\n");
+    env.write_manifest(&manifest_of(&[("shell/bashrc", "~/.bashrc", "-")]));
+
+    // 用户自建的链接指向仓库内一个带 ESC/BEL 的路径: 说明中的"实际指向"来自
+    // readlink 的返回值, 属于文件系统文本, 必须与清单字段一样被转义.
+    let actual = physical_repo(&env).join("shell").join("\u{1b}\u{7}gone");
+    std::os::unix::fs::symlink(&actual, env.home().join(".bashrc")).expect("建立错误链接");
+
+    let run = run(&env, &["status"]);
+
+    assert!(
+        !run.stdout.as_bytes().contains(&0x1b),
+        "输出含未转义 ESC: {:?}",
+        run.stdout
+    );
+    assert!(
+        !run.stdout.as_bytes().contains(&0x07),
+        "输出含未转义 BEL: {:?}",
+        run.stdout
+    );
+    assert_eq!(
+        run.stdout.lines().count(),
+        2,
+        "条目与汇总各占一行: {:?}",
+        run.stdout
+    );
+    let line = line_for(&run.stdout, "~/.bashrc");
+    assert_eq!(token_of(line), "wrong", "{line}");
+    assert!(
+        line.contains(r"shell/\u{1b}\u{7}gone"),
+        "实际指向必须显示转义形式: {line}"
+    );
+    assert_eq!(run.code, 1, "存在偏离; stdout:\n{}", run.stdout);
+}

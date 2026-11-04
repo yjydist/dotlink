@@ -481,3 +481,61 @@ fn the_summary_puts_one_entry_in_each_of_the_four_columns() {
     );
     assert_eq!(run.code, 1, "存在待办与失败, preview 必须退 1");
 }
+
+// ---------------------------------------------------------------------------
+// 输出契约: 报告中的控制字符必须转义 (cli-contract 的"报告中的控制字符必须转义")
+// ---------------------------------------------------------------------------
+
+#[test]
+fn preview_escapes_control_characters_in_target_and_source() {
+    let env = TempEnv::new();
+    env.write_source("shell/bashrc", "managed\n");
+    // TOML 基本字符串里的转义: 未转义的换行会让一个条目折行, ESC/BEL 可向终端
+    // 注入 OSC 序列. 第一个条目覆盖 target, 第二个条目让 source 出现在缺失说明里.
+    env.write_manifest(&manifest_of(&[
+        (
+            "shell/bashrc",
+            r"~/.bashrc\u001b]0;pwned\u0007\nsecond",
+            "-",
+        ),
+        (r"shell/\u001b\u0007missing", "~/.missing", "-"),
+    ]));
+
+    let run = run(&env, &["preview"]);
+
+    assert!(
+        !run.stdout.as_bytes().contains(&0x1b),
+        "输出含未转义 ESC: {:?}",
+        run.stdout
+    );
+    assert!(
+        !run.stdout.as_bytes().contains(&0x07),
+        "输出含未转义 BEL: {:?}",
+        run.stdout
+    );
+    // 两个条目加末尾汇总: 换行 target 不得使条目折行.
+    assert_eq!(
+        run.stdout.lines().count(),
+        3,
+        "每个条目必须恰占一行, 汇总在最后: {:?}",
+        run.stdout
+    );
+
+    let lines: Vec<&str> = run.stdout.lines().collect();
+    assert!(
+        lines[0].contains(r"~/.bashrc\u{1b}]0;pwned\u{7}\nsecond"),
+        "target 列必须显示转义后的原始写法: {}",
+        lines[0]
+    );
+    assert!(
+        lines[1].contains(r"shell/\u{1b}\u{7}missing"),
+        "缺失说明中的 source 必须被转义: {}",
+        lines[1]
+    );
+    assert_eq!(
+        lines[2], "2 个条目: 1 成功, 0 已是最新, 0 未处理, 1 失败",
+        "汇总行必须是最后一行:\n{}",
+        run.stdout
+    );
+    assert_eq!(run.code, 1, "存在待办与失败; stdout:\n{}", run.stdout);
+}

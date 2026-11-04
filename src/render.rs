@@ -30,6 +30,27 @@ const TOKEN_WIDTH: usize = 9;
 /// (`14 + 6 = 20`).
 const TARGET_WIDTH: usize = 20;
 
+/// 把控制字符替换为可读转义形式, 只供显示层使用.
+///
+/// 对 `char::is_control()` (C0, C1 与 DEL) 的字符使用 `char::escape_default`:
+/// 换行 -> `\n`, 回车 -> `\r`, 制表 -> `\t`, ESC -> `\u{1b}`, BEL -> `\u{7}`,
+/// DEL -> `\u{7f}`. 其余字符原样保留, 因此正常路径与清单原文逐字一致, 且路径中的
+/// 反斜杠与引号不会被二次转义.
+///
+/// 转义仅作用于报告文本, 不参与清单解析, 路径解析或文件系统操作
+/// (`openspec/specs/cli-contract/spec.md` 的"报告中的控制字符必须转义").
+pub fn escape_controls(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        if character.is_control() {
+            escaped.extend(character.escape_default());
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
+}
+
 /// 报告中的一行.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReportRow {
@@ -155,19 +176,23 @@ pub fn note_for(
 /// 逐条目行 (`<序号>/<总数> <token> <用户书写的 target> <说明>`) 与末尾汇总.
 ///
 /// 第三列是**用户书写的原始 `entry.target` 字符串**, 不是解析后的绝对路径;
-/// 每行末尾换行; 最后一行是汇总.
+/// 每行末尾换行; 最后一行是汇总. target 与说明中的控制字符在这里统一转义, 因此
+/// 动态字段 (target, source, 实际指向, 备份路径与错误原因) 无论来自清单还是文件系统,
+/// 都不能折行或向终端发送控制序列.
 pub fn render(rows: &[ReportRow]) -> String {
     let total = rows.len();
     let mut out = String::new();
 
     for (index, row) in rows.iter().enumerate() {
+        let target_display = escape_controls(&row.target_display);
+        let note = escape_controls(&row.note);
         out.push_str(&format!(
             "{}/{} {:<width$} {:<target$} {}\n",
             index + 1,
             total,
             token_name(row.token),
-            row.target_display,
-            row.note,
+            target_display,
+            note,
             width = TOKEN_WIDTH,
             // `TARGET_WIDTH` 含其后那一格分隔空格, 因此字段本身少一格.
             target = TARGET_WIDTH - 1,
@@ -1177,6 +1202,46 @@ mod tests {
                 "4/4 missing   ~/.config/nvim      源缺失 (仓库中不存在: nvim)\n",
                 "4 个条目: 1 成功, 1 已是最新, 1 未处理, 1 失败\n",
             )
+        );
+    }
+
+    #[test]
+    fn escape_controls_maps_only_control_characters_to_readable_forms() {
+        assert_eq!(escape_controls("a\nb\rc\td"), r"a\nb\rc\td");
+        assert_eq!(escape_controls("\u{1b}[31m"), r"\u{1b}[31m");
+        assert_eq!(escape_controls("\u{7}"), r"\u{7}");
+        assert_eq!(escape_controls("\u{7f}"), r"\u{7f}");
+        assert_eq!(escape_controls("\u{85}"), r"\u{85}");
+        // 非控制字符保持原样: 反斜杠与引号不得被二次转义.
+        assert_eq!(escape_controls(r#"a\b"c'd"#), r#"a\b"c'd"#);
+    }
+
+    #[test]
+    fn render_escapes_control_characters_and_keeps_each_entry_on_one_line() {
+        let rows = vec![
+            ReportRow {
+                target_display: "~/.a\nb".to_string(),
+                token: EntryOutcome::Create,
+                note: "说明".to_string(),
+            },
+            ReportRow {
+                target_display: "~/.c\u{1b}[31m".to_string(),
+                token: EntryOutcome::Ok,
+                note: "文件系统返回\u{7}".to_string(),
+            },
+        ];
+
+        let out = render(&rows);
+        assert_eq!(out.lines().count(), rows.len() + 1, "{out:?}");
+        assert!(out.contains(r"~/.a\nb"), "{out:?}");
+        assert!(out.contains(r"~/.c\u{1b}[31m"), "{out:?}");
+        assert!(out.contains(r"文件系统返回\u{7}"), "{out:?}");
+        assert!(!out.contains('\u{1b}'), "输出含未转义 ESC: {out:?}");
+        assert!(!out.contains('\u{7}'), "输出含未转义 BEL: {out:?}");
+        assert_eq!(
+            out.lines().last().unwrap_or_default(),
+            summary_line_of(&rows).trim_end(),
+            "汇总行必须是最后一行: {out:?}"
         );
     }
 

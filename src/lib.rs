@@ -80,7 +80,13 @@ fn run_on(supported: bool) -> i32 {
         Ok(manifest) => manifest,
         Err(error) => {
             // 与 `platform_gate` 同构: 标准错误不可写时只放弃说明, 清单错误仍是 2.
-            let _ = writeln!(std::io::stderr().lock(), "dotlink: {error}");
+            // 原因可能带着来自清单或环境的路径, 因此与报告行共用同一个转义助手,
+            // 保证诊断恰好一行且不含未转义的 ESC/BEL.
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "dotlink: {}",
+                render::escape_controls(&error.to_string())
+            );
             return error.exit_code();
         }
     };
@@ -124,7 +130,13 @@ fn write_report(
     if let Err(error) = written
         && error.kind() != std::io::ErrorKind::BrokenPipe
     {
-        let _ = writeln!(stderr, "dotlink: 写出报告失败: {error}");
+        // 底层错误文本可能包含由实现提供的路径或消息; 与报告行共用同一个转义助手,
+        // 使诊断也恰好一行.
+        let _ = writeln!(
+            stderr,
+            "dotlink: 写出报告失败: {}",
+            render::escape_controls(&error.to_string())
+        );
     }
 }
 
@@ -452,6 +464,36 @@ mod tests {
         let text = String::from_utf8(stderr).expect("诊断必须是 UTF-8");
         assert_eq!(text.lines().count(), 1, "诊断必须恰好一行: {text:?}");
         assert_eq!(text, "dotlink: 写出报告失败: 模拟写失败\n");
+    }
+
+    /// 写返回带控制字符错误的 writer: 诊断必须把换行与 ESC 转义后才能占一行.
+    struct ControlCharErrorWriter;
+
+    impl std::io::Write for ControlCharErrorWriter {
+        fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("模拟\n\u{1b}写失败"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn write_report_escapes_control_characters_in_the_diagnostic() {
+        let rows = sample_rows();
+        let mut stdout = ControlCharErrorWriter;
+        let mut stderr = Vec::new();
+
+        write_report(&rows, &mut stdout, &mut stderr);
+
+        let text = String::from_utf8(stderr).expect("诊断必须是 UTF-8");
+        assert_eq!(text.lines().count(), 1, "诊断必须恰好一行: {text:?}");
+        assert!(!text.contains('\u{1b}'), "诊断含未转义 ESC: {text:?}");
+        assert!(
+            text.contains(r"模拟\n\u{1b}写失败"),
+            "诊断必须显示转义形式: {text:?}"
+        );
     }
 
     /// 标准错误也不可写时只放弃诊断: 不 panic (能正常返回即通过).

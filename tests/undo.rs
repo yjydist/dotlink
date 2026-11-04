@@ -879,3 +879,66 @@ fn undo_reports_fail_and_can_be_retried_when_the_backup_is_unreadable() {
     );
     env.assert_content(&backup, "original\n");
 }
+
+// ---------------------------------------------------------------------------
+// 输出契约: 备份路径中的控制字符同样转义 (cli-contract 的"报告中的控制字符必须转义")
+// ---------------------------------------------------------------------------
+
+/// target 的文件名含 ESC/BEL 时, apply 生成的备份文件名也带着它们. `undo` 的
+/// `restore` 说明会给出备份完整路径, 该路径属于"备份路径"这一类动态字段, 必须在
+/// 输出中转义, 不能把原始控制字节送进终端.
+#[test]
+fn undo_escapes_control_characters_in_the_restored_backup_path() {
+    let env = TempEnv::new();
+    env.write_source("shell/bashrc", "managed\n");
+    // TOML 基本字符串用 `\u001b` / `\u0007` 表达 ESC / BEL; 原始控制字节不能直接写进清单.
+    let target_name = ".bashrc\u{1b}\u{7}";
+    env.write_manifest(&manifest_of(&[(
+        "shell/bashrc",
+        r"~/.bashrc\u001b\u0007",
+        "replace_and_backup",
+    )]));
+
+    let target = env.home().join(target_name);
+    fs::write(&target, "original\n").unwrap();
+
+    let applied = run(&env, &["apply"]);
+    assert_eq!(applied.code, 0, "前置部署必须成功: {}", applied.stdout);
+    assert!(
+        !applied.stdout.as_bytes().contains(&0x1b) && !applied.stdout.as_bytes().contains(&0x07),
+        "apply 输出含未转义 ESC/BEL: {:?}",
+        applied.stdout
+    );
+    let applied_line = line_for(&applied.stdout, r"~/.bashrc\u{1b}\u{7}");
+    assert_eq!(token_of(applied_line), "replace", "{applied_line}");
+    assert!(
+        applied_line.contains(r".bashrc\u{1b}\u{7}.dotlink-backup."),
+        "备份路径必须显示转义形式: {applied_line}"
+    );
+    assert_eq!(backups_in(env.home()).len(), 1, "apply 应留下恰好一份备份");
+
+    let undone = run(&env, &["undo"]);
+    assert_eq!(
+        undone.code, 1,
+        "撤销了东西 (restore) 故退 1; stdout:\n{}",
+        undone.stdout
+    );
+    assert!(
+        !undone.stdout.as_bytes().contains(&0x1b) && !undone.stdout.as_bytes().contains(&0x07),
+        "undo 输出含未转义 ESC/BEL: {:?}",
+        undone.stdout
+    );
+    assert_eq!(
+        undone.stdout.lines().count(),
+        2,
+        "条目与汇总各占一行: {:?}",
+        undone.stdout
+    );
+    let line = line_for(&undone.stdout, r"~/.bashrc\u{1b}\u{7}");
+    assert_eq!(token_of(line), "restore", "{line}");
+    assert!(
+        line.contains(r".bashrc\u{1b}\u{7}.dotlink-backup."),
+        "恢复说明必须显示转义后的备份路径: {line}"
+    );
+    env.assert_content(&target, "original\n");
+}

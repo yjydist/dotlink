@@ -1132,3 +1132,38 @@ fn an_unreadable_entry_is_a_failure_not_a_validation_error() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// 输出契约: 清单诊断中的控制字符转义 (cli-contract 的"报告中的控制字符必须转义")
+// ---------------------------------------------------------------------------
+
+/// 清单错误文本带着用户书写的 target 时, 其中的 ESC/BEL 必须在写入标准错误前转义:
+/// 诊断仍是一行, 不把控制序列送给终端, 退出码仍是 2.
+#[test]
+fn manifest_diagnostics_escape_control_characters_and_keep_exit_code_two() {
+    let env = env_with_source();
+    // 两个条目规范化后同一路径 -> V-5 诊断会回显 target_path.
+    env.write_manifest(
+        "[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"~/.bashrc\\u001b\\u0007\"\n\n\
+         [[entry]]\nsource = \"shell/bashrc\"\ntarget = \"~/.bashrc\\u001b\\u0007\"\n",
+    );
+
+    let run = run(&env, &["preview"]);
+    assert_eq!(run.code, 2, "清单校验失败必须退 2; stderr:\n{}", run.stderr);
+    assert!(
+        !run.stderr.as_bytes().contains(&0x1b) && !run.stderr.as_bytes().contains(&0x07),
+        "诊断含未转义 ESC/BEL: {:?}",
+        run.stderr
+    );
+    assert_eq!(
+        run.stderr.lines().count(),
+        1,
+        "诊断必须恰好一行: {:?}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains(r".bashrc\u{1b}\u{7}"),
+        "诊断必须显示转义形式: {}",
+        run.stderr
+    );
+}
