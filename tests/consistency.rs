@@ -1,5 +1,5 @@
 //! 四命令一致性: 同一份清单与同一文件系统状态上, 四条命令对同一条目给出同一个结论
-//! (tasks.md 的 8.7).
+//! (openspec/specs/entry-classification/spec.md 的 FR-017).
 //!
 //! 契约来源: `src/lib.rs` 在分发到命令之前只调用**一次** `classify`, 四条命令消费的是
 //! 同一个 `Vec<EntryState>`; token 由 `src/render.rs::token_for` 按

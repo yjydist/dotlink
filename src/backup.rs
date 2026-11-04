@@ -1,4 +1,5 @@
-//! 备份路径的构造, 备份的写入, 与"最近一次备份"的查找 (research.md R4).
+//! 备份路径的构造, 备份的写入, 与"最近一次备份"的查找
+//! (openspec/specs/backup-lifecycle/spec.md).
 //!
 //! 备份不是需要维护的数据结构, 而是"文件系统上的命名约定": 位置固定在被覆盖路径的
 //! **同一目录**, 名称携带本地时区的秒级时间戳与消歧序号. "最新"因此可由名字直接
@@ -103,7 +104,7 @@ fn backup_candidates_at(target: &Path, stamp: String) -> impl Iterator<Item = Pa
 ///
 /// **只接受已完整命名的备份**: 后缀必须是 `<15 位时间戳>` 或 `<15 位时间戳>.<序号>`,
 /// 因此复制中途中断留下的 `...<时间戳>.partial` 既不参与"取最新", 也不会被 `undo`
-/// 消费 (data-model.md 第 4 节的完整性规则).
+/// 消费 (openspec/specs/backup-lifecycle/spec.md 的"只有完整命名的备份参与查找").
 ///
 /// 目录读取失败不是"无备份"而是**环境故障**, 原样上抛 (调用者按 `Unreadable` 的
 /// 先例报 `fail` 并给出底层原因); 只有目录不存在 (`NotFound`) 才算没有备份.
@@ -154,7 +155,7 @@ pub(crate) fn find_latest_backup(target: &Path) -> Result<Option<PathBuf>> {
 ///
 /// `object` 可以是普通文件, 目录 (递归) 或符号链接 (**复制链接本身, 不跟随**).
 /// 返回 `Ok` 意味着备份已完整落定并改名到最终名 -- 调用者此时才可以删除原对象
-/// (data-model.md 第 4 节的"先复制后删除的硬顺序"). 失败时不留下最终名.
+/// (openspec/specs/backup-fidelity/spec.md 的"备份的发布仍以完整复制为前提"). 失败时不留下最终名.
 pub(crate) fn write_backup(object: &Path) -> Result<PathBuf> {
     write_backup_at(object, &timestamp())
 }
@@ -181,8 +182,8 @@ fn write_backup_at(object: &Path, stamp: &str) -> Result<PathBuf> {
 /// 把 `backup` 的内容恢复到已空出的 `target`, 拒绝覆盖期间新建的占用物.
 ///
 /// 复制先落到**进程级唯一**的临时名, 全部复制成功后再改名到 `target`: 目录恢复中途
-/// 失败不会在原路径留下半成品. 恢复成功后**不删除备份文件本身** (`contracts/cli.md`
-/// 的"幂等").
+/// 失败不会在原路径留下半成品. 恢复成功后**不删除备份文件本身**
+/// (`openspec/specs/link-teardown/spec.md` 的"备份文件恢复后仍留在原地").
 pub(crate) fn restore_backup(target: &Path, backup: &Path) -> Result<()> {
     let partial = copy_to_staging(backup, target, RESTORE_SUFFIX)?;
 

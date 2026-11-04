@@ -55,7 +55,7 @@ pub fn classify(manifest: &Manifest) -> Vec<EntryState> {
         .collect()
 }
 
-/// 判定单个条目 (`data-model.md` 3.1).
+/// 判定单个条目 (openspec/specs/entry-classification/spec.md).
 ///
 /// 求值顺序严格为: 两次 `lstat` 的故障裁决 (`Unreadable` 先于表内各行) ->
 /// `SourceMissing` -> `Absent` -> 自上而下取首个命中者.
@@ -153,7 +153,7 @@ fn classify_entry(entry: &Entry, repo_root: &Path) -> EntryState {
         );
     }
 
-    // 归属分界 (research.md R2): 落在仓库内 -> 本工具的错误链接; 之外 -> 别人的链接.
+    // 归属分界 (openspec/specs/path-normalization/spec.md 的 R2): 落在仓库内 -> 本工具的错误链接; 之外 -> 别人的链接.
     // 二者互斥且穷尽, 且都以同一个 os::normalize 为基准, 因此悬空链接也能正确归类.
     // 判定直接复用上面已解析出的 `actual` 与循环外算好的仓库根, 不再重读链接.
     //
@@ -172,7 +172,7 @@ fn classify_entry(entry: &Entry, repo_root: &Path) -> EntryState {
 /// 目标路径上的符号链接文本解析为绝对路径后的非严格规范化结果 (`L`).
 ///
 /// 相对链接以链接所在目录为基准; 链接文本与基准都不必存在, 因此不得用
-/// `Path::canonicalize` (`research.md` R2 的悬空链接陷阱).
+/// `Path::canonicalize` (openspec/specs/path-normalization/spec.md 的 R2 悬空链接陷阱).
 fn link_destination(link_path: &Path, link_text: &Path) -> PathBuf {
     let absolute = if link_text.is_absolute() {
         link_text.to_path_buf()
@@ -191,8 +191,8 @@ fn lstat(path: &Path) -> std::io::Result<Metadata> {
     std::fs::symlink_metadata(path)
 }
 
-/// 组装判定结果. `detail` 是自由文本, 但必须携带 `contracts/cli.md` 的必现信息
-/// (失败原因 / 实际指向 / 占用物类型).
+/// 组装判定结果. `detail` 是自由文本, 但必须携带 `openspec/specs/cli-contract/spec.md`
+/// 的"必现信息" (失败原因 / 实际指向 / 占用物类型).
 fn new_state(current: Current, detail: String, on_conflict: OnConflict) -> EntryState {
     EntryState {
         current,
@@ -201,7 +201,8 @@ fn new_state(current: Current, detail: String, on_conflict: OnConflict) -> Entry
     }
 }
 
-/// 由现状与 `on_conflict` 导出动作 (严格按 `data-model.md` 3.2 表).
+/// 由现状与 `on_conflict` 导出动作 (严格按 `openspec/specs/entry-classification/spec.md`
+/// 的动作映射表).
 ///
 /// `SourceMissing` / `Unreadable` / `Absent` / `LinkedCorrect` 四种与
 /// `on_conflict` 无关. `LinkedWrong` 是本工具创建的错误链接 (落在仓库内), 同样不受
@@ -318,7 +319,7 @@ mod tests {
         fs::read_dir(dir).is_ok()
     }
 
-    // --- 3.1 的八种 Current 取值 ---
+    // --- 八种 Current 取值 ---
 
     #[test]
     fn source_missing_wins_over_an_occupied_target() {
@@ -595,7 +596,7 @@ mod tests {
 
     #[test]
     fn normalize_trap_under_tmp_is_still_linked_correct() {
-        // macOS 上 /tmp 是指向 /private/tmp 的符号链接 (research.md R2 的实测情形):
+        // macOS 上 /tmp 是指向 /private/tmp 的符号链接 (openspec/specs/path-normalization/spec.md 的 R2 实测情形):
         // 链接文本含 `..` 且两侧都过同一个非严格 normalize 时必须仍是 LinkedCorrect.
         let Some(dir) = tempfile::Builder::new().tempdir_in("/tmp").ok() else {
             println!(
@@ -621,7 +622,7 @@ mod tests {
         );
     }
 
-    // --- 3.2 的动作映射 ---
+    // --- 动作映射 ---
 
     #[test]
     fn action_mapping_follows_the_table() {
@@ -724,25 +725,27 @@ mod tests {
     }
 
     // =======================================================================
-    // T040 不变量回归
+    // 不变量回归
     //
-    // `data-model.md` 3.1 / 3.2 的**逐格**覆盖已由 T047 在上面完成, 本节不重复
-    // 逐格用例, 只补四类在实现过程中暴露出的**不变量** (3.1 的"求值语义"第 1 条
-    // 与 3.2a, `research.md` R2, `data-model.md` 3.4):
+    // `openspec/specs/entry-classification/spec.md` 的**逐格**覆盖已由上一节的逐格
+    // 用例完成, 本节不重复逐格用例, 只补四类在实现过程中暴露出的**不变量**
+    // (该 spec 的求值顺序第 1 条与动作映射, `openspec/specs/path-normalization/spec.md`
+    // 的 R2, 以及 `openspec/specs/link-deployment/spec.md` 与
+    // `openspec/specs/link-teardown/spec.md` 中描述迁移的 Scenario):
     //
     //   1. 互斥且穷尽   -- 8 种 `Current` 恰好命中一种; `Current` x `on_conflict`
-    //                      的每一种组合都落在 3.2 表内;
-    //   2. 判定顺序     -- 先判目标侧就会退化的两个反例 (相对 T047 的正面断言,
+    //                      的每一种组合都落在动作映射表内;
+    //   2. 判定顺序     -- 先判目标侧就会退化的两个反例 (相对逐格用例的正面断言,
     //                      这里补的是"目标侧为**符号链接**"的那一格, 以及
     //                      **两条反例一起**成立所给出的"与目标侧状态无关");
-    //   3. 迁移自洽     -- 3.4 的迁移路径逐条走一遍, 且 `SourceMissing` 是终态;
+    //   3. 迁移自洽     -- 迁移路径逐条走一遍, 且 `SourceMissing` 是终态;
     //   4. 规范化同源   -- 仓库根路径含 `..` 段时仍为 `LinkedCorrect`, 条目必须由
     //                      `entry::resolve` / `manifest::parse` 产出.
     // =======================================================================
 
-    // --- T040.1 互斥且穷尽 ---
+    // --- 互斥且穷尽 ---
 
-    /// 3.1 的八种取值, 供穷尽性断言使用.
+    /// 八种取值, 供穷尽性断言使用.
     const ALL_CURRENTS: [Current; 8] = [
         Current::SourceMissing,
         Current::Absent,
@@ -760,9 +763,9 @@ mod tests {
     /// 的**期望取值**在此一并锁定; 返回值是实际取到的取值集合, 供调用方断言
     /// "符号链接情形只落在 `LinkedCorrect` / `LinkedWrong` / `ForeignLink` 三者之内".
     ///
-    /// T047 的 `symlink_shapes_are_partitioned_by_link_ownership` 覆盖了前三种形态,
+    /// 上一节的 `symlink_shapes_are_partitioned_by_link_ownership` 覆盖了前三种形态,
     /// 两种悬空形态则散落于 `a_dangling_link_inside_the_repo_is_linked_wrong` 的两半.
-    /// 这里把它们收进同一组, 并补上 T047 没有的那条断言: **取值集合的大小与内容**.
+    /// 这里把它们收进同一组, 并补上逐格用例没有的那条断言: **取值集合的大小与内容**.
     /// 若两条归属分支被合并 (例如让 `LinkedWrong` 收下所有指错的链接), 集合会塌缩,
     /// 这条断言即失败.
     fn symlink_currents() -> [Current; 3] {
@@ -837,7 +840,7 @@ mod tests {
     ///
     /// `Unreadable` 用**不依赖权限位**的方式构造: 目标路径穿过一个普通文件
     /// (`<home>/occupier/rc`), `lstat` 因此返回 `NotADirectory` -- 它是 `NotFound`
-    /// **之外**的错误, 因此在 root 下也确定生效. 这与 T047 用 chmod `000` 构造的
+    /// **之外**的错误, 因此在 root 下也确定生效. 这与逐格用例用 chmod `000` 构造的
     /// `EACCES` 是不同的触发路径, 且断言不再需要"权限位生效"这一前提.
     #[test]
     fn the_eight_current_values_are_pairwise_distinct() {
@@ -910,13 +913,13 @@ mod tests {
     }
 
     /// "每种 `Current` 恰好命中所属的那一类动作"的可自动化形式: 每个
-    /// `Current` x `on_conflict` 的组合都必须落在 3.2 表内, 不存在"配到表外
+    /// `Current` x `on_conflict` 的组合都必须落在动作映射表内, 不存在"配到表外
     /// `Action`"的情形.
     ///
     /// `action_mapping_follows_the_table` 逐格断言了 8 x 2 的具体取值; 这里断言的是
     /// **补集** -- 组合的**结构**而不是取值本身:
     ///
-    /// - 3.2 表中带 "-" (与 `on_conflict` 无关) 的四种取值: 两个 `on_conflict`
+    /// - 动作映射表中带 "-" (与 `on_conflict` 无关) 的四种取值: 两个 `on_conflict`
     ///   必须给出**同一个**动作, 且该动作不得是冲突类的两个之一;
     /// - `LinkedWrong` 同样与 `on_conflict` 无关 (本工具的错误链接), 固定为
     ///   `ReplaceAndBackup`;
@@ -972,7 +975,7 @@ mod tests {
         }
     }
 
-    /// 3.2 的六个动作恰好覆盖全部 `Current` x `on_conflict` 组合的取值集合.
+    /// 动作映射的六个动作恰好覆盖全部 `Current` x `on_conflict` 组合的取值集合.
     #[test]
     fn the_action_set_is_closed_over_all_currents() {
         let mut reachable: Vec<Action> = Vec::new();
@@ -984,7 +987,7 @@ mod tests {
                 }
             }
         }
-        // 3.2 的副作用一列共六种动作, 全部可达; 且没有第七种.
+        // 动作映射的副作用一列共六种动作, 全部可达; 且没有第七种.
         for expected in [
             Action::ReportMissingSource,
             Action::ReportUnreadable,
@@ -1005,11 +1008,11 @@ mod tests {
         );
     }
 
-    // --- T040.2 判定顺序的负面断言 ---
+    // --- 判定顺序的负面断言 ---
 
     /// 若实现被改成先判目标侧, "源缺失 + 目标被占用"会退化为 `conflict`.
     ///
-    /// T047 的 `source_missing_wins_over_an_occupied_target` 只覆盖了"目标被**普通
+    /// 上一节的 `source_missing_wins_over_an_occupied_target` 只覆盖了"目标被**普通
     /// 文件**占用"这一格; 这里补的是"目标侧是**符号链接**"(对应 `conflict` 分支),
     /// 且两条反例一并断言结果与目标侧的状态**无关** -- 这正是"判定顺序"这一不变量的
     /// 内容, 而非某一格的具体取值.
@@ -1070,7 +1073,7 @@ mod tests {
 
     /// `Unreadable` 只吸收 `lstat` 的**非 `NotFound`** 错误, 不吸收"路径不存在".
     ///
-    /// T047 的 `not_found_is_never_unreadable` 覆盖了 `SourceMissing` / `Absent`
+    /// 上一节的 `not_found_is_never_unreadable` 覆盖了 `SourceMissing` / `Absent`
     /// 两侧; 这里把它扩成"同一批缺失路径在**两种** `on_conflict` 下都不得为
     /// `Unreadable`", 并把"非 `NotFound` 的那一侧才是 `Unreadable`"这一互补结论
     /// 放在同一个用例里对照.
@@ -1120,9 +1123,10 @@ mod tests {
         chmod(&blocked, 0o755);
     }
 
-    // --- T040.3 迁移表自洽 (data-model.md 3.4) ---
+    // --- 迁移自洽 (迁移路径见 `openspec/specs/link-deployment/spec.md` 与
+    // `openspec/specs/link-teardown/spec.md` 的 Scenario) ---
 
-    /// 3.4 的迁移路径逐条走一遍, 每次迁移后重新调用 `classify` 并断言 `Current`.
+    /// 迁移路径逐条走一遍, 每次迁移后重新调用 `classify` 并断言 `Current`.
     ///
     /// 全部迁移都用**真实文件系统操作**模拟 (而不只是断言枚举本身), 因此它同时
     /// 覆盖了"判定是只读的"这一前提: 每次判定都只看实况, 不依赖上一次的结论.
@@ -1275,13 +1279,13 @@ mod tests {
         );
     }
 
-    // --- T040.4 os::normalize 的三个调用点同源 (research.md R2) ---
+    // --- os::normalize 的三个调用点同源 (openspec/specs/path-normalization/spec.md 的 R2) ---
 
     /// 仓库根路径含 `..` 段时, 链接必须仍判定为 `LinkedCorrect`.
     ///
     /// 关键在于条目必须走 `manifest::parse` 的解析路径: 手工拼 `Entry` 字面量会绕过
     /// `entry.rs` 对 `source_path` 的规范化, 而那正是本用例要钉住的一环
-    /// (T047 的 `normalize_trap_under_tmp_is_still_linked_correct` 走的正是字面量).
+    /// (上一节的 `normalize_trap_under_tmp_is_still_linked_correct` 走的正是字面量).
     ///
     /// 构造: 临时根 `<tmp>` 下建 `<tmp>/repo` 并写入 `shell/bashrc`; 部署链接时链接
     /// 文本取**规范化后**的源路径 `<tmp>/repo/shell/bashrc` (即 `ln -sfn $PWD/shell/bashrc`
@@ -1290,12 +1294,12 @@ mod tests {
     /// `S = repo_root + "shell/bashrc"` (未过 `normalize` 时) 与已规范化的 `L` 不相等.
     /// 两侧都过同一个 `os::normalize` 时 `L == S` 成立, 因此本用例断言 `LinkedCorrect`;
     /// 若 `source_path` 未过 `normalize` (或只规范化了一侧), 本用例必失败 -- 这正是
-    /// 它的回归价值 (`research.md` R2 的第 3 个调用点).
+    /// 它的回归价值 (openspec/specs/path-normalization/spec.md 的 R2 第 3 个调用点).
     ///
     /// 两层断言, 缺一不可 -- 说明为何不能只留 `classify` 那一层:
     ///
     /// 1. `classify` 层 (`current == LinkedCorrect`): 这是本用例的实质断言, 对应
-    ///    T040 的"三个调用点同源". 但 `classify` 内部会把两侧都过一遍 `os::normalize`
+    ///    本节的"三个调用点同源". 但 `classify` 内部会把两侧都过一遍 `os::normalize`
     ///    (`link_destination` 与 `let source = os::normalize(...)`), 因此当
     ///    `normalize` 是幂等的, 它**无法**区分"`source_path` 在解析阶段就已规范化"
     ///    与"`source_path` 是字面拼接, 由 `classify` 兜底规范化"; 后者会让同一个
@@ -1303,8 +1307,8 @@ mod tests {
     ///    `normalize` 时仍然通过 (实测已复现).
     /// 2. 解析层 (`manifest.entries[0].source_path == source`): 直接钉住解析产物
     ///    本身, 是唯一能捕捉"`source_path` 未过 `normalize`"的断言
-    ///    (`research.md` R2 的第 3 个调用点). 与上一层的差别只在**规范化发生的位置**,
-    ///    而这正是 T040 要钉住的内容.
+    ///    (openspec/specs/path-normalization/spec.md 的 R2 第 3 个调用点). 与上一层的差别只在**规范化发生的位置**,
+    ///    而这正是本节要钉住的内容.
     ///
     /// 不依赖机器上真实存在的符号链接, 也不假设 `normalize` 是纯词法的: 只依赖
     /// "`L` 与 `S` 共用同一个 `os::normalize`" 这一属性.
@@ -1333,7 +1337,8 @@ mod tests {
             "含 .. 段的仓库根与真实仓库根必须规范化到同一路径"
         );
 
-        // `target` 取绝对路径: 相对 target 也以仓库根为基准 (R5), 那会把本用例的
+        // `target` 取绝对路径: 相对 target 也以仓库根为基准
+        // (openspec/specs/manifest-schema/spec.md 的 V-6), 那会把本用例的
         // 焦点从 `source_path` 的规范化上移开.
         let text = format!(
             "[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"{}\"\n",

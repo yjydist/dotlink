@@ -1,4 +1,5 @@
-//! FR-011 / `contracts/cli.md` 的 `fail` 行: `Unreadable` 的跨命令一致性 (tasks.md 的 T057).
+//! FR-011 / `openspec/specs/cli-contract/spec.md` 的 `fail` 行: `Unreadable` 的跨命令
+//! 一致性.
 //!
 //! 用 chmod `000` 的父目录构造 `lstat` 的 `EACCES`, 断言**四条命令**下该条目的 token
 //! 均为 `fail`, 汇总的"失败"列为 1, 退出码为 **1** (非 2 或 3), 且文件系统零改动.

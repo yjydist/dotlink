@@ -1,4 +1,4 @@
-//! 条目与路径解析 (research.md R5).
+//! 条目与路径解析 (openspec/specs/manifest-schema/spec.md).
 
 use std::path::{Path, PathBuf};
 
@@ -17,7 +17,8 @@ pub enum OnConflict {
 ///
 /// `source` / `target` 保留用户书写的原始字符串 (报告中展示它, 便于对照清单);
 /// `source_path` / `target_path` 是绝对路径且**均已过 `os::normalize`** -- 只规范化
-/// 一侧会使 `classify` 的 `L == S` 比较落在两套路径语义上 (`research.md` R2).
+/// 一侧会使 `classify` 的 `L == S` 比较落在两套路径语义上
+/// (openspec/specs/path-normalization/spec.md 的 R2).
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub source: String,
@@ -94,10 +95,11 @@ pub(crate) fn resolve_with(
 
 /// 解析 `target` 为未规范化的绝对路径.
 ///
-/// 规则 (R5): `~/...` 与裸 `~` 展开为主目录; 绝对路径原样; 相对路径挂到仓库根.
+/// 规则 (openspec/specs/manifest-schema/spec.md 的 V-6): `~/...` 与裸 `~` 展开为主目录; 绝对路径原样; 相对路径挂到仓库根.
 /// 以 `~` 开头但不以 `~/` 开头 (例如漏写斜杠的 `~.bashrc`, 或指其他用户的 `~foo/bar`)
 /// 既非主目录简写也不是绝对路径 -- 若放行会落到"相对仓库根"分支, 在受版本控制的
-/// 仓库里静默建出名为 `~.bashrc` 的路径 (`contracts/manifest.md` 的 V-6). 与 V-8 的
+/// 仓库里静默建出名为 `~.bashrc` 的路径 (`openspec/specs/manifest-schema/spec.md`
+/// 的 V-6). 与 V-8 的
 /// 立场一致, 一律整体拒绝并指出书写形态.
 fn expand_target(
     written: &str,
@@ -129,7 +131,7 @@ fn expand_target(
 
 /// 解析 `source` 为未规范化的绝对路径.
 ///
-/// 源条目必须是仓库内的相对路径 (`contracts/manifest.md` 的字段表; `research.md` R5:
+/// 源条目必须是仓库内的相对路径 (`openspec/specs/manifest-schema/spec.md` 的 V-6:
 /// "源条目路径始终相对于清单文件所在目录解析"). `~` 前缀与绝对路径都不属于"仓库内
 /// 的相对路径", 按 V-4 / V-6 整体拒绝, 以维持"条目来自仓库"这一心智模型. 词法拼接
 /// 之后仍可能越出仓库 (见 `resolve` 中归一化后的越界判定), 那一半不在此处裁决.
@@ -260,7 +262,7 @@ mod tests {
 
     #[test]
     fn source_must_be_a_relative_path_inside_the_repo() {
-        // 源条目只接受仓库内相对路径: `~` 前缀与绝对路径都不合法 (T059).
+        // 源条目只接受仓库内相对路径: `~` 前缀与绝对路径都不合法.
         for written in ["~/src/rc", "/etc/hosts"] {
             let error = resolve(written, "link/bashrc", OnConflict::Skip, &repo())
                 .expect_err("非仓库内相对路径的 source 必须被拒绝");

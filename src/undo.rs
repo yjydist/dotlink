@@ -38,7 +38,8 @@ pub fn undo_entry(entry: &Entry, state: &EntryState, backup: Option<&Path>) -> R
             Some(backup) => replace_link_with_backup(target, backup),
             None => remove_link(target),
         },
-        // 非本工具创建的内容: 绝不删除 (`contracts/cli.md` 的 `undo` 分支表).
+        // 非本工具创建的内容: 绝不删除
+        // (`openspec/specs/link-teardown/spec.md` 的"只移除本工具创建的链接").
         Current::ForeignLink | Current::ForeignFile | Current::ForeignDir => Ok(()),
         // 该路径本就没有本工具创建的链接 (含撤销后目标为空的第二次运行).
         Current::Absent => Ok(()),
@@ -553,7 +554,8 @@ mod tests {
     }
 
     /// 恢复出的是普通文件, 不是链接: 真实的第二次 `undo` 会由 `classify` 判为
-    /// `ForeignFile` 并报 `skip` (见 `contracts/cli.md` 的幂等说明). 这里直接以
+    /// `ForeignFile` 并报 `skip` (见 `openspec/specs/link-teardown/spec.md` 的
+    /// "撤销幂等且退出码随备份情形而异"). 这里直接以
     /// `Absent` 调用, 只锁定"`Absent` 不触碰文件系统"这一行.
     #[test]
     fn undo_entry_is_a_noop_when_the_target_is_already_absent() {

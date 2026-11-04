@@ -1,9 +1,10 @@
-//! US4 / FR-009 / FR-010 / SC-005: 撤销部署 (tasks.md 的 T028 全部条目).
+//! US4 / FR-009 / FR-010: 撤销部署 (openspec/specs/link-teardown/spec.md 的 FR-009 与
+//! FR-010).
 //!
 //! 覆盖 (a)-(h), 以及备份生命周期的补充用例 (不可读备份 / 同目录多目标 / 同秒多备份).
-//! 本文件经真实二进制断言, 因此**依赖 `src/lib.rs` 的命令接入**
-//! (T015 / T026 / T031). 在那些接入完成之前, 这里的断言必然失败 -- 这是预期的
-//! TDD 红阶段 (测试先于实现存在), 不得为了让本文件变绿而改动 `src/lib.rs`.
+//! 本文件经真实二进制断言, 因此**依赖 `src/lib.rs` 的命令接入**. 在那些接入完成之前,
+//! 这里的断言必然失败 -- 这是预期的 TDD 红阶段 (测试先于实现存在), 不得为了让本文件
+//! 变绿而改动 `src/lib.rs`.
 
 mod support;
 
@@ -24,7 +25,7 @@ fn deployed(env: &TempEnv, source: &str, target: &str) -> PathBuf {
     let path = env.home().join(target);
     assert!(
         fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink()),
-        "前置条件失败: apply 之后 {} 应当是指向源的符号链接 (命令接入由 T015/T031 负责, 尚未完成)",
+        "前置条件失败: apply 之后 {} 应当是指向源的符号链接 (命令接入尚未完成)",
         path.display()
     );
     env.assert_symlink_to(&path, &env.repo().join(source));
@@ -341,7 +342,7 @@ fn undo_reports_missing_for_a_source_missing_entry() {
 }
 
 // ---------------------------------------------------------------------------
-// (c) 安全反例 (SC-005): 手工换成真实目录 -> skip 且目录完整保留
+// (c) 安全反例 (真实文件不被删除): 手工换成真实目录 -> skip 且目录完整保留
 // ---------------------------------------------------------------------------
 
 #[test]

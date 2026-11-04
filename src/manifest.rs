@@ -23,7 +23,7 @@ const ENTRY_KEYS: [&str; 3] = [SOURCE_KEY, TARGET_KEY, ON_CONFLICT_KEY];
 const SKIP_VALUE: &str = "skip";
 const REPLACE_VALUE: &str = "replace_and_backup";
 
-/// V-8 说明中的两个层级名 (`contracts/manifest.md` 的两层合法键表).
+/// V-8 说明中的两个层级名 (openspec/specs/manifest-schema/spec.md 的 V-8 两层合法键表).
 const TOP_LEVEL: &str = "顶层";
 const ENTRY_LEVEL: &str = "条目内";
 
@@ -54,11 +54,11 @@ pub fn load() -> Result<Manifest> {
 /// 解析并校验给定的清单文本.
 ///
 /// 纯函数: 只读取 `text` 与 `repo_root` (以及展开 `~` 所需的 `HOME`), 不产生任何
-/// 文件系统改动. 校验规则 V-1 到 V-8 见 `data-model.md` 第 1 节, 逐条对应如下:
+/// 文件系统改动. 校验规则 V-1 到 V-8 见 `openspec/specs/manifest-schema/spec.md`, 逐条对应如下:
 /// V-2 语法 (本函数前半), V-3 条目非空, V-4 两字段非空, V-5 目标路径互不重复,
 /// V-6 目标可解析为绝对路径, V-7 `on_conflict` 取值合法, V-8 只出现已定义的键.
 /// V-9 (目标落点不得退化) 与 V-10 (目标不得自指) 是其后新增的两条落点校验,
-/// 定义见 `contracts/manifest.md`.
+/// 定义见 `openspec/specs/manifest-schema/spec.md`.
 ///
 /// V-11 在全部条目解析后检查目标之间, 目标与源之间的路径隔离.
 /// 不校验源条目是否存在 (那是运行时状态 `SourceMissing`) 或条目数量上限.

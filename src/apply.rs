@@ -55,14 +55,15 @@ fn create_dir_all(dir: &Path) -> Result<()> {
         .map_err(|error| Error::EntryFailed(format!("创建父目录 {} 失败: {error}", dir.display())))
 }
 
-/// `Action::ReplaceAndBackup` 的严格顺序 (data-model.md 第 4 节).
+/// `Action::ReplaceAndBackup` 的严格顺序 (openspec/specs/link-deployment/spec.md 的
+/// "获许可的替换先完成备份再删除原对象").
 ///
 /// 1. 把 `target_path` 上的**现有对象**备份出去 (文件 / 目录递归 / 符号链接本身);
 /// 2. `write_backup` 返回即意味着备份已完整落定**并被改名为最终名**;
 /// 3. 只有到此时才允许删除原对象, 再建立新链接.
 ///
 /// 顺序不可颠倒: 原对象是唯一副本, 先删除再复制会让一次中途失败变成不可恢复的
-/// 数据丢失 (SC-004). 备份失败时**不删除原对象**, 条目报 `Err` 并保留原状.
+/// 数据丢失. 备份失败时**不删除原对象**, 条目报 `Err` 并保留原状.
 fn replace_and_backup(entry: &Entry) -> Result<Option<PathBuf>> {
     let target = entry.target_path.as_path();
 

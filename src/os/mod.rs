@@ -1,7 +1,8 @@
 //! 符号链接, 路径规范化与归属判定的平台层.
 //!
 //! 链接原语在 unix 下由 `unix.rs` 提供, 不覆盖落点的原子移动仅支持 macOS/Linux.
-//! 其他平台提供可编译的拒绝实现 (运行时由平台门禁拒绝, 见 `research.md` R6).
+//! 其他平台提供可编译的拒绝实现 (运行时由平台门禁拒绝, 见
+//! `openspec/specs/cli-contract/spec.md` 的"平台门禁先于一切其他步骤").
 
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
@@ -13,12 +14,13 @@ mod unix;
 #[cfg(unix)]
 pub use unix::{create_symlink, read_link};
 
-// 不提供 `is_symlink`: T007 曾要求它, 但 T044 审阅确认它**无任何消费者** -- 生产路径
+// 不提供 `is_symlink`: 早期设计曾要求它, 但审阅确认它**无任何消费者** -- 生产路径
 // (含 `classify`) 直接读一次 `symlink_metadata` 的 `file_type()`, 便于同一次 lstat 同时
 // 判定"存在"与"是链接"; 若再提供一个 `is_symlink`, 调用处就要 lstat 两次. `tests/` 用的
 // 是 std 的 `FileType::is_symlink`. 保留它只会是一个无消费者的公开接口, 与宪章第一条
-// "接口是成本"及第六条"禁止投机抽象"相悖 (`data-model.md` 2 节对 `source_kind` 的处置
-// 同理). 若将来出现确实需要的调用点, 在**那时**随该调用点一并引入.
+// "接口是成本"及第六条"禁止投机抽象"相悖 (清单同样只保留 `source` / `target` /
+// `on_conflict` 三个键, 见 `openspec/specs/manifest-schema/spec.md` 的 V-8).
+// 若将来出现确实需要的调用点, 在**那时**随该调用点一并引入.
 
 #[cfg(not(unix))]
 mod stub {
@@ -216,7 +218,8 @@ impl Resolver {
 /// `LinkedWrong` / `ForeignLink` 三者全部失真. 只解析祖先段已足以消除别名差异.
 ///
 /// 不存在的尾段只做词法处理; `..` 消去全部缺失段后恢复祖先解析. 未消去的缺失尾段
-/// 保留原样, 指向仓库内但已失效的**悬空链接**仍归类为"落在仓库内" (research.md R2).
+/// 保留原样, 指向仓库内但已失效的**悬空链接**仍归类为"落在仓库内"
+/// (openspec/specs/path-normalization/spec.md 的 R2).
 ///
 /// 不得改用 `Path::canonicalize` -- 它对悬空链接返回 `Err` (实测已确认), 会把
 /// 一个指向仓库内但已失效的链接误判为落在仓库外, 使 `undo` 拒绝清理自己的产物.
@@ -274,7 +277,7 @@ pub fn normalize(path: &Path) -> PathBuf {
 
 /// 判断链接的解析目标是否落在 `repo_root` 之内 (即该链接由本工具创建).
 ///
-/// 归属分界 (research.md R2) 的唯一口径: 仓库内 -> 本工具的错误链接; 之外 -> 别人的
+/// 归属分界 (openspec/specs/path-normalization/spec.md 的 R2) 的唯一口径: 仓库内 -> 本工具的错误链接; 之外 -> 别人的
 /// 链接. 落在 `repo_root` 自身上也算在内. 两侧都必须已经过 [`normalize`] -- 链接目标
 /// 由调用方从链接文本解析得出, 仓库根由调用方每运行只算一次; 本判定纯词法,
 /// 不再访问文件系统 (链接文本也由调用方读取后传入其解析结果, 不重复 `read_link`).

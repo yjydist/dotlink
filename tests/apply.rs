@@ -1,11 +1,12 @@
-//! US1 / FR-005 / FR-018 / SC-002 / SC-003: 部署 (tasks.md 的 T013 与 T039).
+//! US1 / FR-005 / FR-018: 部署 (openspec/specs/link-deployment/spec.md 的 FR-003 至
+//! FR-005, FR-014 与 FR-018).
 //!
-//! 覆盖 T013 的 (a)-(g) 与 T039 的三条收尾用例 (50 条目的性能断言, 单条目失败不阻塞
+//! 覆盖逐条目用例的 (a)-(g) 与三条收尾用例 (50 条目的性能断言, 单条目失败不阻塞
 //! 其余条目, 并发调用不产生指向错误位置的链接).
 //!
-//! 本文件经**真实二进制**断言, 因此依赖 `src/lib.rs` 的命令接入 (T015/T016). 在那些
-//! 接入完成之前, 这里的断言必然失败 -- 这是预期的 TDD 红阶段 (测试先于实现存在),
-//! 不得为了让本文件变绿而改动 `src/` 下的任何文件.
+//! 本文件经**真实二进制**断言, 因此依赖 `src/lib.rs` 的命令接入. 在那些接入完成之前,
+//! 这里的断言必然失败 -- 这是预期的 TDD 红阶段 (测试先于实现存在), 不得为了让本文件
+//! 变绿而改动 `src/` 下的任何文件.
 
 mod support;
 
@@ -25,7 +26,7 @@ fn assert_all_tokens(run: &Run, token: &str) {
     let lines = entry_lines(&run.stdout);
     assert!(
         !lines.is_empty(),
-        "输出中没有逐条目行 (命令接入由 T015 负责, 尚未完成):\n{}",
+        "输出中没有逐条目行 (命令接入尚未完成):\n{}",
         run.stdout
     );
     for line in lines {
@@ -67,7 +68,7 @@ fn has_backup_file(rows: &[(PathBuf, String)]) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// T013 (a): 3 个条目全不存在时退 0 且三行均为 create
+// 条目用例 (a): 3 个条目全不存在时退 0 且三行均为 create
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -106,7 +107,7 @@ fn three_absent_targets_are_all_created_and_apply_exits_zero() {
 }
 
 // ---------------------------------------------------------------------------
-// T013 (b): 每个目标都是指向仓库内文件的正确链接, 且能读到内容
+// 条目用例 (b): 每个目标都是指向仓库内文件的正确链接, 且能读到内容
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -143,7 +144,7 @@ fn every_created_target_is_a_link_into_the_repo_and_reads_back_the_source() {
 }
 
 // ---------------------------------------------------------------------------
-// T013 (c): 目标父目录不存在时被自动创建 (FR-005)
+// 条目用例 (c): 目标父目录不存在时被自动创建 (FR-005)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -195,7 +196,7 @@ fn a_duplicate_separator_after_tilde_still_lands_in_home() {
 }
 
 // ---------------------------------------------------------------------------
-// T013 (d): 目录条目建立的是整目录软链接 (FR-018)
+// 条目用例 (d): 目录条目建立的是整目录软链接 (FR-018)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -231,7 +232,7 @@ fn a_directory_entry_links_the_whole_directory() {
 }
 
 // ---------------------------------------------------------------------------
-// T013 (e): 幂等 (SC-002)
+// 条目用例 (e): 幂等 (FR-004)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -292,10 +293,7 @@ fn a_second_apply_is_idempotent_and_produces_no_new_files() {
     }
 
     let after = snapshot_all(&env);
-    assert_eq!(
-        before, after,
-        "SC-002: 第二次 apply 不得产生任何文件系统改动"
-    );
+    assert_eq!(before, after, "第二次 apply 不得产生任何文件系统改动");
     assert!(
         !has_backup_file(&after),
         "幂等运行不得产生备份文件: {after:?}"
@@ -328,7 +326,7 @@ fn a_missing_segment_before_an_alias_keeps_apply_idempotent() {
 }
 
 // ---------------------------------------------------------------------------
-// T013 (f): 增量 -- 新增条目后只有新条目为 create
+// 条目用例 (f): 增量 -- 新增条目后只有新条目为 create
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -426,7 +424,7 @@ fn apply_heals_a_link_left_behind_by_a_renamed_source_under_the_default_policy()
 }
 
 // ---------------------------------------------------------------------------
-// T013 (g): 多条目声明同一个源但目标不同, 两侧都成功
+// 条目用例 (g): 多条目声明同一个源但目标不同, 两侧都成功
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -450,7 +448,7 @@ fn two_entries_sharing_one_source_both_succeed() {
 }
 
 // ---------------------------------------------------------------------------
-// T039: SC-003 性能断言 (50 个条目, 墙钟 < 2 秒, 输出恰好 50 行)
+// 性能断言 (50 个条目, 墙钟 < 2 秒, 输出恰好 50 行)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -481,7 +479,7 @@ fn fifty_entries_preview_and_apply_finish_under_two_seconds_with_fifty_rows() {
 
     assert!(
         preview_elapsed < budget,
-        "SC-003: preview 在 {COUNT} 个条目上耗时 {preview_elapsed:?}, 超出 {budget:?}"
+        "preview 在 {COUNT} 个条目上耗时 {preview_elapsed:?}, 超出 {budget:?}"
     );
     assert_eq!(
         entry_lines(&preview.stdout).len(),
@@ -502,7 +500,7 @@ fn fifty_entries_preview_and_apply_finish_under_two_seconds_with_fifty_rows() {
 
     assert!(
         apply_elapsed < budget,
-        "SC-003: apply 在 {COUNT} 个条目上耗时 {apply_elapsed:?}, 超出 {budget:?}"
+        "apply 在 {COUNT} 个条目上耗时 {apply_elapsed:?}, 超出 {budget:?}"
     );
     assert_eq!(
         entry_lines(&apply.stdout).len(),
@@ -524,7 +522,7 @@ fn fifty_entries_preview_and_apply_finish_under_two_seconds_with_fifty_rows() {
 }
 
 // ---------------------------------------------------------------------------
-// T039: 单条目失败不阻塞其余条目 (FR-014)
+// 单条目失败不阻塞其余条目 (FR-014)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -561,7 +559,7 @@ fn a_missing_source_does_not_block_the_other_entries() {
 }
 
 // ---------------------------------------------------------------------------
-// T039: 执行期失败不阻塞其余条目 (FR-014)
+// 执行期失败不阻塞其余条目 (FR-014)
 //
 // 与上一条的区别: 这里的失败发生在 `create_symlink` (动作执行期), 而不是分类阶段的
 // `SourceMissing` / `Unreadable`. 它覆盖 `src/lib.rs` apply 循环里 `Err -> fail_row`
@@ -661,7 +659,7 @@ fn the_four_commands_do_not_create_a_state_or_index_file() {
 }
 
 // ---------------------------------------------------------------------------
-// T039: 并发调用不产生指向错误位置的链接 (research.md R8)
+// 并发调用不产生指向错误位置的链接 (README 的并发已知限制)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -711,8 +709,8 @@ fn concurrent_apply_never_creates_a_link_to_the_wrong_place() {
                 "并发下出现了非预期 token {token}: {line}"
             );
             if token == "fail" {
-                // 两个进程在同一路径上竞争时, 落败者可能遇到 `File exists`. R8 允许
-                // 这种竞争, 但它必须**如实报告** (`fail`), 并说明原因 -- 不得静默.
+                // 两个进程在同一路径上竞争时, 落败者可能遇到 `File exists`. README 的
+                // 并发已知限制允许这种竞争, 但它必须**如实报告** (`fail`), 并说明原因.
                 assert!(
                     line.contains("失败") || line.contains("File exists"),
                     "fail 行必须给出原因 (FR-016): {line}"
@@ -721,7 +719,7 @@ fn concurrent_apply_never_creates_a_link_to_the_wrong_place() {
         }
     }
 
-    // R8: 只断言"不静默产生错误结果" -- 最终每个目标都是指向正确源的链接, 因此
+    // 该已知限制只要求"不静默产生错误结果" -- 最终每个目标都是指向正确源的链接, 因此
     // 即便某一侧报了 `fail`, 落点也绝不是"指向错误位置的链接".
     // 不断言备份文件的唯一性 (并发下允许出现重复备份, 那是已记录的已知限制).
     for (source, target) in &entries {

@@ -3,7 +3,8 @@
 //! 本模块是全部模块的唯一串行接入点: 平台门禁 -> 参数解析 -> 清单载入 ->
 //! **一次** `classify` -> 按子命令分发 -> 渲染报告. 四个子命令消费**同一个**
 //! `classify` 返回值, 因此"同一状态下四条命令结论一致"由数据流保证 (FR-017),
-//! 而不是靠四处逻辑各自对齐 (`research.md` R7).
+//! 而不是靠四处逻辑各自对齐
+//! (openspec/specs/entry-classification/spec.md 的"四条命令消费同一份判定结果").
 //!
 //! 三处"唯一来源"在这里只被接线, 不被重写:
 //!
@@ -20,7 +21,7 @@
 //
 // 被门面重新导出的项 (`Command` / `EntryOutcome` / `exit_code_for`) 在各自模块内仍是
 // `pub`, 私有模块边界的收窄使 `Entry` / `EntryState` / `Action` / `Manifest` / `Current`
-// 等内部类型不再是外部契约的一部分 (`research.md` 的"深模块"门禁).
+// 等内部类型不再是外部契约的一部分 (深模块原则).
 mod apply;
 mod backup;
 mod classify;
@@ -46,8 +47,10 @@ use crate::render::ReportRow;
 
 /// 编排: 平台门禁 -> 解析参数 -> 载入清单 -> 分发命令 -> 渲染报告, 返回进程退出码.
 ///
-/// 顺序是契约的一部分 (FR-015 / FR-019, `research.md` R6): 平台检查早于参数解析与
-/// 清单读取, 使不受支持的平台上不产生任何标准输出, 也不触碰文件系统.
+/// 顺序是契约的一部分: 平台门禁见 FR-019 与
+/// `openspec/specs/cli-contract/spec.md` 的"平台门禁先于一切其他步骤", 清单读取见
+/// FR-015 与 `openspec/specs/manifest-schema/spec.md` 的"清单定位与仓库根". 平台检查
+/// 早于参数解析与清单读取, 使不受支持的平台上不产生任何标准输出, 也不触碰文件系统.
 pub fn run() -> i32 {
     run_on(platform_supported())
 }
@@ -140,7 +143,7 @@ fn platform_gate(supported: bool, stderr: &mut impl std::io::Write) -> Option<i3
     Some(error.exit_code())
 }
 
-/// FR-019 / `research.md` R6: 仅 macOS 与 Linux 受支持.
+/// FR-019 / `openspec/specs/cli-contract/spec.md`: 仅 macOS 与 Linux 受支持.
 ///
 /// 用 `cfg!` 而非 `#[cfg]`: 门禁是**运行时**拒绝, 使二进制在不受支持的平台上仍能
 /// 构建成功并给出可读提示, 而不是以编译错误收场.
@@ -151,7 +154,7 @@ fn platform_supported() -> bool {
 /// 由报告行导出退出码.
 ///
 /// 报告行是逐条结果的**唯一**载体, 因此"输出说成功而退出码说失败"在结构上不可能:
-/// 两个条件 (`contracts/cli.md` 的"退出码"小节) 都只看这一份 token 序列.
+/// 两个条件 (`openspec/specs/cli-contract/spec.md` 的"退出码的两条件判据") 都只看这一份 token 序列.
 fn exit_code_of(command: Command, rows: &[ReportRow]) -> i32 {
     let outcomes: Vec<EntryOutcome> = rows.iter().map(|row| row.token).collect();
     exit_code_for(command, &outcomes)
@@ -159,7 +162,8 @@ fn exit_code_of(command: Command, rows: &[ReportRow]) -> i32 {
 
 /// `preview`: 渲染 `Current` 与 `Action`, 不执行任何动作.
 ///
-/// 本路径不产生任何文件系统写操作 (含创建父目录, SC-006): `render` 只读判定结果,
+/// 本路径不产生任何文件系统写操作 (含创建父目录, 见
+/// `openspec/specs/link-deployment/spec.md` 的 FR-006): `render` 只读判定结果,
 /// 这里额外的 `backup_path_for` 也只做占用检测.
 fn preview(manifest: &Manifest, states: &[EntryState]) -> Vec<ReportRow> {
     manifest
@@ -214,7 +218,7 @@ fn apply(manifest: &Manifest, states: &[EntryState]) -> Vec<ReportRow> {
 /// `status`: 只渲染 `Current`.
 ///
 /// `action` 原样传入, 但 `render` 的 `status` 分支不消费它 (token 与措辞都只由
-/// `Current` 导出, `data-model.md` 3.3), 因此这里没有"报告动作"的余地.
+/// `Current` 导出, 见 `openspec/specs/entry-classification/spec.md`), 因此这里没有"报告动作"的余地.
 fn status(manifest: &Manifest, states: &[EntryState]) -> Vec<ReportRow> {
     manifest
         .entries
@@ -239,7 +243,8 @@ struct UndoItem<'a> {
     entry: &'a Entry,
     state: &'a EntryState,
     /// 同目录最新备份. token 是 `restore` 还是 `undo` 由它决定, 与 `Current` 是
-    /// `LinkedCorrect` 还是 `LinkedWrong` 无关 (`contracts/cli.md` 的 `undo` 分支表).
+    /// `LinkedCorrect` 还是 `LinkedWrong` 无关
+    /// (`openspec/specs/link-teardown/spec.md` 的"撤销的 token 由状态与备份有无共同决定").
     backup: Option<PathBuf>,
     /// 备份快照或移除/恢复失败的原因 (FR-014: 不中断其余条目).
     failure: Option<String>,
@@ -247,7 +252,8 @@ struct UndoItem<'a> {
 
 /// `undo`: 消费同一个 `classify` 返回值, 走撤销分支.
 ///
-/// **目标谓词在动手之前求值** (`contracts/cli.md` 的"`undo` 的谓词在动手之前求值"):
+/// **目标谓词在动手之前求值** (`openspec/specs/cli-contract/spec.md` 的
+/// "只读与写入命令的求值时刻"):
 /// 谓词问的是"本次要撤销的清单上是否还有本工具创建的链接". 撤销之后链接已不存在,
 /// 若在动手后求值将恒为 0, 于是"刚部署好则退 1"与"撤销后该谓词为真"无法同时成立.
 /// 因此这里先由判定结果取一份快照 (逐条 token + 备份), 再执行移除; 快照同时就是报告

@@ -1,8 +1,9 @@
 //! 命令行接口: 四个子命令, 无参数, 仅 `-h/--help` 与 `-V/--version`.
 //!
-//! 帮助文本必须自带退出码语义 (`research.md` R10): `clap` 只生成命令与参数, 若不在
-//! `about` / `long_about` 里写明 "只读命令在有待办时也退 1" 与 "退出码 2 的两重含义",
-//! 用户就无法仅凭命令行输出决定下一步 (SC-009). `about` 供 `-h`, `long_about` 供
+//! 帮助文本必须自带退出码语义 (见 `openspec/specs/cli-contract/spec.md` 的"`--help`
+//! 文本自带退出码语义"): `clap` 只生成命令与参数, 若不在 `about` / `long_about` 里
+//! 写明 "只读命令在有待办时也退 1" 与 "退出码 2 的两重含义",
+//! 用户就无法仅凭命令行输出决定下一步. `about` 供 `-h`, `long_about` 供
 //! `--help`, 二者都写, 因为两处短帮助是最容易先被看到的地方.
 
 use clap::{Parser, Subcommand};

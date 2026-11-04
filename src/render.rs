@@ -1,7 +1,7 @@
 //! 人类可读输出 (FR-016).
 //!
-//! 本模块是状态 token 与末尾汇总分列的**唯一**来源. `contracts/cli.md` 要求
-//! "实现时不得在 `render.rs` 里另起一套 token 命名"; 其反面同样成立 -- token 与
+//! 本模块是状态 token 与末尾汇总分列的**唯一**来源. `openspec/specs/cli-contract/spec.md`
+//! 要求 token 词汇固定且文本稳定; 其反面同样成立 -- token 与
 //! 分列口径只在这里确定, 各命令接入时不得自行拼凑.
 //!
 //! 导出面各有分工, 调用者只要不绕过它们, 结论就必然一致:
@@ -20,13 +20,14 @@ use crate::cli::Command;
 use crate::entry::Entry;
 use crate::error::EntryOutcome;
 
-/// token 列宽, 对齐 `contracts/cli.md` 的示例.
+/// token 列宽, 与 README 的输出示例一致.
 ///
-/// 示例中 `create` 与 `conflict` 之后到 target 之间的空格数不同 (3 与 1), 但
-/// token 加其后空白的宽度恒为 9.
+/// token 加其后空白的宽度恒为 9: `create` 之后接 3 个空格, 八个字符的 token
+/// (如 `conflict`) 之后只接 1 个空格.
 const TOKEN_WIDTH: usize = 9;
-/// target 列宽 (含其后的分隔空格), 对齐示例: `~/.bashrc` 之后到说明之间有 11 个
-/// 空格 (`9 + 11 = 20`), `~/.config/nvim` 之后有 6 个 (`14 + 6 = 20`).
+/// target 列宽 (含其后的分隔空格), 与 README 的输出示例一致: `~/.bashrc` 之后到
+/// 说明之间有 11 个空格 (`9 + 11 = 20`), `~/.config/nvim` 之后有 6 个
+/// (`14 + 6 = 20`).
 const TARGET_WIDTH: usize = 20;
 
 /// 报告中的一行.
@@ -42,7 +43,9 @@ pub struct ReportRow {
 
 /// 由 `(命令, Current, Action, 同目录是否有备份)` 唯一决定 token.
 ///
-/// 唯一权威为 `contracts/cli.md` 的"状态 token 表"与"`undo` 分支". `has_backup`
+/// 唯一权威为 `openspec/specs/cli-contract/spec.md` 的"token 词汇固定为十二个"与
+/// `openspec/specs/link-teardown/spec.md` 的"撤销的 token 由状态与备份有无共同决定".
+/// `has_backup`
 /// 只为 `undo` 而存在: `undo` / `restore` 的 token 不由 `Action` 导出, 而由
 /// `(Current, 同目录是否有备份)` 决定, 因为 `Action` 枚举不含移除类取值.
 ///
@@ -195,7 +198,8 @@ pub fn tally(outcomes: &[EntryOutcome]) -> (usize, usize, usize, usize) {
 ///
 /// 第三列的列名必须是**"未处理"**而非"跳过": 它是 token 的分桶名, 同时收容
 /// "有意不处理"的 `conflict` / `skip` 与"没有动作可执行"的 `foreign` / `absent` /
-/// `wrong`, 后三个出现在只读的 `status` 上 (`contracts/cli.md` 的"输出契约").
+/// `wrong`, 后三个出现在只读的 `status` 上
+/// (`openspec/specs/cli-contract/spec.md` 的"汇总分列为四列且是 token 的划分").
 pub fn summary_line(outcomes: &[EntryOutcome]) -> String {
     let counts = tally(outcomes);
     format!(
@@ -216,7 +220,7 @@ enum Column {
     Failed,
 }
 
-/// token 归入哪一列, 严格按 `contracts/cli.md` 的"汇总列 / token"对照表.
+/// token 归入哪一列, 严格按 `openspec/specs/cli-contract/spec.md` 的"汇总分列为四列且是 token 的划分".
 ///
 /// 该表是一个**划分**: 12 个 token 各有唯一归属, 因此不存在同一条目计入两列的可能.
 fn column_of(token: EntryOutcome) -> Column {
@@ -238,11 +242,11 @@ fn column_of(token: EntryOutcome) -> Column {
 /// `preview` 与 `apply` 的 token: 由 `(Current, Action)` 决定, 二者共用同一张表.
 ///
 /// 两个命令在同一 token 下的措辞必须可辨 (将来时 / 完成时), 由
-/// [`note_for_token`] 按命令分支实现 (T020); token 本身完全一致 (FR-017).
+/// [`note_for_token`] 按命令分支实现; token 本身完全一致 (FR-017).
 fn deploy_token(current: Current, action: Action) -> EntryOutcome {
     match current {
         // 环境故障先于一切: 判定阶段的 `lstat` 失败使该条目无法被归类为一个确定的
-        // 文件系统事实 (`data-model.md` 3.1 的"求值语义"), 因此四条命令下都是 `fail`.
+        // 文件系统事实 (`openspec/specs/entry-classification/spec.md` 的"求值顺序: 环境故障先于确定事实"), 因此四条命令下都是 `fail`.
         Current::Unreadable => EntryOutcome::Fail,
         Current::SourceMissing => EntryOutcome::Missing,
         Current::Absent if action == Action::Create => EntryOutcome::Create,
@@ -261,7 +265,8 @@ fn deploy_token(current: Current, action: Action) -> EntryOutcome {
     }
 }
 
-/// `status` 的 token: **只渲染 `Current`, 不渲染 `Action`** (`data-model.md` 3.3).
+/// `status` 的 token: **只渲染 `Current`, 不渲染 `Action`**
+/// (`openspec/specs/entry-classification/spec.md`).
 ///
 /// `foreign` 与 `wrong` 的分工由 `Current` 的取值直接给出 -- `LinkedWrong` 蕴含
 /// "链接落在仓库内", `ForeignLink` 蕴含"落在仓库外", 二者互斥且穷尽.
@@ -469,7 +474,7 @@ mod tests {
     ];
     const BACKUPS: [bool; 2] = [false, true];
 
-    /// 每个 token 的稳定文本, 逐字抄自 `contracts/cli.md` 的"状态 token 表".
+    /// 每个 token 的稳定文本, 逐字抄自 `openspec/specs/cli-contract/spec.md` 的"token 词汇固定为十二个".
     const TOKEN_NAMES: [(EntryOutcome, &str); 12] = [
         (EntryOutcome::Create, "create"),
         (EntryOutcome::Ok, "ok"),
@@ -514,7 +519,7 @@ mod tests {
         }
     }
 
-    /// 契约期望的 token, 独立于 `render.rs` 的实现而手工抄自 `contracts/cli.md`.
+    /// 契约期望的 token, 独立于 `render.rs` 的实现而手工抄自 `openspec/specs/cli-contract/spec.md`.
     /// `None` 表示该组合不在 contract 表内 (实现仍须给出确定取值且不 panic).
     fn contract_token(
         command: Command,
@@ -1115,7 +1120,8 @@ mod tests {
         }
     }
 
-    /// `contracts/cli.md` 的四行示例必须被逐字复现: 这是"行格式"一节唯一的可断言落点.
+    /// 期望的四行输出必须被逐字复现: 这是 `openspec/specs/cli-contract/spec.md` 的
+    /// "报告行格式"要求唯一的可断言落点.
     #[test]
     fn contract_example_block_is_reproduced_verbatim() {
         let bashrc = entry("bashrc", "~/.bashrc");

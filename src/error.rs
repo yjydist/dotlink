@@ -87,7 +87,7 @@ pub fn exit_code_for(command: Command, outcomes: &[EntryOutcome]) -> i32 {
 ///   若执行**失败**, token 是 `Fail` 而非 `Create` / `Replace`, 由条件 2 拦下.
 ///
 /// 这份非对称是契约要求的行为, 不是实现疏漏: 未部署的清单上 `preview` 退 1 而
-/// `apply` 退 0 (`contracts/cli.md` 的"只读命令与写入命令的对偶").
+/// `apply` 退 0 (`openspec/specs/cli-contract/spec.md` 的"只读与写入命令的求值时刻").
 fn goal_reached(command: Command, outcomes: &[EntryOutcome]) -> bool {
     match command {
         Command::Preview => !outcomes.iter().any(|outcome| {

@@ -269,7 +269,7 @@ cargo check --locked --target x86_64-unknown-linux-gnu
 cargo check --locked --target x86_64-pc-windows-gnu
 ```
 
-设计文档 (规格, 契约, 数据模型, 验证场景) 在 `specs/001-dotfile-link-management/`. 交叉编译检查不能代替目标平台的运行时验证; Windows 拒绝行为仍需在 Windows 环境确认 (见"平台").
+设计文档 (规格, 契约, 数据模型, 验证场景) 在 `openspec/specs/`, 按能力分为 8 个目录: `manifest-schema`, `path-normalization`, `entry-classification`, `link-deployment`, `link-teardown`, `backup-lifecycle`, `backup-fidelity` 与 `cli-contract`; 每份 `spec.md` 含 requirement 与 Scenario. 交叉编译检查不能代替目标平台的运行时验证; Windows 拒绝行为仍需在 Windows 环境确认 (见"平台").
 
 ## 已知限制
 
@@ -278,4 +278,4 @@ cargo check --locked --target x86_64-pc-windows-gnu
 - **`undo` 只恢复最新备份**: 同目录下按"先比时间戳, 同一秒内再比消歧序号的数值"取最新的一份; 更早的备份保留但不被自动使用.
 - **元数据保真为尽力而为**: 不保留所有权与 ACL; 无法设置的扩展属性按属性跳过; 平台不支持扩展属性或 mtime 设置时静默降级, 不产生额外警告. 旧版本创建的备份按自身元数据恢复, 其 mtime 是备份时刻.
 
-更多可执行验证场景见 [端到端验证指南](specs/001-dotfile-link-management/quickstart.md).
+更多可执行验证场景见 [cli-contract 规格](openspec/specs/cli-contract/spec.md) 的 Scenario 与本文档的示例; 端到端验证流程已拆入各 capability 的规格.
