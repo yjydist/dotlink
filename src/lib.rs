@@ -10,6 +10,11 @@
 //! - token 与说明措辞: `render` 层 (`row_from_state` / `fail_row`);
 //! - 逐条结果侧的退出码 (0 / 1): `exit_code_for`, 输入即报告行本身;
 //! - 派发**之前**的结局 (2 / 3): `Error::exit_code`.
+//!
+//! 标准输出也只有一个写入点 `write_report`: 报告一次 `write_all` 并显式 `flush`.
+//! 写失败不改变退出码 -- `BrokenPipe` 视为消费方主动结束而静默, 其他写错误尽力向
+//! 标准错误留一行诊断 (诊断写不出去时同样静默). 标准错误上的说明 (清单错误, 平台
+//! 门禁) 一律忽略写失败. 因此管道提前关闭不会 panic, 也不会出现 101.
 
 // 模块全部私有: 唯一的对外表面是下面的 `pub fn run` 与三条 `pub use`.
 //
@@ -30,6 +35,7 @@ mod undo;
 pub use cli::Command;
 pub use error::{EntryOutcome, exit_code_for};
 
+use std::io::Write;
 use std::path::PathBuf;
 
 use crate::classify::{Action, Current, EntryState};
@@ -50,6 +56,10 @@ pub fn run() -> i32 {
 /// "先于参数解析"可被单元测试锁定 (本机是受支持平台, 端到端测试走不到该分支). 测试
 /// 进程自身的命令行不是 dotlink 的子命令, 因此若门禁晚于 `cli::parse`, 这里会以 2
 /// 结束进程而不是返回 3.
+///
+/// 报告唯一从 `write_report` 写出: 退出码在写出**之前**算出, 写出后原样返回. 因此
+/// 标准输出被提前关闭 (`BrokenPipe`) 时静默结束, 其他写错误只尽力写一行标准错误,
+/// 两种情形都不改变退出码.
 fn run_on(supported: bool) -> i32 {
     // 1. 平台门禁. 唯一来源是 `Error::exit_code` (退 3).
     if let Some(code) = platform_gate(supported, &mut std::io::stderr()) {
@@ -66,7 +76,8 @@ fn run_on(supported: bool) -> i32 {
     let manifest = match manifest::load() {
         Ok(manifest) => manifest,
         Err(error) => {
-            eprintln!("dotlink: {error}");
+            // 与 `platform_gate` 同构: 标准错误不可写时只放弃说明, 清单错误仍是 2.
+            let _ = writeln!(std::io::stderr().lock(), "dotlink: {error}");
             return error.exit_code();
         }
     };
@@ -82,9 +93,36 @@ fn run_on(supported: bool) -> i32 {
         Command::Undo => undo(&manifest, &states),
     };
 
-    // 6. 渲染与退出码. 逐条结果侧的 0 / 1 全部由 `exit_code_for` 给出.
-    print!("{}", render::render(&rows));
-    exit_code_of(command, &rows)
+    // 6. 渲染与退出码. 逐条结果侧的 0 / 1 全部由 `exit_code_for` 给出. 先算退出码
+    //    再写出: 报告写不出去 (含管道提前关闭) 不参与结局, 返回值与写出是否成功无关.
+    let code = exit_code_of(command, &rows);
+    write_report(&rows, &mut std::io::stdout(), &mut std::io::stderr());
+    code
+}
+
+/// 报告写入标准输出的**唯一**点.
+///
+/// 把 `render::render` 的结果一次 `write_all` 写出, 再显式 `flush`, 两者合并为一个
+/// `io::Result`; 错误分类只在这里发生:
+///
+/// - `BrokenPipe`: 消费方主动结束 (例如 `| head`), 静默返回, 不写标准错误;
+/// - 其他错误: 尽力向标准错误写一行诊断, 诊断本身写不出去时忽略.
+///
+/// 两种情形都不改变退出码: 退出码由调用方在写出之前算出 (`run_on`).
+fn write_report(
+    rows: &[ReportRow],
+    stdout: &mut impl std::io::Write,
+    stderr: &mut impl std::io::Write,
+) {
+    let report = render::render(rows);
+    let written = stdout
+        .write_all(report.as_bytes())
+        .and_then(|()| stdout.flush());
+    if let Err(error) = written
+        && error.kind() != std::io::ErrorKind::BrokenPipe
+    {
+        let _ = writeln!(stderr, "dotlink: 写出报告失败: {error}");
+    }
 }
 
 /// 平台门禁的唯一实现: `Some(退出码)` 表示进程应在此结束, `None` 表示继续.
@@ -312,5 +350,111 @@ mod tests {
         let mut untouched = Vec::new();
         assert_eq!(platform_gate(true, &mut untouched), None);
         assert!(untouched.is_empty(), "受支持时门禁不得写标准错误");
+    }
+
+    /// 报告是唯一受断言的内容: 一条 `create` 行加末尾汇总.
+    fn sample_rows() -> Vec<ReportRow> {
+        vec![ReportRow {
+            target_display: "~/.bashrc".to_string(),
+            token: EntryOutcome::Create,
+            note: "将创建链接".to_string(),
+        }]
+    }
+
+    /// 成功路径: 标准输出得到与 `render` 完全一致的完整报告, 标准错误为空.
+    #[test]
+    fn write_report_writes_the_complete_report_to_stdout() {
+        let rows = sample_rows();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_report(&rows, &mut stdout, &mut stderr);
+
+        let text = String::from_utf8(stdout).expect("报告必须是 UTF-8");
+        assert_eq!(text, render::render(&rows), "写出的必须是完整报告");
+        assert!(
+            text.starts_with("1/1 create"),
+            "报告首行必须携带 token: {text:?}"
+        );
+        assert!(text.ends_with('\n'), "报告末尾必须有换行: {text:?}");
+        assert!(stderr.is_empty(), "成功写出时不得写标准错误: {stderr:?}");
+    }
+
+    /// 写或刷新返回 `BrokenPipe` 的 writer.
+    struct BrokenPipeWriter {
+        /// `true` 表示写成功而 `flush` 失败; `false` 表示写与刷新都在写阶段失败.
+        fail_flush: bool,
+    }
+
+    impl std::io::Write for BrokenPipeWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            if self.fail_flush {
+                Ok(buffer.len())
+            } else {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.fail_flush {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// 写返回 `BrokenPipe` 之外错误的 writer.
+    struct OtherErrorWriter;
+
+    impl std::io::Write for OtherErrorWriter {
+        fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("模拟写失败"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `BrokenPipe` (写或刷新) 视为消费方主动结束: 标准错误一个字节都不写.
+    #[test]
+    fn write_report_stays_silent_on_broken_pipe() {
+        let rows = sample_rows();
+        for fail_flush in [false, true] {
+            let mut stdout = BrokenPipeWriter { fail_flush };
+            let mut stderr = Vec::new();
+
+            write_report(&rows, &mut stdout, &mut stderr);
+
+            assert!(
+                stderr.is_empty(),
+                "BrokenPipe (flush 失败 = {fail_flush}) 不得写标准错误: {stderr:?}"
+            );
+        }
+    }
+
+    /// 其他写错误: 标准错误恰好一行诊断, 且带底层原因.
+    #[test]
+    fn write_report_diagnoses_other_write_errors_on_stderr() {
+        let rows = sample_rows();
+        let mut stdout = OtherErrorWriter;
+        let mut stderr = Vec::new();
+
+        write_report(&rows, &mut stdout, &mut stderr);
+
+        let text = String::from_utf8(stderr).expect("诊断必须是 UTF-8");
+        assert_eq!(text.lines().count(), 1, "诊断必须恰好一行: {text:?}");
+        assert_eq!(text, "dotlink: 写出报告失败: 模拟写失败\n");
+    }
+
+    /// 标准错误也不可写时只放弃诊断: 不 panic (能正常返回即通过).
+    #[test]
+    fn write_report_ignores_a_failing_stderr() {
+        let rows = sample_rows();
+        let mut stdout = OtherErrorWriter;
+        let mut stderr = BrokenPipeWriter { fail_flush: false };
+
+        write_report(&rows, &mut stdout, &mut stderr);
     }
 }

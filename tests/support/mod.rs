@@ -69,7 +69,12 @@ impl TempEnv {
 
     /// 构造 `dotlink` 命令: `cwd` = 仓库根, `HOME` = 临时主目录.
     pub fn cmd(&self) -> Command {
-        let mut command = Command::cargo_bin("dotlink").expect("找到 dotlink 二进制");
+        Command::from_std(self.raw_cmd())
+    }
+
+    /// 未包装的 `std` 命令, 供需要自行接管管道 (例如关闭读端) 的用例使用.
+    pub fn raw_cmd(&self) -> std::process::Command {
+        let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("dotlink"));
         command.current_dir(self.repo());
         command.env("HOME", self.home());
         command.env_remove("XDG_CONFIG_HOME");
