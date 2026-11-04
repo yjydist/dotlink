@@ -678,6 +678,40 @@ fn v9_the_repo_root_and_its_ancestors_are_rejected() {
 }
 
 #[test]
+fn v9_the_manifest_file_itself_is_rejected() {
+    let env = env_with_source();
+    // 清单文件自身是唯一配置源: 一旦被 `replace_and_backup` 替换, 后续命令全部退 2.
+    let absolute = env.repo().join("dotlink.toml");
+    for written in [
+        "dotlink.toml".to_string(),
+        "./dotlink.toml".to_string(),
+        absolute.display().to_string(),
+    ] {
+        env.write_manifest(&format!(
+            "[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"{written}\"\n"
+        ));
+        let before = snapshot_all(&env);
+
+        for command in COMMANDS {
+            let run = run(&env, &[command]);
+            assert_eq!(
+                run.code, 2,
+                "`{command}` 必须拒绝以清单文件自身为落点; 实际 {};\nstdout:\n{}\nstderr:\n{}",
+                run.code, run.stdout, run.stderr
+            );
+            assert_eq!(run.stdout, "", "校验失败不得产生标准输出 (`{command}`)");
+            assert!(
+                run.stderr.contains("清单文件自身") && run.stderr.contains("entry[0]"),
+                "V-9 必须指出清单文件自身与条目下标 (`{command}`): {}",
+                run.stderr
+            );
+        }
+
+        assert_eq!(before, snapshot_all(&env), "零改动 ({written})");
+    }
+}
+
+#[test]
 fn v9_legal_target_shapes_are_not_harmed() {
     let env = env_with_source();
     env.write_source("git/gitconfig", "managed\n");

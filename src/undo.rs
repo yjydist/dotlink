@@ -2,16 +2,16 @@
 //!
 //! 破坏面被 `Current` 的取值直接限制住: 只有 `LinkedCorrect` 与 `LinkedWrong` 才意味着
 //! "这是本工具的链接", 其余取值 (尤其 `ForeignLink` / `ForeignFile` / `ForeignDir`)
-//! 一律不触碰. 因此本模块**不需要**再次做归属判定 (`os::is_inside_repo`, 其入参需先过
-//! `os::normalize`) -- 归属判定已经被吸收进 `Current`, 重复判定既冗余, 又可能因两处
-//! 规范化语义不同而引入分歧.
+//! 一律不触碰. 判定与动手之间仍可能被外部替换, 因此动手时先原子暂存, 再按与
+//! `classify` 相同的 `os::link_destination` 口径复核暂存对象: 不是符号链接或目标
+//! 落在仓库外时移回原路径并失败, 不删除用户内容.
 //!
 //! 有备份时恢复走"先把链接原子移到暂存名 -> 复制备份就位 -> 失败则把链接移回":
-//! 复制失败且原路径仍为空时回滚链接, 因此下一次 `undo` 仍可重试; 路径被重新占用时
-//! 保留占用物和暂存链接, 并报告暂存位置.
+//! 复制或 rename 失败且原路径仍为空时回滚链接, 因此下一次 `undo` 仍可重试; 路径被
+//! 重新占用时保留占用物和暂存链接, 并报告暂存位置. rename 之后的父目录同步失败表示
+//! 内容已就位, 此时不回滚, 只清理旧链接副本并在说明中指出内容已恢复.
 
 use std::fs;
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use crate::backup;
@@ -20,23 +20,34 @@ use crate::entry::Entry;
 use crate::error::{Error, Result};
 use crate::os;
 
+/// 撤销路径的暂存标签; 与替换路径的 `dotlink-replace.partial` 区分, 便于诊断残留.
+const UNDO_STAGING_LABEL: &str = "dotlink-undo.partial";
+
 /// 撤销单个条目.
 ///
 /// `backup` 是调用方在**动手之前**取得的同目录最新备份 (lib.rs 的 `undo` 计划), 报告
 /// 行的 token 与说明由同一份快照导出; 把它作为恢复的唯一输入, "说明里写的备份"与
 /// "实际恢复的备份"就必然是同一个, 本模块也不再持有第二份查找逻辑.
 ///
+/// `repo_root` 是**已规范化**的仓库根, 由调用方在循环外计算一次; 复核暂存链接的
+/// 归属时与 `classify` 使用同一基准.
+///
 /// `Ok(())` 表示该条目已按判定处理完毕 (可能什么都没做). `Err` 表示本工具自己的
 /// 链接/备份处理失败 (FR-014: 由调用者决定不中断其余条目).
-pub fn undo_entry(entry: &Entry, state: &EntryState, backup: Option<&Path>) -> Result<()> {
+pub fn undo_entry(
+    entry: &Entry,
+    state: &EntryState,
+    backup: Option<&Path>,
+    repo_root: &Path,
+) -> Result<()> {
     let target = entry.target_path.as_path();
 
     match state.current {
-        // 本工具创建的链接 (二者都蕴含链接文本落在仓库根之内): 动手前先复核身份,
-        // 再按快照有无备份决定"移除链接"还是"恢复备份".
+        // 本工具创建的链接 (二者都蕴含链接文本落在仓库根之内): 动手时先原子暂存并
+        // 复核身份与归属, 再按快照有无备份决定"移除链接"还是"恢复备份".
         Current::LinkedCorrect | Current::LinkedWrong => match backup {
-            Some(backup) => replace_link_with_backup(target, backup),
-            None => remove_link(target),
+            Some(backup) => replace_link_with_backup(target, backup, entry, repo_root),
+            None => remove_link(target, entry, repo_root),
         },
         // 非本工具创建的内容: 绝不删除
         // (`openspec/specs/link-teardown/spec.md` 的"只移除本工具创建的链接").
@@ -48,70 +59,91 @@ pub fn undo_entry(entry: &Entry, state: &EntryState, backup: Option<&Path>) -> R
     }
 }
 
-/// 复核目标路径仍是符号链接.
-///
-/// 判定与撤销之间目标可能被替换: `remove_file` 与 `rename` 对普通文件与目录同样有效,
-/// 不复核身份就会把用户数据当成"本工具的链接"删除或覆盖. 因此动手前以
-/// `symlink_metadata` 复核, 已不是符号链接的一律拒绝 (与 apply 在实况变化时失败对偶).
-fn ensure_still_a_link(target: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(target).map_err(|error| {
-        Error::EntryFailed(format!("移除链接 {} 失败: {error}", target.display()))
-    })?;
-    if !metadata.file_type().is_symlink() {
-        return Err(Error::EntryFailed(format!(
-            "拒绝移除 {}: 目标已不是本工具创建的符号链接 (判定之后被替换), 未做任何改动",
-            target.display()
-        )));
-    }
-    Ok(())
-}
-
-/// 移除目标路径上的符号链接 (先复核身份).
-fn remove_link(target: &Path) -> Result<()> {
-    ensure_still_a_link(target)?;
-    fs::remove_file(target)
-        .map_err(|error| Error::EntryFailed(format!("移除链接 {} 失败: {error}", target.display())))
+/// 移除目标路径上的符号链接: 先原子暂存并复核身份与归属, 再删除暂存链接.
+fn remove_link(target: &Path, entry: &Entry, repo_root: &Path) -> Result<()> {
+    let staged = stage_verified_link(target, entry, repo_root)?;
+    fs::remove_file(&staged).map_err(|error| {
+        Error::EntryFailed(format!(
+            "移除链接 {} 失败: {error}; 链接已暂存于 {}",
+            target.display(),
+            staged.display()
+        ))
+    })
 }
 
 /// 移除链接并把快照指定的备份恢复到原路径.
 ///
-/// 暂存, 恢复落位及失败回滚都拒绝覆盖落点. 回滚冲突时链接留在暂存名, 错误中给出
+/// 暂存, 复核, 恢复落位及失败回滚都拒绝覆盖落点. 回滚冲突时链接留在暂存名, 错误中给出
 /// 位置, 避免为了恢复原状而覆盖期间新建的用户内容.
-fn replace_link_with_backup(target: &Path, backup: &Path) -> Result<()> {
-    ensure_still_a_link(target)?;
-    let aside = stage_link(target)?;
+fn replace_link_with_backup(
+    target: &Path,
+    backup: &Path,
+    entry: &Entry,
+    repo_root: &Path,
+) -> Result<()> {
+    let staged = stage_verified_link(target, entry, repo_root)?;
 
     match backup::restore_backup(target, backup) {
         Ok(()) => {
             // 恢复已就位; 旧链接副本的清理失败只是残留, 不外抛.
-            let _ = fs::remove_file(&aside);
+            let _ = fs::remove_file(&staged);
             Ok(())
         }
-        Err(error) => Err(rollback_link(target, &aside, error)),
+        // 内容尚未落位: 原路径仍为空, 可以把链接移回以便重试.
+        Err(backup::RestoreError::NotLanded(error)) => Err(rollback_link(target, &staged, error)),
+        // 内容已就位: 回滚只会因目标被占用而失败, 清理旧链接副本即可.
+        Err(backup::RestoreError::LandedButUnsynced(error)) => match fs::remove_file(&staged) {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(Error::EntryFailed(format!(
+                "{error}; 清理旧链接副本 {} 失败: {cleanup}",
+                staged.display()
+            ))),
+        },
     }
 }
 
-fn stage_link(target: &Path) -> Result<PathBuf> {
-    let base = aside_path(target);
-    for serial in 1_u64.. {
-        let mut name = base.as_os_str().to_os_string();
-        if serial > 1 {
-            name.push(format!(".{serial}"));
-        }
-        let aside = PathBuf::from(name);
-        match os::rename_noreplace(target, &aside) {
-            Ok(()) => return Ok(aside),
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(Error::EntryFailed(format!(
-                    "暂存链接 {} 到 {} 失败: {error}",
-                    target.display(),
-                    aside.display()
-                )));
-            }
-        }
+/// 原子暂存目标, 再复核暂存对象仍是本工具创建的符号链接.
+///
+/// 判定与动手之间目标可能被替换: `rename` 与 `remove_file` 对普通文件与目录同样
+/// 有效, 只有暂存之后重新读取对象, 才能确保被删除的确实是判定时的那个链接. 复核
+/// 失败时把暂存对象移回原路径并保留, 错误中说明"判定之后被替换".
+fn stage_verified_link(target: &Path, entry: &Entry, repo_root: &Path) -> Result<PathBuf> {
+    let staged = os::stage_aside(target, UNDO_STAGING_LABEL)
+        .map_err(|error| Error::EntryFailed(error.to_string()))?;
+    match verify_staged_link(&staged, target, entry, repo_root) {
+        Ok(()) => Ok(staged),
+        Err(error) => Err(rollback_link(target, &staged, error)),
     }
-    unreachable!("序号消歧必然终止")
+}
+
+/// 暂存之后的身份与归属复核.
+///
+/// 1. 暂存对象必须仍是符号链接 (`remove_file` 对真实文件同样有效);
+/// 2. 重新读取链接文本, 用与 `classify` 相同的 [`os::link_destination`] 解析;
+///    目标必须等于本条目的 `source_path` 或落在仓库根内, 否则视为外部链接.
+fn verify_staged_link(staged: &Path, target: &Path, entry: &Entry, repo_root: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(staged).map_err(|error| {
+        Error::EntryFailed(format!("复核暂存链接 {} 失败: {error}", staged.display()))
+    })?;
+    if !metadata.file_type().is_symlink() {
+        return Err(Error::EntryFailed(format!(
+            "拒绝移除 {}: 目标已不是本工具创建的符号链接 (判定之后被替换)",
+            target.display()
+        )));
+    }
+
+    let link_text = os::read_link(staged).map_err(|error| {
+        Error::EntryFailed(format!("读取暂存链接 {} 失败: {error}", staged.display()))
+    })?;
+    let destination = os::link_destination(staged, &link_text);
+    if destination != entry.source_path && !os::is_inside_repo(&destination, repo_root) {
+        return Err(Error::EntryFailed(format!(
+            "拒绝移除 {}: 暂存链接的目标 {} 落在仓库外 (判定之后被替换)",
+            target.display(),
+            destination.display()
+        )));
+    }
+    Ok(())
 }
 
 fn rollback_link(target: &Path, aside: &Path, error: Error) -> Error {
@@ -122,13 +154,6 @@ fn rollback_link(target: &Path, aside: &Path, error: Error) -> Error {
             aside.display()
         )),
     }
-}
-
-/// 同目录暂存候选的基础名; PID 不保证未被占用, 由 `stage_link` 原子尝试并消歧.
-fn aside_path(target: &Path) -> PathBuf {
-    let mut name = target.as_os_str().to_os_string();
-    name.push(format!(".{}.dotlink-undo.partial", std::process::id()));
-    PathBuf::from(name)
 }
 
 #[cfg(all(test, unix))]
@@ -142,6 +167,11 @@ mod tests {
     use crate::classify::Action;
     use crate::entry::OnConflict;
     use crate::os;
+
+    /// 测试侧的暂存候选名; 与生产路径共用 `os::staging_path`, 避免两套命名规则.
+    fn aside_path(target: &Path) -> PathBuf {
+        os::staging_path(target, UNDO_STAGING_LABEL)
+    }
 
     fn entry_for(repo: &Path, source: &str, target: &Path) -> Entry {
         crate::entry::resolve(
@@ -159,6 +189,16 @@ mod tests {
             action: Action::Noop,
             detail: String::new(),
         }
+    }
+
+    /// 测试用 `undo_entry`: 仓库根取临时目录的规范形态.
+    fn undo_entry_in(
+        dir: &Path,
+        entry: &Entry,
+        state: &EntryState,
+        backup: Option<&Path>,
+    ) -> Result<()> {
+        undo_entry(entry, state, backup, &os::normalize(dir))
     }
 
     /// 布置一个"已部署"的条目: 源在仓库中, 目标是指向源的链接.
@@ -187,7 +227,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (target, entry) = deployed(dir.path(), "bashrc", "managed");
 
-        undo_entry(&entry, &state(Current::LinkedCorrect), None).unwrap();
+        undo_entry_in(dir.path(), &entry, &state(Current::LinkedCorrect), None).unwrap();
 
         assert!(fs::symlink_metadata(&target).is_err(), "链接必须已被移除");
     }
@@ -197,7 +237,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (target, entry) = deployed(dir.path(), "bashrc", "managed");
 
-        undo_entry(&entry, &state(Current::LinkedWrong), None).unwrap();
+        undo_entry_in(dir.path(), &entry, &state(Current::LinkedWrong), None).unwrap();
 
         assert!(fs::symlink_metadata(&target).is_err());
     }
@@ -217,7 +257,7 @@ mod tests {
         let link_entry = entry_for(repo, "bashrc", &link_target);
 
         for current in [Current::ForeignLink, Current::Absent] {
-            undo_entry(&link_entry, &state(current), None).unwrap();
+            undo_entry_in(dir.path(), &link_entry, &state(current), None).unwrap();
             assert!(
                 fs::symlink_metadata(&link_target).is_ok(),
                 "{current:?} 下不得删除任何东西"
@@ -239,8 +279,8 @@ mod tests {
             Current::SourceMissing,
             Current::Unreadable,
         ] {
-            undo_entry(&file_entry, &state(current), None).unwrap();
-            undo_entry(&dir_entry, &state(current), None).unwrap();
+            undo_entry_in(dir.path(), &file_entry, &state(current), None).unwrap();
+            undo_entry_in(dir.path(), &dir_entry, &state(current), None).unwrap();
         }
 
         assert_eq!(fs::read_to_string(&file_target).unwrap(), "keep me");
@@ -262,12 +302,71 @@ mod tests {
         let backup_path = parent.join("bashrc.dotlink-backup.20260101T000000");
         fs::write(&backup_path, "original").unwrap();
 
-        undo_entry(&entry, &state(Current::LinkedWrong), Some(&backup_path)).unwrap();
+        undo_entry_in(
+            dir.path(),
+            &entry,
+            &state(Current::LinkedWrong),
+            Some(&backup_path),
+        )
+        .unwrap();
 
         assert_eq!(fs::read_to_string(&target).unwrap(), "original");
         assert!(
             fs::symlink_metadata(&backup_path).is_ok(),
             "备份文件本身必须保留"
+        );
+    }
+
+    /// rename 成功后的父目录同步失败: 内容已恢复, 不得回滚链接, 失败说明指出已恢复.
+    #[test]
+    fn a_failed_restore_parent_sync_keeps_the_restored_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let (target, entry) = deployed(dir.path(), "bashrc", "managed");
+
+        let backup_path = target.with_file_name("bashrc.dotlink-backup.20260101T000000");
+        fs::write(&backup_path, "original").unwrap();
+
+        // 只让目录同步失败: 备份内容的文件同步会先通过, 失败点落在恢复 rename 后的
+        // 父目录同步上.
+        let guard = os::fail_directory_syncs();
+        let error = undo_entry_in(
+            dir.path(),
+            &entry,
+            &state(Current::LinkedWrong),
+            Some(&backup_path),
+        )
+        .unwrap_err();
+        drop(guard);
+
+        let message = error.to_string();
+        assert!(message.contains("同步父目录"), "{message}");
+        assert!(message.contains("备份内容已恢复到"), "{message}");
+        assert!(
+            !message.contains("回滚链接失败"),
+            "内容已恢复时不得尝试回滚: {message}"
+        );
+
+        // 目标是恢复出的真实文件, 不是链接; 备份保留, 旧链接副本已清理.
+        assert!(
+            !fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "original");
+        assert!(
+            fs::symlink_metadata(&backup_path).is_ok(),
+            "备份文件本身必须保留"
+        );
+        assert!(
+            fs::read_dir(target.parent().unwrap())
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".dotlink-undo.partial")),
+            "内容已恢复后旧链接副本必须被清理"
         );
     }
 
@@ -295,7 +394,13 @@ mod tests {
             .map(|path| fs::symlink_metadata(path).unwrap().ino())
             .collect();
 
-        undo_entry(&entry, &state(Current::LinkedCorrect), Some(&backup)).unwrap();
+        undo_entry_in(
+            dir.path(),
+            &entry,
+            &state(Current::LinkedCorrect),
+            Some(&backup),
+        )
+        .unwrap();
 
         for (path, inode) in occupied.iter().zip(inodes) {
             assert_eq!(fs::symlink_metadata(path).unwrap().ino(), inode);
@@ -399,13 +504,25 @@ mod tests {
         let backup = target.with_file_name("bashrc.dotlink-backup.20260101T000000");
         let link_text = fs::read_link(&target).unwrap();
 
-        let error = undo_entry(&entry, &state(Current::LinkedCorrect), Some(&backup)).unwrap_err();
+        let error = undo_entry_in(
+            dir.path(),
+            &entry,
+            &state(Current::LinkedCorrect),
+            Some(&backup),
+        )
+        .unwrap_err();
 
         assert!(error.to_string().contains(&backup.display().to_string()));
         assert_eq!(fs::read_link(&target).unwrap(), link_text);
         assert!(fs::symlink_metadata(aside_path(&target)).is_err());
         fs::write(&backup, "original").unwrap();
-        undo_entry(&entry, &state(Current::LinkedCorrect), Some(&backup)).unwrap();
+        undo_entry_in(
+            dir.path(),
+            &entry,
+            &state(Current::LinkedCorrect),
+            Some(&backup),
+        )
+        .unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "original");
         assert_eq!(fs::read_to_string(&backup).unwrap(), "original");
         assert!(fs::symlink_metadata(aside_path(&target)).is_err());
@@ -422,7 +539,13 @@ mod tests {
         let backup_path = parent.join("bashrc.dotlink-backup.20260101T000000");
         os::create_symlink(&elsewhere, &backup_path).unwrap();
 
-        undo_entry(&entry, &state(Current::LinkedCorrect), Some(&backup_path)).unwrap();
+        undo_entry_in(
+            dir.path(),
+            &entry,
+            &state(Current::LinkedCorrect),
+            Some(&backup_path),
+        )
+        .unwrap();
 
         assert!(
             fs::symlink_metadata(&target)
@@ -443,7 +566,13 @@ mod tests {
         fs::create_dir_all(backup_path.join("lua")).unwrap();
         fs::write(backup_path.join("lua/a.lua"), "old-a").unwrap();
 
-        undo_entry(&entry, &state(Current::LinkedCorrect), Some(&backup_path)).unwrap();
+        undo_entry_in(
+            dir.path(),
+            &entry,
+            &state(Current::LinkedCorrect),
+            Some(&backup_path),
+        )
+        .unwrap();
 
         assert!(fs::symlink_metadata(&target).unwrap().is_dir());
         assert_eq!(
@@ -473,7 +602,7 @@ mod tests {
             ".partial 不得被认作可用备份"
         );
 
-        undo_entry(&entry, &state(Current::LinkedCorrect), None).unwrap();
+        undo_entry_in(dir.path(), &entry, &state(Current::LinkedCorrect), None).unwrap();
 
         assert!(fs::symlink_metadata(&target).is_err(), "链接仍须被移除");
         assert!(fs::symlink_metadata(dir.path().join("bashrc")).is_err());
@@ -497,7 +626,8 @@ mod tests {
             return;
         }
 
-        let error = undo_entry(&entry, &state(Current::LinkedCorrect), None).unwrap_err();
+        let error =
+            undo_entry_in(dir.path(), &entry, &state(Current::LinkedCorrect), None).unwrap_err();
         assert!(matches!(error, Error::EntryFailed(_)));
         assert!(
             fs::symlink_metadata(&target).is_ok(),
@@ -530,7 +660,13 @@ mod tests {
         let backup = repo.join("bashrc.dotlink-backup.20260101T000000");
         fs::write(&backup, "original").unwrap();
 
-        let error = undo_entry(&entry, &state(Current::LinkedCorrect), Some(&backup)).unwrap_err();
+        let error = undo_entry_in(
+            dir.path(),
+            &entry,
+            &state(Current::LinkedCorrect),
+            Some(&backup),
+        )
+        .unwrap_err();
 
         assert!(matches!(error, Error::EntryFailed(_)));
         assert!(
@@ -553,6 +689,56 @@ mod tests {
         );
     }
 
+    /// 判定与撤销之间目标可能被替换成指向仓库外的链接: 它不再是本工具的链接,
+    /// 必须移回原路径并保留, 不删除, 备份也不得被消费.
+    #[test]
+    fn a_link_that_replaced_the_original_and_points_outside_is_refused_and_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let (target, entry) = deployed(dir.path(), "bashrc", "managed");
+
+        // 同目录确有一份备份: "复核失败时不消费备份"必须有真实备份才可验证.
+        let backup = target.with_file_name("bashrc.dotlink-backup.20260101T000000");
+        fs::write(&backup, "original").unwrap();
+
+        // 判定之后, 撤销之前: 用户把链接换成了指向仓库外的链接.
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside = outside_dir.path().join("foreign");
+        fs::write(&outside, "foreign").unwrap();
+        fs::remove_file(&target).unwrap();
+        os::create_symlink(&outside, &target).unwrap();
+
+        let error = undo_entry_in(
+            dir.path(),
+            &entry,
+            &state(Current::LinkedCorrect),
+            Some(&backup),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::EntryFailed(_)));
+        assert!(
+            error.to_string().contains("仓库外"),
+            "说明应指出暂存链接的目标落在仓库外: {error}"
+        );
+        assert!(
+            fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "仓库外链接必须被移回原路径"
+        );
+        assert_eq!(fs::read_link(&target).unwrap(), outside);
+        assert!(
+            fs::symlink_metadata(&outside).is_ok(),
+            "链接指向的内容不得被删除"
+        );
+        assert_eq!(
+            fs::read_to_string(&backup).unwrap(),
+            "original",
+            "复核失败时备份不得被消费或删除"
+        );
+    }
+
     /// 恢复出的是普通文件, 不是链接: 真实的第二次 `undo` 会由 `classify` 判为
     /// `ForeignFile` 并报 `skip` (见 `openspec/specs/link-teardown/spec.md` 的
     /// "撤销幂等且退出码随备份情形而异"). 这里直接以
@@ -567,10 +753,16 @@ mod tests {
             .join("bashrc.dotlink-backup.20260101T000000");
         fs::write(&backup_path, "original").unwrap();
 
-        undo_entry(&entry, &state(Current::LinkedCorrect), Some(&backup_path)).unwrap();
+        undo_entry_in(
+            dir.path(),
+            &entry,
+            &state(Current::LinkedCorrect),
+            Some(&backup_path),
+        )
+        .unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "original");
 
-        undo_entry(&entry, &state(Current::Absent), None).unwrap();
+        undo_entry_in(dir.path(), &entry, &state(Current::Absent), None).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "original");
         assert!(fs::symlink_metadata(&backup_path).is_ok());
     }
@@ -598,8 +790,13 @@ mod tests {
             return;
         }
 
-        let error =
-            undo_entry(&entry, &state(Current::LinkedCorrect), Some(&backup_path)).unwrap_err();
+        let error = undo_entry_in(
+            dir.path(),
+            &entry,
+            &state(Current::LinkedCorrect),
+            Some(&backup_path),
+        )
+        .unwrap_err();
         assert!(matches!(error, Error::EntryFailed(_)));
         assert!(
             fs::symlink_metadata(&target)
@@ -611,7 +808,13 @@ mod tests {
 
         // 恢复权限后重试: 链接仍在, 因此能走通恢复.
         fs::set_permissions(&backup_path, fs::Permissions::from_mode(0o644)).unwrap();
-        undo_entry(&entry, &state(Current::LinkedCorrect), Some(&backup_path)).unwrap();
+        undo_entry_in(
+            dir.path(),
+            &entry,
+            &state(Current::LinkedCorrect),
+            Some(&backup_path),
+        )
+        .unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "original");
         assert!(fs::symlink_metadata(&backup_path).is_ok());
     }

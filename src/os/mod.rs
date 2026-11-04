@@ -67,6 +67,164 @@ pub(crate) fn rename_noreplace(_source: &Path, _destination: &Path) -> std::io::
     ))
 }
 
+/// 同目录暂存候选名: `<source>.<pid>.<label>`.
+///
+/// `label` 区分暂存用途 (替换 / 撤销); 序号消歧由 [`stage_aside`] 在末尾追加.
+pub(crate) fn staging_path(source: &Path, label: &str) -> PathBuf {
+    let mut name = source.as_os_str().to_os_string();
+    name.push(format!(".{}.{label}", std::process::id()));
+    PathBuf::from(name)
+}
+
+/// 以原子不覆盖的 rename 把 `source` 移到同目录暂存名, 名称占用时在末尾追加
+/// `.序号` 重试, 返回实际取得的暂存路径.
+///
+/// 只负责暂存, 不判断对象身份: 复核由调用方 (替换 / 撤销) 各自完成. 失败说明包含
+/// 目标与尝试过的暂存路径, 调用方可以直接转成条目级错误.
+pub(crate) fn stage_aside(source: &Path, label: &str) -> std::io::Result<PathBuf> {
+    let base = staging_path(source, label);
+    for serial in 1_u64.. {
+        let staged = if serial == 1 {
+            base.clone()
+        } else {
+            let mut name = base.as_os_str().to_os_string();
+            name.push(format!(".{serial}"));
+            PathBuf::from(name)
+        };
+        match rename_noreplace(source, &staged) {
+            Ok(()) => return Ok(staged),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "暂存 {} 到 {} 失败: {error}",
+                        source.display(),
+                        staged.display()
+                    ),
+                ));
+            }
+        }
+    }
+    unreachable!("序号消歧必然终止")
+}
+
+/// 把普通文件的数据与元数据同步到稳定存储.
+///
+/// macOS 与 Linux 支持; 其他平台返回 `Unsupported`, 由调用方按既有元数据降级策略
+/// 处理 (设计 D4).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn sync_file(file: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(test)]
+    injected_sync_failure(SyncScope::File)?;
+    file.sync_all()
+}
+
+/// 把目录项同步到稳定存储: 让 rename 产生的新名字在崩溃后仍然可见.
+///
+/// macOS 与 Linux 支持; 其他平台返回 `Unsupported`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn sync_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    injected_sync_failure(SyncScope::Directory)?;
+    std::fs::File::open(path)?.sync_all()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub(crate) fn sync_file(_file: &std::fs::File) -> std::io::Result<()> {
+    unsupported_sync()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub(crate) fn sync_dir(_path: &Path) -> std::io::Result<()> {
+    unsupported_sync()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn unsupported_sync() -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "当前平台不支持把备份同步到稳定存储",
+    ))
+}
+
+// 测试接缝: 让当前线程的同步原语返回模拟的 `EIO`.
+//
+// 真实的同步失败无法在可移植的测试里稳定构造; 线程局部状态避免并行测试互相影响.
+// 按 `scope` 区分文件与目录, 才能单独覆盖"rename 之后的父目录同步失败".
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SyncFailure {
+    None,
+    All,
+    Directory,
+}
+
+/// 同步原语的类别; 与 [`SyncFailure`] 分开, 避免把"注入模式"与"被注入的作用域"
+/// 混成一枚举, 导致某个模式没有构造点.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SyncScope {
+    File,
+    Directory,
+}
+
+#[cfg(test)]
+thread_local! {
+    static SYNC_FAILURE: std::cell::Cell<SyncFailure> =
+        const { std::cell::Cell::new(SyncFailure::None) };
+}
+
+/// 在当前线程启用"全部同步失败"注入, 直到返回的守卫被丢弃.
+#[cfg(test)]
+pub(crate) fn fail_syncs() -> SyncFailureGuard {
+    SyncFailureGuard::set(SyncFailure::All)
+}
+
+/// 只让目录同步失败.
+///
+/// 普通文件备份的目录同步只发生在 rename 之后的父目录上, 因此这条注入可以单独
+/// 覆盖"备份已发布但父目录同步失败"的路径.
+#[cfg(test)]
+pub(crate) fn fail_directory_syncs() -> SyncFailureGuard {
+    SyncFailureGuard::set(SyncFailure::Directory)
+}
+
+#[cfg(test)]
+pub(crate) struct SyncFailureGuard {
+    previous: SyncFailure,
+}
+
+#[cfg(test)]
+impl SyncFailureGuard {
+    fn set(mode: SyncFailure) -> Self {
+        let previous = SYNC_FAILURE.with(|slot| slot.replace(mode));
+        Self { previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for SyncFailureGuard {
+    fn drop(&mut self) {
+        SYNC_FAILURE.with(|slot| slot.set(self.previous));
+    }
+}
+
+/// 测试注入点: `scope` 命中当前注入时返回模拟的同步失败 (非 `Unsupported`, 不会被降级吞掉).
+#[cfg(test)]
+fn injected_sync_failure(scope: SyncScope) -> std::io::Result<()> {
+    let active = SYNC_FAILURE.with(|slot| slot.get());
+    let fails = match active {
+        SyncFailure::None => false,
+        SyncFailure::All => true,
+        SyncFailure::Directory => scope == SyncScope::Directory,
+    };
+    if fails {
+        return Err(std::io::Error::other("模拟同步失败"));
+    }
+    Ok(())
+}
+
 /// 符号链接解析的深度上限.
 ///
 /// 链接链 (含环) 超过该层数即停止解析, 退化为词法处理: 归属判定本就只要求"两侧同
@@ -273,6 +431,23 @@ pub fn normalize(path: &Path) -> PathBuf {
     } else {
         PathBuf::from(out)
     }
+}
+
+/// 目标路径上的符号链接文本解析为绝对路径后的非严格规范化结果 (`L`).
+///
+/// 相对链接以链接所在目录为基准; 链接文本与基准都不必存在, 因此不得用
+/// `Path::canonicalize` (openspec/specs/path-normalization/spec.md 的 R2 悬空链接陷阱).
+/// `classify` 与 `undo` 共用这一解析口径, 避免两处各自实现产生分歧.
+pub(crate) fn link_destination(link_path: &Path, link_text: &Path) -> PathBuf {
+    let absolute = if link_text.is_absolute() {
+        link_text.to_path_buf()
+    } else {
+        match link_path.parent() {
+            Some(parent) => parent.join(link_text),
+            None => link_text.to_path_buf(),
+        }
+    };
+    normalize(&absolute)
 }
 
 /// 判断链接的解析目标是否落在 `repo_root` 之内 (即该链接由本工具创建).
@@ -519,5 +694,28 @@ mod tests {
             Path::new("/repo")
         ));
         assert!(!is_inside_repo(Path::new("/etc/rc"), Path::new("/repo")));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn sync_file_flushes_an_open_file() {
+        let dir = tempfile::tempdir().expect("创建临时目录");
+        let path = dir.path().join("payload");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("创建临时文件");
+        std::io::Write::write_all(&mut file, b"payload").expect("写入临时文件");
+
+        sync_file(&file).expect("普通文件必须可以同步");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn sync_dir_flushes_a_directory() {
+        let dir = tempfile::tempdir().expect("创建临时目录");
+
+        sync_dir(dir.path()).expect("目录必须可以同步");
     }
 }

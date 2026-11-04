@@ -3,6 +3,7 @@
 //! 本模块只做文件系统改动, 不做任何判定 -- 逐条目的结论由 `classify` 唯一给出
 //! (FR-017), 这里只执行 `EntryState::action`.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::backup;
@@ -10,6 +11,9 @@ use crate::classify::{Action, EntryState};
 use crate::entry::Entry;
 use crate::error::{Error, Result};
 use crate::os;
+
+/// 替换路径的暂存标签; 与撤销路径的 `dotlink-undo.partial` 区分, 便于诊断残留.
+const REPLACE_STAGING_LABEL: &str = "dotlink-replace.partial";
 
 /// 执行单个条目的动作. 返回备份文件的完整路径 (若发生了备份).
 ///
@@ -56,47 +60,208 @@ fn create_dir_all(dir: &Path) -> Result<()> {
 }
 
 /// `Action::ReplaceAndBackup` 的严格顺序 (openspec/specs/link-deployment/spec.md 的
-/// "获许可的替换先完成备份再删除原对象").
+/// "获许可的替换先完成备份再删除原对象" 与 "替换删除前必须原子复核身份").
 ///
-/// 1. 把 `target_path` 上的**现有对象**备份出去 (文件 / 目录递归 / 符号链接本身);
-/// 2. `write_backup` 返回即意味着备份已完整落定**并被改名为最终名**;
-/// 3. 只有到此时才允许删除原对象, 再建立新链接.
+/// 1. 用 `symlink_metadata` 记录目标的对象身份 (设备号, inode 与对象类型);
+/// 2. 把 `target_path` 上的**现有对象**备份出去 (文件 / 目录递归 / 符号链接本身);
+/// 3. `write_backup` 返回即意味着备份已完整落定**并被改名为最终名**;
+/// 4. 以原子不覆盖的 rename 把目标移入同目录暂存名, 复核暂存对象仍是第 1 步记录的
+///    那一个, 只有复核通过才删除暂存对象并建立新链接.
 ///
 /// 顺序不可颠倒: 原对象是唯一副本, 先删除再复制会让一次中途失败变成不可恢复的
-/// 数据丢失. 备份失败时**不删除原对象**, 条目报 `Err` 并保留原状.
+/// 数据丢失. 暂存与复核把"判定"和"删除"之间的竞态收窄为一次 rename: 外部替换物
+/// 会因身份不一致被移回原路径, 不会被当作旧对象删除. 备份失败时**不删除原对象**,
+/// 条目报 `Err` 并保留原状.
 fn replace_and_backup(entry: &Entry) -> Result<Option<PathBuf>> {
     let target = entry.target_path.as_path();
 
-    // 备份落定之后才允许删除原对象, 因此这两步的失败都发生在"原内容已被备份"之后:
+    let identity = ObjectIdentity::snapshot(target)
+        .map_err(|error| Error::EntryFailed(format!("读取 {} 失败: {error}", target.display())))?;
+
+    // 备份落定之后才允许删除原对象, 因此这之后的失败都发生在"原内容已被备份"之后:
     // 错误里带上备份路径, 用户才知道去哪儿找回它 (FR-016).
     let backup_path = backup::write_backup(target)?;
-    remove_object(target)
-        .and_then(|()| create_link(entry))
-        .map_err(|error| {
-            Error::EntryFailed(format!(
-                "{error} (原内容已备份到 {})",
-                backup_path.display()
-            ))
-        })?;
+    #[cfg(test)]
+    run_after_backup_hook();
+    replace_with_backup(entry, identity).map_err(|error| {
+        Error::EntryFailed(format!(
+            "{error} (原内容已备份到 {})",
+            backup_path.display()
+        ))
+    })?;
 
     Ok(Some(backup_path))
 }
 
-/// 删除原对象: 目录用 `remove_dir_all`, 文件与符号链接用 `remove_file`.
-///
-/// 判定同样使用 lstat 语义 (`symlink_metadata`), 因此指向目录的符号链接走
-/// `remove_file` 分支, 只移除链接本身而不动其目标的内容.
-fn remove_object(target: &Path) -> Result<()> {
-    let metadata = std::fs::symlink_metadata(target)
-        .map_err(|error| Error::EntryFailed(format!("读取 {} 失败: {error}", target.display())))?;
+/// 备份完成后的替换: 暂存并复核身份, 复核通过才删除暂存对象, 最后建立链接.
+fn replace_with_backup(entry: &Entry, identity: ObjectIdentity) -> Result<()> {
+    let target = entry.target_path.as_path();
+    let staged = stage_and_verify(target, identity)?;
+    remove_staged(target, &staged)?;
+    create_link(entry)
+}
 
+/// 对象身份快照: 设备号, inode 与对象类型 (设计 D2).
+///
+/// 只比较这三项: 足以区分"刚备份的对象"与外部替换物, 又不依赖 mtime 等易变字段.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ObjectIdentity {
+    dev: u64,
+    ino: u64,
+    kind: ObjectKind,
+}
+
+/// 对象类型的分类: 符号链接独立于其目标, 其余特殊类型统一为 `Other`.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ObjectKind {
+    File,
+    Dir,
+    Symlink,
+    Other,
+}
+
+#[cfg(unix)]
+impl ObjectIdentity {
+    fn snapshot(path: &Path) -> std::io::Result<Self> {
+        let metadata = fs::symlink_metadata(path)?;
+        Ok(Self::from_metadata(&metadata))
+    }
+
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+
+        let file_type = metadata.file_type();
+        let kind = if file_type.is_symlink() {
+            ObjectKind::Symlink
+        } else if file_type.is_dir() {
+            ObjectKind::Dir
+        } else if file_type.is_file() {
+            ObjectKind::File
+        } else {
+            ObjectKind::Other
+        };
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            kind,
+        }
+    }
+}
+
+/// 不受支持平台的占位实现: 平台门禁会在运行到替换之前拒绝, 这里只需可编译.
+#[cfg(not(unix))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ObjectIdentity;
+
+#[cfg(not(unix))]
+impl ObjectIdentity {
+    fn snapshot(_path: &Path) -> std::io::Result<Self> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "当前平台不支持对象身份复核",
+        ))
+    }
+}
+
+/// 原子暂存目标并复核它仍是备份前快照记录的对象 (设计 D2).
+///
+/// 复核失败时把暂存对象移回原路径 (原路径为空时), **不删除**它; 无法移回时在
+/// 说明里给出暂存路径. 调用者只应在复核通过后删除返回的暂存对象.
+fn stage_and_verify(target: &Path, expected: ObjectIdentity) -> Result<PathBuf> {
+    let staged = os::stage_aside(target, REPLACE_STAGING_LABEL)
+        .map_err(|error| Error::EntryFailed(error.to_string()))?;
+    let actual = ObjectIdentity::snapshot(&staged).map_err(|error| {
+        staged_failure(
+            target,
+            &staged,
+            format!("复核暂存对象 {} 失败: {error}", staged.display()),
+        )
+    })?;
+    if actual != expected {
+        return Err(staged_failure(
+            target,
+            &staged,
+            format!(
+                "拒绝删除 {}: 备份之后目标被外部替换 (暂存对象的身份与备份时不一致)",
+                target.display()
+            ),
+        ));
+    }
+    Ok(staged)
+}
+
+/// 复核失败时的收尾: 尝试把暂存对象移回原路径, 不移回就报告暂存位置.
+fn staged_failure(target: &Path, staged: &Path, reason: String) -> Error {
+    match os::rename_noreplace(staged, target) {
+        Ok(()) => Error::EntryFailed(format!("{reason}; 已把暂存对象移回原路径, 未删除")),
+        Err(error) => Error::EntryFailed(format!(
+            "{reason}; 且移回原路径 {} 失败: {error}; 对象暂存于 {}",
+            target.display(),
+            staged.display()
+        )),
+    }
+}
+
+/// 删除身份已复核的暂存对象: 目录递归, 文件与符号链接单个删除.
+///
+/// 删除失败时该对象已被备份. 非目录对象可以原子移回原路径 (原路径为空时), 避免把
+/// "已备份但未替换"的对象遗留在暂存名上; 目录可能已被部分删除, **不回滚**, 只报告
+/// 备份路径与暂存路径 (设计 D2, 风险取舍).
+fn remove_staged(target: &Path, staged: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(staged).map_err(|error| {
+        Error::EntryFailed(format!("读取暂存对象 {} 失败: {error}", staged.display()))
+    })?;
     let removal = if metadata.is_dir() {
-        std::fs::remove_dir_all(target)
+        fs::remove_dir_all(staged)
     } else {
-        std::fs::remove_file(target)
+        fs::remove_file(staged)
     };
 
-    removal.map_err(|error| Error::EntryFailed(format!("删除 {} 失败: {error}", target.display())))
+    match removal {
+        Ok(()) => Ok(()),
+        Err(error) if metadata.is_dir() => Err(Error::EntryFailed(format!(
+            "删除暂存目录 {} 失败: {error}; 该目录可能已被部分删除, 未移回原路径",
+            staged.display()
+        ))),
+        Err(error) => match os::rename_noreplace(staged, target) {
+            Ok(()) => Err(Error::EntryFailed(format!(
+                "删除暂存对象 {} 失败: {error}; 已把对象移回原路径",
+                staged.display()
+            ))),
+            Err(rollback) => Err(Error::EntryFailed(format!(
+                "删除暂存对象 {} 失败: {error}; 且移回原路径 {} 失败: {rollback}; 对象暂存于 {}",
+                staged.display(),
+                target.display(),
+                staged.display()
+            ))),
+        },
+    }
+}
+
+// 测试接缝: 备份完成之后, 暂存之前运行一次注入的动作.
+//
+// 真实的"备份后被外部替换"竞态无法通过公开接口构造; 单元测试用它在两步之间改写
+// 目标, 以覆盖身份复核的失败路径 (设计 D5).
+#[cfg(test)]
+thread_local! {
+    static AFTER_BACKUP: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn after_backup_hook(hook: impl FnOnce() + 'static) {
+    AFTER_BACKUP.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_after_backup_hook() {
+    AFTER_BACKUP.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
 }
 
 #[cfg(all(test, unix))]
@@ -273,6 +438,130 @@ mod tests {
     }
 
     #[test]
+    fn a_replacement_after_backup_is_moved_back_and_the_failure_names_the_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        fs::write(repo.join("bashrc"), "managed").unwrap();
+        fs::create_dir_all(repo.join("home")).unwrap();
+
+        let target = repo.join("home/bashrc");
+        fs::write(&target, "original").unwrap();
+        let entry = entry_for(repo, "bashrc", &target);
+
+        // 备份完成后, 暂存前: 外部把目标换成了另一个文件.
+        let replaced = target.clone();
+        after_backup_hook(move || {
+            fs::remove_file(&replaced).unwrap();
+            fs::write(&replaced, "replacement").unwrap();
+        });
+
+        let error = apply_entry(&entry, &state(Action::ReplaceAndBackup)).unwrap_err();
+        let message = error.to_string();
+
+        // 新对象被移回原路径并保留, 没有被当作旧对象删除, 也没有建立链接.
+        assert!(
+            !fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "replacement");
+        assert!(message.contains("被外部替换"), "{message}");
+        assert!(message.contains("原内容已备份到"), "{message}");
+
+        // 备份是替换前那一刻的原内容, 且说明里给出的路径真实存在.
+        let backups: Vec<PathBuf> = fs::read_dir(repo.join("home"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.to_string_lossy().contains(".dotlink-backup."))
+            .collect();
+        assert_eq!(backups.len(), 1, "替换失败也必须留下备份: {backups:?}");
+        assert_eq!(fs::read_to_string(&backups[0]).unwrap(), "original");
+        assert!(
+            message.contains(&backups[0].display().to_string()),
+            "说明必须给出备份路径: {message}"
+        );
+        // 身份不一致时对象已移回原路径, 不留暂存副本.
+        assert!(
+            fs::read_dir(repo.join("home"))
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".dotlink-replace.partial")),
+            "身份不一致时不得遗留暂存副本"
+        );
+    }
+
+    #[test]
+    fn stage_and_verify_accepts_the_object_the_snapshot_saw() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("bashrc");
+        fs::write(&target, "original").unwrap();
+
+        let identity = ObjectIdentity::snapshot(&target).unwrap();
+        let staged = stage_and_verify(&target, identity).unwrap();
+
+        assert!(
+            fs::symlink_metadata(&target).is_err(),
+            "复核通过后目标已被暂存"
+        );
+        assert_eq!(fs::read_to_string(&staged).unwrap(), "original");
+        fs::remove_file(&staged).unwrap();
+    }
+
+    #[test]
+    fn stage_and_verify_moves_a_replaced_file_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("bashrc");
+        fs::write(&target, "original").unwrap();
+        let identity = ObjectIdentity::snapshot(&target).unwrap();
+
+        // 快照之后, 暂存之前: 外部把目标换成了另一个文件.
+        fs::remove_file(&target).unwrap();
+        fs::write(&target, "replacement").unwrap();
+
+        let error = stage_and_verify(&target, identity).unwrap_err();
+
+        assert!(error.to_string().contains("被外部替换"), "{error}");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "replacement");
+        assert!(
+            fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".dotlink-replace.partial")),
+            "身份不一致的对象必须移回原路径, 不留暂存副本"
+        );
+    }
+
+    #[test]
+    fn stage_and_verify_moves_a_replaced_directory_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("bashrc");
+        fs::write(&target, "original").unwrap();
+        let identity = ObjectIdentity::snapshot(&target).unwrap();
+
+        // 目标被替换成目录: 类型不同, 同样必须移回并保留.
+        fs::remove_file(&target).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("nested"), "replacement").unwrap();
+
+        let error = stage_and_verify(&target, identity).unwrap_err();
+
+        assert!(error.to_string().contains("被外部替换"), "{error}");
+        assert!(fs::symlink_metadata(&target).unwrap().is_dir());
+        assert_eq!(
+            fs::read_to_string(target.join("nested")).unwrap(),
+            "replacement"
+        );
+    }
+
+    #[test]
     fn replace_and_backup_keeps_the_original_when_the_backup_fails() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
@@ -364,14 +653,38 @@ mod tests {
             backup_path.display()
         );
 
-        // 备份保真复制了只读子目录的权限位: 两处都要恢复, 否则 TempDir 无法清空
-        // 0o555 目录, 会在 TMPDIR 留下残留 (只恢复原对象一处仍会留下备份副本).
+        // 删除失败时原对象已原子移入暂存名, 说明必须给出暂存路径, 且不得静默丢失它.
+        let staged_marker = "删除暂存目录 ";
+        let staged_start = message
+            .find(staged_marker)
+            .unwrap_or_else(|| panic!("错误必须给出暂存路径: {message}"))
+            + staged_marker.len();
+        let staged_end = staged_start
+            + message[staged_start..]
+                .find(" 失败")
+                .unwrap_or_else(|| panic!("暂存路径应以 ` 失败` 收尾: {message}"));
+        let staged = PathBuf::from(&message[staged_start..staged_end]);
+        assert!(
+            fs::symlink_metadata(&staged).is_ok(),
+            "删除失败时对象应留在暂存名上: {}",
+            staged.display()
+        );
+        assert!(
+            fs::symlink_metadata(&target).is_err(),
+            "目标已原子移入暂存名, 不得留下半删除的原路径"
+        );
+
+        // 备份保真复制了只读子目录的权限位: 暂存树与备份两处都要恢复, 否则 TempDir
+        // 无法清空 0o555 目录, 会在 TMPDIR 留下残留.
         fs::set_permissions(
             backup_path.join("locked"),
             fs::Permissions::from_mode(0o755),
         )
         .unwrap();
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
-        assert_eq!(fs::read_to_string(locked.join("secret")).unwrap(), "secret");
+        fs::set_permissions(staged.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            fs::read_to_string(staged.join("locked/secret")).unwrap(),
+            "secret"
+        );
     }
 }

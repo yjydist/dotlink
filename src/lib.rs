@@ -303,6 +303,9 @@ fn undo(manifest: &Manifest, states: &[EntryState]) -> Vec<ReportRow> {
         })
         .collect();
 
+    // 归属复核的仓库根基准: 与 `classify` 同源, 每运行只算一次.
+    let repo_root = os::normalize(&manifest.repo_root);
+
     // 快照已定, 现在才动手. "哪些 `Current` 允许移除"由 `undo::undo_entry` 一处决定
     // (`Foreign*` / `Absent` / `SourceMissing` / `Unreadable` 下它不触碰任何路径);
     // 快照同时就是恢复动作的输入, 因此报告中写的备份路径与实际恢复的必然是同一个.
@@ -313,7 +316,7 @@ fn undo(manifest: &Manifest, states: &[EntryState]) -> Vec<ReportRow> {
             continue;
         }
         let (entry, state) = (item.entry, item.state);
-        if let Err(error) = undo::undo_entry(entry, state, item.backup.as_deref()) {
+        if let Err(error) = undo::undo_entry(entry, state, item.backup.as_deref(), &repo_root) {
             item.failure = Some(error.to_string());
         }
     }

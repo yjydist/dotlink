@@ -353,10 +353,11 @@ fn physical_home(home: &Path) -> std::path::PathBuf {
 
 /// V-9: 目标落点不得退化 -- 归一化后命中以下位置之一即整体拒绝.
 ///
-/// 三个落点的共同点是命中它们的条目一旦落地 (`replace_and_backup` 尤甚) 就会毁掉
+/// 四个落点的共同点是命中它们的条目一旦落地 (`replace_and_backup` 尤甚) 就会毁掉
 /// 远超单个链接范围的内容: 文件系统根或主目录本身被替换备份, 毁掉的是一整棵树;
-/// 仓库根本身或其祖先被替换备份, 毁掉的是源仓库. `.` / `..` / 裸 `~` 都是极易写出
-/// 的笔误形态, 与 V-6 的立场一致, 静默放行比报错危险得多.
+/// 仓库根本身或其祖先被替换备份, 毁掉的是源仓库; 清单文件自身被替换备份, 之后所有
+/// 命令都因清单不可读而退 2. `.` / `..` / 裸 `~` / `dotlink.toml` 都是极易写出的
+/// 笔误形态, 与 V-6 的立场一致, 静默放行比报错危险得多.
 ///
 /// 主目录有两个比较基准 (`HOME` 的书写形态与解析符号链接后的物理形态), 二者都要
 /// 拒绝: `HOME` 自身可能是符号链接, 只比较一种形态会让另一种写法的主目录落点漏过.
@@ -396,6 +397,14 @@ fn reject_degenerate_target(
         return Err(invalid_entry(
             index,
             format!("`{written}` 归一化后是仓库根本身或其祖先: 不能以源仓库为落点"),
+        ));
+    }
+    // 清单文件自身: 替换它会同时失去唯一配置源, 之后的命令都因清单不可读而退 2.
+    // `repo` 与 `landing` 都已规范化, 相对形态, `./` 形态与绝对形态因此一致命中.
+    if landing.as_path() == repo.join(MANIFEST_NAME) {
+        return Err(invalid_entry(
+            index,
+            format!("`{written}` 归一化后是清单文件自身: 不能以 `{MANIFEST_NAME}` 为落点"),
         ));
     }
     Ok(())
@@ -769,6 +778,17 @@ mod tests {
                 &format!("[[entry]]\nsource = \"a\"\ntarget = \"{written}\"\n"),
                 repo_root,
                 &["entry[0]", "仓库根本身或其祖先", &format!("`{written}`")],
+            );
+        }
+    }
+
+    #[test]
+    fn v9_the_manifest_file_itself_is_rejected() {
+        // 相对形态, `./` 形态与绝对形态归一化后都是仓库根下的 `dotlink.toml`.
+        for written in ["dotlink.toml", "./dotlink.toml", "/repo/dotlink.toml"] {
+            assert_invalid(
+                &format!("[[entry]]\nsource = \"a\"\ntarget = \"{written}\"\n"),
+                &["entry[0]", "清单文件自身", &format!("`{written}`")],
             );
         }
     }

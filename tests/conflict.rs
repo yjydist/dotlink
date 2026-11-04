@@ -461,14 +461,15 @@ fn a_failed_backup_keeps_the_original_and_leaves_no_final_name() {
 }
 
 // ---------------------------------------------------------------------------
-// (j) 备份成功但替换失败: 失败行给出备份路径, 原对象仍在原路径
+// (j) 备份成功但替换失败: 失败行给出备份路径与暂存路径
 // ---------------------------------------------------------------------------
 
-/// 构造: 目标目录内含一个只读可进的子目录 (`0o555`), 备份能读取它, 但删除原对象时
+/// 构造: 目标目录内含一个只读可进的子目录 (`0o555`), 备份能读取它, 但删除暂存副本时
 /// 无法清空它 -- 于是备份已完整落定而替换失败, 正是"原内容已备份但目标未就位"的
-/// 情形. 这条失败行必须给出备份路径 (FR-016), 且原对象不得被移走.
+/// 情形. 这条失败行必须给出备份路径 (FR-016) 与暂存路径; 目标路径已原子移入暂存名,
+/// 不得留下半删除的原路径.
 #[test]
-fn a_failed_replacement_reports_the_backup_path_and_keeps_the_original() {
+fn a_failed_replacement_reports_the_backup_path_and_stages_the_original() {
     if running_as_root() {
         eprintln!("以 root 运行: chmod 555 不生效, 跳过替换失败的备份路径断言");
         return;
@@ -491,17 +492,26 @@ fn a_failed_replacement_reports_the_backup_path_and_keeps_the_original() {
 
     let run = run(&env, &["apply"]);
 
-    // 备份副本会保留原目录的只读权限位, 原对象内的只读子目录也仍在原路径: 两者都要
-    // 在断言之前恢复, 否则临时目录清理会因无法清空 0o555 子目录而失败.
+    // 删除失败时原对象已原子移入暂存名; 暂存树与备份都保留只读子目录的权限位, 两者
+    // 都要在断言之前恢复, 否则临时目录清理会因无法清空 0o555 子目录而失败.
     let backup = backup_path_from_output(&run.stdout);
-    unlock(&locked);
+    let staged = fs::read_dir(target.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().contains(".dotlink-replace.partial"))
+        })
+        .expect("替换失败时应留下暂存目录");
+    unlock(&staged.join("locked"));
     unlock(&backup.join("locked"));
 
     let line = line_for(&run.stdout, "~/.config/nvim");
     assert_eq!(token_of(line), "fail", "{line}");
     assert_eq!(run.code, 1, "条目失败使退出码为 1");
 
-    // 失败行必须给出备份路径, 且该路径真实存在, 内容就是被覆盖前的原对象.
+    // 失败行必须给出备份路径与暂存路径, 且两者真实存在.
     assert!(
         line.contains("原内容已备份到"),
         "替换失败的 fail 行必须说明原内容已备份: {line}"
@@ -511,6 +521,10 @@ fn a_failed_replacement_reports_the_backup_path_and_keeps_the_original() {
         "fail 行必须给出备份文件的完整路径: {line}"
     );
     assert!(
+        line.contains(&staged.display().to_string()),
+        "fail 行必须给出暂存目录的完整路径: {line}"
+    );
+    assert!(
         fs::symlink_metadata(&backup).unwrap().is_dir(),
         "备份的必须是原目录: {}",
         backup.display()
@@ -518,11 +532,11 @@ fn a_failed_replacement_reports_the_backup_path_and_keeps_the_original() {
     env.assert_content(&backup.join("init.lua"), "old\n");
     env.assert_content(&backup.join("locked/secret"), "secret\n");
 
-    // 原对象仍在原路径: 备份先行, 删除失败不得把原内容移走或替换成链接.
+    // 目标已原子移入暂存名, 不得留下半删除的原路径; 原内容仍可从暂存树找回.
     assert!(
-        fs::symlink_metadata(&target).unwrap().is_dir(),
-        "原目录必须保留在原路径: {}",
+        fs::symlink_metadata(&target).is_err(),
+        "目标应已移入暂存名: {}",
         target.display()
     );
-    env.assert_content(&target.join("locked/secret"), "secret\n");
+    env.assert_content(&staged.join("locked/secret"), "secret\n");
 }

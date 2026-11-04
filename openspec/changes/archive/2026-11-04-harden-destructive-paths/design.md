@@ -74,14 +74,16 @@
 - 目录: 子项全部复制并应用元数据后, 对目录调用 `sync_all`.
 - 符号链接: 无法对链接自身 sync; 由发布后的父目录同步覆盖.
 
-在 `write_backup_at` 的 `rename_noreplace` 成功后, 对最终名的父目录调用 `sync_all`.`restore_backup` 同样在 rename 后同步父目录; 由于 `copy_object` 已同步内容, 恢复路径同样具备持久性.
+在 `write_backup_at` 的 `rename_noreplace` 成功后, 对最终名的父目录调用 `sync_all`. `restore_backup` 同样在 rename 后同步父目录; 由于 `copy_object` 已同步内容, 恢复路径同样具备持久性.
 
-平台不支持同步 (`Unsupported`) 时沿用 `skip_unsupported` 的降级策略, 其他同步错误使该条目失败.该取舍与现有扩展属性/ mtime 的降级语义一致; 代价是部分网络文件系统上仍可能不满足强持久性.
+rename 是否已经发生决定失败语义: rename 之前的复制产物同步失败不发布最终名; rename 之后的父目录同步失败无法回滚已发布的名字, 因此该条目失败, 说明给出已发布的备份路径, 原对象保持原样. 恢复路径同理: rename 成功后的父目录同步失败表示内容已就位, 该条目仍报告失败, 调用方 MUST NOT 回滚暂存链接, 只清理旧链接副本, 并在说明中指出内容已恢复.
+
+平台不支持同步 (`Unsupported`) 时沿用 `skip_unsupported` 的降级策略, 其他同步错误使该条目失败. 该取舍与现有扩展属性/ mtime 的降级语义一致; 代价是部分网络文件系统上仍可能不满足强持久性.
 
 ### D5. 测试接缝
 
 - 身份不一致: 在 `apply` 的替换路径中增加一个 `#[cfg(test)]` 钩子, 允许测试在备份完成后,暂存前替换目标; 或在 `stage_and_verify` 助手上直接构造"快照 A, 暂存 B"的局面.后者更小, 优先.
-- 同步失败: 为 `sync_file` / `sync_dir` 增加 `#[cfg(test)]` 注入点, 模拟 `EIO`; 断言不发布最终名, 原对象保留.
+- 同步失败: 为 `sync_file` / `sync_dir` 增加按作用域区分的 `#[cfg(test)]` 注入点 (全部 / 仅目录), 模拟 `EIO`; 断言复制阶段失败不发布最终名且原对象保留, rename 后的父目录失败在说明中给出已发布路径; 恢复的 rename 后失败不回滚并保留已恢复内容.
 - 清单自指: 直接走 `manifest::parse` 与端到端 `preview` / `apply`, 断言退出码 2 且文件系统不变.
 - `undo` 归属复核: 单测构造"暂存后链接被换成仓库外链接"的场景, 断言移回,不删除,报告失败.
 - 正常路径: 现有 `replace_and_backup`, `undo`, metadata 测试保持通过, 确保暂存与同步没有改变用户可见结果.

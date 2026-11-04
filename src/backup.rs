@@ -168,7 +168,14 @@ fn write_backup_at(object: &Path, stamp: &str) -> Result<PathBuf> {
 
     for final_path in std::iter::once(first).chain(candidates) {
         match os::rename_noreplace(&partial, &final_path) {
-            Ok(()) => return Ok(final_path),
+            Ok(()) => {
+                // rename 已经把备份发布为最终名. 之后的父目录同步失败不能回滚已发布
+                // 的备份, 但失败说明必须给出该路径, 用户才知道备份已经存在 (FR-016).
+                sync_parent(&final_path).map_err(|error| {
+                    Error::EntryFailed(format!("{error}; 备份已发布到 {}", final_path.display()))
+                })?;
+                return Ok(final_path);
+            }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
                 remove_any(&partial);
@@ -179,17 +186,50 @@ fn write_backup_at(object: &Path, stamp: &str) -> Result<PathBuf> {
     unreachable!("序号消歧必然终止")
 }
 
+/// `restore_backup` 的失败阶段.
+///
+/// rename 之前的失败意味着内容尚未落到目标, 调用方可以安全地把暂存链接移回原路径;
+/// rename 之后的父目录同步失败意味着内容已经就位, 目标已被占用, 回滚既无意义也不会
+/// 成功, 调用方 MUST 只清理旧链接并报告内容已恢复.
+#[derive(Debug)]
+pub(crate) enum RestoreError {
+    /// 复制或 rename 失败, 目标路径仍为空.
+    NotLanded(Error),
+    /// rename 成功, 只有父目录同步失败.
+    LandedButUnsynced(Error),
+}
+
+impl std::fmt::Display for RestoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotLanded(error) | Self::LandedButUnsynced(error) => write!(f, "{error}"),
+        }
+    }
+}
+
 /// 把 `backup` 的内容恢复到已空出的 `target`, 拒绝覆盖期间新建的占用物.
 ///
 /// 复制先落到**进程级唯一**的临时名, 全部复制成功后再改名到 `target`: 目录恢复中途
 /// 失败不会在原路径留下半成品. 恢复成功后**不删除备份文件本身**
 /// (`openspec/specs/link-teardown/spec.md` 的"备份文件恢复后仍留在原地").
-pub(crate) fn restore_backup(target: &Path, backup: &Path) -> Result<()> {
-    let partial = copy_to_staging(backup, target, RESTORE_SUFFIX)?;
+pub(crate) fn restore_backup(
+    target: &Path,
+    backup: &Path,
+) -> std::result::Result<(), RestoreError> {
+    let partial =
+        copy_to_staging(backup, target, RESTORE_SUFFIX).map_err(RestoreError::NotLanded)?;
 
     os::rename_noreplace(&partial, target).map_err(|error| {
         remove_any(&partial);
-        failed("恢复备份到", target, &error)
+        RestoreError::NotLanded(failed("恢复备份到", target, &error))
+    })?;
+
+    // rename 已把内容放到目标: 之后的同步失败不能触发回滚, 但仍要报告持久性未确认.
+    sync_parent(target).map_err(|error| {
+        RestoreError::LandedButUnsynced(Error::EntryFailed(format!(
+            "{error}; 备份内容已恢复到 {}",
+            target.display()
+        )))
     })
 }
 
@@ -240,7 +280,10 @@ fn copy_object(source: &Path, dest: &Path) -> io::Result<()> {
             }
             // 子项复制完成后再应用元数据: 创建子项会改变目录 mtime, 只读权限也会
             // 阻止后续子项写入.
-            apply_metadata(source, dest, &metadata)
+            apply_metadata(source, dest, &metadata)?;
+            // 全部子项与目录自身都同步完成后, 复制产物才算落盘 (设计 D4).
+            skip_unsupported(os::sync_dir(dest))
+                .map_err(|error| copy_error("同步备份目录", dest, error))
         })();
         return finish_copy(dest, copied);
     }
@@ -264,7 +307,12 @@ fn copy_object(source: &Path, dest: &Path) -> io::Result<()> {
         .map_err(|error| copy_error("创建备份文件", dest, error))?;
     let copied = io::copy(&mut input, &mut output)
         .map_err(|error| copy_error("复制", source, error))
-        .and_then(|_| apply_metadata(source, dest, &metadata));
+        .and_then(|_| apply_metadata(source, dest, &metadata))
+        .and_then(|()| {
+            // 数据与元数据在 rename 到最终名前同步到稳定存储 (设计 D4).
+            skip_unsupported(os::sync_file(&output))
+                .map_err(|error| copy_error("同步备份文件", dest, error))
+        });
     finish_copy(dest, copied)
 }
 
@@ -430,6 +478,14 @@ fn unique_staging_suffix(suffix: &str) -> String {
     format!(".{}{suffix}", std::process::id())
 }
 
+/// rename 之后同步父目录, 让新名字在崩溃后仍然可见.
+///
+/// `Unsupported` 与其他元数据的降级语义一致; 其余错误使该条目失败 (设计 D4).
+fn sync_parent(path: &Path) -> Result<()> {
+    let parent = parent_dir(path);
+    skip_unsupported(os::sync_dir(parent)).map_err(|error| failed("同步父目录", parent, &error))
+}
+
 /// 统一的条目级错误措辞 (含底层 io 错误).
 fn failed(context: &str, path: &Path, error: &io::Error) -> Error {
     Error::EntryFailed(format!("{context} {} 失败: {error}", path.display()))
@@ -565,6 +621,104 @@ mod tests {
         assert_eq!(suffix_of(&target, &second), format!("{stamp}.2"));
         assert_eq!(fs::read_to_string(&first).unwrap(), "first");
         assert_eq!(fs::read_to_string(&second).unwrap(), "second");
+    }
+
+    /// 同步失败必须使该条目失败: 不发布最终名, 不删除原对象, 也不留暂存残留.
+    #[test]
+    fn a_failed_file_sync_publishes_no_backup_and_keeps_the_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("bashrc");
+        let stamp = "20260101T000000";
+        fs::write(&target, "original").unwrap();
+
+        let guard = os::fail_syncs();
+        let error = write_backup_at(&target, stamp).unwrap_err();
+        drop(guard);
+
+        assert!(error.to_string().contains("同步备份文件"), "{error}");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "original");
+        assert!(
+            fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("bashrc.dotlink-backup.")),
+            "同步失败不得发布最终名或留下暂存残留"
+        );
+    }
+
+    /// 目录自身的同步失败同样不得发布最终名, 原目录保持原样.
+    #[test]
+    fn a_failed_directory_sync_publishes_no_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("nvim");
+        let stamp = "20260101T000000";
+        // 空目录: 复制过程只涉及目录自身, 因此失败点必然落在目录同步上.
+        fs::create_dir(&target).unwrap();
+
+        let guard = os::fail_syncs();
+        let error = write_backup_at(&target, stamp).unwrap_err();
+        drop(guard);
+
+        assert!(error.to_string().contains("同步备份目录"), "{error}");
+        assert!(
+            fs::symlink_metadata(&target).unwrap().is_dir(),
+            "原目录必须保留"
+        );
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+        assert!(
+            fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("nvim.dotlink-backup.")),
+            "同步失败不得发布最终名或留下暂存残留"
+        );
+    }
+
+    /// rename 之后的父目录同步失败: 备份已经发布, 失败说明必须给出最终路径, 原对象保留.
+    #[test]
+    fn a_failed_parent_sync_reports_the_published_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("bashrc");
+        let stamp = "20260101T000000";
+        fs::write(&target, "original").unwrap();
+
+        // 只让目录同步失败: 普通文件的内容同步会先通过, 失败点因此落在 rename 之后
+        // 的父目录同步上.
+        let guard = os::fail_directory_syncs();
+        let error = write_backup_at(&target, stamp).unwrap_err();
+        drop(guard);
+
+        let message = error.to_string();
+        assert!(message.contains("同步父目录"), "{message}");
+        assert!(message.contains("备份已发布到"), "{message}");
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "original",
+            "原对象不得被删除"
+        );
+
+        let backups: Vec<PathBuf> = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name().is_some_and(|name| {
+                    name.to_string_lossy().starts_with("bashrc.dotlink-backup.")
+                })
+            })
+            .collect();
+        assert_eq!(backups.len(), 1, "rename 已发布最终名: {backups:?}");
+        assert!(
+            message.contains(&backups[0].display().to_string()),
+            "说明必须给出已发布的备份路径: {message}"
+        );
+        assert_eq!(fs::read_to_string(&backups[0]).unwrap(), "original");
     }
 
     /// 本地时区不可用 (`now_local()` 失败) 时退化为 UTC: 退化只影响字面值, 形态不变,
@@ -1094,7 +1248,10 @@ mod tests {
         fs::write(target.join("nested/keep"), "keep").unwrap();
 
         let error = restore_backup(&target, &backup).unwrap_err();
-        assert!(matches!(error, Error::EntryFailed(_)));
+        assert!(matches!(
+            error,
+            RestoreError::NotLanded(Error::EntryFailed(_))
+        ));
 
         let residue: Vec<String> = fs::read_dir(dir.path())
             .unwrap()

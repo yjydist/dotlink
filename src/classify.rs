@@ -2,7 +2,7 @@
 
 use std::fs::Metadata;
 use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::entry::{Entry, OnConflict};
 use crate::manifest::Manifest;
@@ -143,7 +143,7 @@ fn classify_entry(entry: &Entry, repo_root: &Path) -> EntryState {
             };
         }
     };
-    let actual = link_destination(&entry.target_path, &link_text);
+    let actual = os::link_destination(&entry.target_path, &link_text);
     // `source_path` 已在 entry 层过 `os::normalize`, 与链接目标使用同一形态.
     if actual == entry.source_path {
         return new_state(
@@ -158,7 +158,7 @@ fn classify_entry(entry: &Entry, repo_root: &Path) -> EntryState {
     // 判定直接复用上面已解析出的 `actual` 与循环外算好的仓库根, 不再重读链接.
     //
     // `detail` 与 `render.rs` 的分工: `wrong` 与 `foreign` 都取"实际指向" --
-    // 写规范化结果 (`link_destination` 的返回值) 而不是链接文本的原始写法, 使相对
+    // 写规范化结果 (`os::link_destination` 的返回值) 而不是链接文本的原始写法, 使相对
     // 链接文本也展示为解析后的绝对目标; `missing` 行冠以"仓库中不存在: <source>";
     // 其余行原样透出.
     let resolved = actual.display().to_string();
@@ -167,22 +167,6 @@ fn classify_entry(entry: &Entry, repo_root: &Path) -> EntryState {
     } else {
         new_state(Current::ForeignLink, resolved, entry.on_conflict)
     }
-}
-
-/// 目标路径上的符号链接文本解析为绝对路径后的非严格规范化结果 (`L`).
-///
-/// 相对链接以链接所在目录为基准; 链接文本与基准都不必存在, 因此不得用
-/// `Path::canonicalize` (openspec/specs/path-normalization/spec.md 的 R2 悬空链接陷阱).
-fn link_destination(link_path: &Path, link_text: &Path) -> PathBuf {
-    let absolute = if link_text.is_absolute() {
-        link_text.to_path_buf()
-    } else {
-        match link_path.parent() {
-            Some(parent) => parent.join(link_text),
-            None => link_text.to_path_buf(),
-        }
-    };
-    os::normalize(&absolute)
 }
 
 /// 一次 lstat. 必须用 `symlink_metadata`: `metadata` 会穿透到链接的目标,
@@ -1300,7 +1284,7 @@ mod tests {
     ///
     /// 1. `classify` 层 (`current == LinkedCorrect`): 这是本用例的实质断言, 对应
     ///    本节的"三个调用点同源". 但 `classify` 内部会把两侧都过一遍 `os::normalize`
-    ///    (`link_destination` 与 `let source = os::normalize(...)`), 因此当
+    ///    (`os::link_destination` 与 `let source = os::normalize(...)`), 因此当
     ///    `normalize` 是幂等的, 它**无法**区分"`source_path` 在解析阶段就已规范化"
     ///    与"`source_path` 是字面拼接, 由 `classify` 兜底规范化"; 后者会让同一个
     ///    路径被规范化两次而结论不变. 只靠这一层, 本用例会在 `entry.rs` 漏掉
