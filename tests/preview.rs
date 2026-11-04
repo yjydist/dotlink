@@ -387,6 +387,65 @@ fn preview_reports_the_backup_path_it_would_use() {
 }
 
 // ---------------------------------------------------------------------------
+// source 改名: preview 预测自愈 (默认 skip)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn preview_predicts_healing_a_renamed_source_under_the_default_policy() {
+    let env = TempEnv::new();
+    env.write_source("shell/bashrc", "managed\n");
+    env.write_manifest(&manifest_of(&[("shell/bashrc", "~/.bashrc", "-")]));
+    assert_eq!(run(&env, &["apply"]).code, 0, "先按旧 source 部署");
+
+    // source 改名后, 目标上的旧链接指向仓库内旧路径; 条目保持缺省 `on_conflict`.
+    let repo = physical_repo(&env);
+    fs::rename(repo.join("shell/bashrc"), repo.join("shell/bashrc2")).expect("改名源文件");
+    env.write_manifest(&manifest_of(&[("shell/bashrc2", "~/.bashrc", "-")]));
+
+    let before = snapshot_all(&env);
+    let preview = run(&env, &["preview"]);
+    assert_eq!(preview.code, 1, "存在待办; stdout:\n{}", preview.stdout);
+    assert_eq!(
+        snapshot_all(&env),
+        before,
+        "preview 必须只读; stdout:\n{}",
+        preview.stdout
+    );
+
+    let line = line_for(&preview.stdout, "~/.bashrc");
+    assert_eq!(token_of(line), "replace", "{line}");
+    assert!(
+        line.contains("本工具的链接指向错误"),
+        "预览必须说明这是本工具的错误链接: {line}"
+    );
+
+    let predicted = backup_candidate_from_output(line);
+    assert_eq!(
+        predicted.parent(),
+        Some(env.home()),
+        "备份必须与被替换的链接同目录: {}",
+        predicted.display()
+    );
+    let predicted_name = predicted
+        .file_name()
+        .expect("预测路径必须有文件名")
+        .to_string_lossy()
+        .into_owned();
+    let predicted_stamp = predicted_name
+        .strip_prefix(".bashrc.dotlink-backup.")
+        .unwrap_or_else(|| panic!("预测的备份名形态不对: {predicted_name}"));
+    assert!(
+        is_timestamp(predicted_stamp),
+        "预测的备份名必须带 15 位时间戳: {predicted_name}"
+    );
+    assert!(
+        fs::symlink_metadata(&predicted).is_err(),
+        "preview 不得创建备份: {}",
+        predicted.display()
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 汇总四列: 四个条目分别落入 成功 / 已是最新 / 未处理 / 失败, 各行计数为 1
 // ---------------------------------------------------------------------------
 

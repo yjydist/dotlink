@@ -204,17 +204,17 @@ fn new_state(current: Current, detail: String, on_conflict: OnConflict) -> Entry
 /// 由现状与 `on_conflict` 导出动作 (严格按 `data-model.md` 3.2 表).
 ///
 /// `SourceMissing` / `Unreadable` / `Absent` / `LinkedCorrect` 四种与
-/// `on_conflict` 无关; 其余四种冲突类只在"拒绝"与"备份后替换"之间二选一.
+/// `on_conflict` 无关. `LinkedWrong` 是本工具创建的错误链接 (落在仓库内), 同样不受
+/// `on_conflict` 约束, 固定导出"备份后替换", 与 `undo` 的归属规则一致; 其余三种
+/// 外部占用只在"拒绝"与"备份后替换"之间二选一.
 fn action_for(current: Current, on_conflict: OnConflict) -> Action {
     match current {
         Current::SourceMissing => Action::ReportMissingSource,
         Current::Unreadable => Action::ReportUnreadable,
         Current::Absent => Action::Create,
         Current::LinkedCorrect => Action::Noop,
-        Current::LinkedWrong
-        | Current::ForeignLink
-        | Current::ForeignFile
-        | Current::ForeignDir => match on_conflict {
+        Current::LinkedWrong => Action::ReplaceAndBackup,
+        Current::ForeignLink | Current::ForeignFile | Current::ForeignDir => match on_conflict {
             OnConflict::Skip => Action::RefuseConflict,
             OnConflict::ReplaceAndBackup => Action::ReplaceAndBackup,
         },
@@ -373,12 +373,17 @@ mod tests {
 
         let state = f.state("shell/bashrc", &target, OnConflict::Skip);
         assert_eq!(state.current, Current::LinkedWrong);
-        assert_eq!(state.action, Action::RefuseConflict);
+        assert_eq!(state.action, Action::ReplaceAndBackup);
         assert_eq!(
             state.detail,
             other.display().to_string(),
             "wrong 行的说明即链接实际指向 (由 render.rs 冠以措辞)"
         );
+
+        // 本工具的错误链接不受 `on_conflict` 约束: 两种策略都备份后替换.
+        let replace = f.state("shell/bashrc", &target, OnConflict::ReplaceAndBackup);
+        assert_eq!(replace.current, Current::LinkedWrong);
+        assert_eq!(replace.action, Action::ReplaceAndBackup);
     }
 
     #[test]
@@ -656,7 +661,7 @@ mod tests {
             (
                 Current::LinkedWrong,
                 OnConflict::Skip,
-                Action::RefuseConflict,
+                Action::ReplaceAndBackup,
             ),
             (
                 Current::LinkedWrong,
@@ -908,12 +913,14 @@ mod tests {
     /// `Current` x `on_conflict` 的组合都必须落在 3.2 表内, 不存在"配到表外
     /// `Action`"的情形.
     ///
-    /// T047 的 `action_mapping_follows_the_table` 逐格断言了 8 x 2 的具体取值;
-    /// 这里断言的是**补集** -- 组合的**结构**而不是取值本身:
+    /// `action_mapping_follows_the_table` 逐格断言了 8 x 2 的具体取值; 这里断言的是
+    /// **补集** -- 组合的**结构**而不是取值本身:
     ///
     /// - 3.2 表中带 "-" (与 `on_conflict` 无关) 的四种取值: 两个 `on_conflict`
     ///   必须给出**同一个**动作, 且该动作不得是冲突类的两个之一;
-    /// - 冲突类的四种取值: 两个 `on_conflict` 必须给出**恰好一对**冲突动作.
+    /// - `LinkedWrong` 同样与 `on_conflict` 无关 (本工具的错误链接), 固定为
+    ///   `ReplaceAndBackup`;
+    /// - 其余三种外部占用: 两个 `on_conflict` 必须给出**恰好一对**冲突动作.
     #[test]
     fn every_current_lands_inside_the_action_table() {
         assert_eq!(ALL_CURRENTS.len(), 8, "3.2 表的左侧必须恰有 8 种 Current");
@@ -937,10 +944,19 @@ mod tests {
                         "{current:?} 与 on_conflict 无关, 两种策略必须给出同一个动作"
                     );
                 }
-                Current::LinkedWrong
-                | Current::ForeignLink
-                | Current::ForeignFile
-                | Current::ForeignDir => {
+                Current::LinkedWrong => {
+                    assert_eq!(
+                        skip,
+                        Action::ReplaceAndBackup,
+                        "3.2 表: {current:?} + skip 必须是 ReplaceAndBackup"
+                    );
+                    assert_eq!(
+                        replace,
+                        Action::ReplaceAndBackup,
+                        "3.2 表: {current:?} + replace_and_backup 必须是 ReplaceAndBackup"
+                    );
+                }
+                Current::ForeignLink | Current::ForeignFile | Current::ForeignDir => {
                     assert_eq!(
                         skip,
                         Action::RefuseConflict,

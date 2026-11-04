@@ -324,24 +324,28 @@ fn note_for_token(
             _ => "已是最新".to_string(),
         },
         EntryOutcome::Replace => {
-            let source = entry.source.as_str();
+            // `LinkedWrong` 是本工具创建的错误链接, 与 `Foreign*` 的"外部占用"不同:
+            // token 相同, 但说明必须让用户看出这一链接的归属.
+            let lead = match current {
+                Current::LinkedWrong => {
+                    format!("本工具的链接指向错误 (实际指向: {})", actual_target(detail))
+                }
+                _ => format!("冲突占用 ({})", entry.source.as_str()),
+            };
+            let verb = if current == Current::LinkedWrong {
+                "重建链接"
+            } else {
+                "建立链接"
+            };
             match (command, backup_path) {
                 (Command::Preview, Some(path)) => {
-                    format!(
-                        "冲突占用 ({source}) -> 将备份到 {} 并建立链接",
-                        path.display()
-                    )
+                    format!("{lead} -> 将备份到 {} 并{verb}", path.display())
                 }
-                (Command::Preview, None) => {
-                    format!("冲突占用 ({source}) -> 将备份后建立链接")
-                }
+                (Command::Preview, None) => format!("{lead} -> 将备份后{verb}"),
                 (_, Some(path)) => {
-                    format!(
-                        "冲突占用 ({source}) -> 已备份到 {} 并建立链接",
-                        path.display()
-                    )
+                    format!("{lead} -> 已备份到 {} 并{verb}", path.display())
                 }
-                (_, None) => format!("冲突占用 ({source}) -> 已备份并建立链接"),
+                (_, None) => format!("{lead} -> 已备份并{verb}"),
             }
         }
         EntryOutcome::Conflict => {
@@ -954,6 +958,73 @@ mod tests {
             None,
         );
         assert!(conflict.contains("skip"), "{conflict}");
+    }
+
+    /// `replace` 的 token 由两种现状共享, 说明必须区分"外部占用"与"本工具的错误链接".
+    #[test]
+    fn replace_wording_distinguishes_owned_mislinks_from_foreign_occupants() {
+        let backup = "/home/u/.bashrc.dotlink-backup.20250101T000000";
+        let e = entry("shell/bashrc", "~/.bashrc");
+        let detail = "/repo/shell/zshrc";
+
+        let wrong_preview = note_for(
+            Command::Preview,
+            Current::LinkedWrong,
+            Action::ReplaceAndBackup,
+            &e,
+            detail,
+            Some(Path::new(backup)),
+        );
+        assert!(
+            wrong_preview.contains("本工具的链接指向错误"),
+            "LinkedWrong 必须说明这是本工具的链接: {wrong_preview}"
+        );
+        assert!(
+            wrong_preview.contains(detail),
+            "LinkedWrong 必须给出实际指向: {wrong_preview}"
+        );
+        assert!(
+            wrong_preview.contains("将备份到") && wrong_preview.contains(backup),
+            "preview 必须给出预测备份路径: {wrong_preview}"
+        );
+        assert!(
+            wrong_preview.contains("重建"),
+            "LinkedWrong 是重建链接, 不是首次建立: {wrong_preview}"
+        );
+        assert!(
+            !wrong_preview.contains("冲突占用"),
+            "LinkedWrong 不得被描述为外部占用: {wrong_preview}"
+        );
+
+        let wrong_apply = note_for(
+            Command::Apply,
+            Current::LinkedWrong,
+            Action::ReplaceAndBackup,
+            &e,
+            detail,
+            Some(Path::new(backup)),
+        );
+        assert!(
+            wrong_apply.contains("已备份到") && wrong_apply.contains(backup),
+            "apply 必须给出实际备份路径: {wrong_apply}"
+        );
+
+        let foreign = note_for(
+            Command::Apply,
+            Current::ForeignFile,
+            Action::ReplaceAndBackup,
+            &e,
+            "",
+            Some(Path::new(backup)),
+        );
+        assert!(
+            foreign.contains("冲突占用"),
+            "Foreign* 保持外部占用措辞: {foreign}"
+        );
+        assert!(
+            !foreign.contains("本工具的链接指向错误"),
+            "Foreign* 不得被描述为本工具的错误链接: {foreign}"
+        );
     }
 
     #[test]

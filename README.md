@@ -111,9 +111,11 @@ on_conflict = "replace_and_backup"
 |----|------|------|------|------|
 | `source` | 是 | 非空字符串 | 无 | 仓库内的相对路径, 可以是文件或目录; 不接受 `~` 前缀、绝对路径, 以及解析后落在仓库之外的路径 |
 | `target` | 是 | 非空字符串 | 无 | 期望链接出现的位置, 规则见下 |
-| `on_conflict` | 否 | `"skip"` 或 `"replace_and_backup"` | `"skip"` | 目标被非 dotlink 内容占用时的策略 |
+| `on_conflict` | 否 | `"skip"` 或 `"replace_and_backup"` | `"skip"` | 目标被外部内容占用时的策略 |
 
-`on_conflict = "skip"` (默认) 会保留占用物并把该条目标记为 `conflict`, 本次不动它; `on_conflict = "replace_and_backup"` 会先把占用物备份到同目录的 `<原名>.dotlink-backup.<时间戳>`, 再建立链接. 备份文件的完整路径会打印在 `replace` 行里.
+`on_conflict` 只约束目标被**外部内容** (非 dotlink 创建的链接、普通文件或目录) 占用时的处置: `"skip"` (默认) 会保留占用物并把该条目标记为 `conflict`, 本次不动它; `"replace_and_backup"` 会先把占用物备份到同目录的 `<原名>.dotlink-backup.<时间戳>`, 再建立链接. 备份文件的完整路径会打印在 `replace` 行里.
+
+指向错误的本工具链接**不属于**外部占用: 例如 source 改名后, 目标上的旧链接仍指向仓库内的旧路径, `apply` 会无视 `on_conflict` 把它备份后重建为指向新 source 的链接, `preview` 会预测同一动作与备份路径 (`replace` token, 说明为"本工具的链接指向错误").
 
 备份保留原对象的内容、对象类型、权限位、修改时间 (mtime) 以及全部可设置的扩展属性. 扩展属性采用**尽力而为**策略: 文件系统不支持、权限不足或内核保护导致某个属性无法设置时跳过该属性, 其余内容与元数据仍照常备份; 磁盘满等 I/O 错误仍使该条目失败. 不保留所有权与 ACL (macOS 的 ACL 不经 `listxattr` 暴露), 也不保留符号链接自身的元数据. 目录的 mtime 在其子项全部复制完成后设置.
 

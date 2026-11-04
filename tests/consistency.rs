@@ -61,18 +61,20 @@ const TARGETS: [&str; 7] = [
 /// - `preview` / `apply` 由 `(Current, Action)` 导出, 二者共用同一张 token 表;
 /// - `undo` 由 `(Current, 同目录是否有备份)` 导出, 本夹具没有任何备份.
 ///
-/// 冲突类条目 (3-6) 在缺省 `on_conflict = skip` 下得到 `RefuseConflict`, 故
-/// `preview` / `apply` 报 `conflict`; `undo` 对 `Foreign*` 报 `skip`, 对仓库内的错误
-/// 链接报 `undo` (它也是本工具的链接, 无备份时只移除).
+/// 条目 3 是仓库内的错误链接 (本工具产物), 不受 `on_conflict` 约束, 在
+/// `preview` / `apply` 下固定报 `replace`; 条目 4-6 是外部占用, 在缺省
+/// `on_conflict = skip` 下得到 `RefuseConflict`, 故 `preview` / `apply` 报
+/// `conflict`; `undo` 对 `Foreign*` 报 `skip`, 对仓库内的错误链接报 `undo`
+/// (它也是本工具的链接, 无备份时只移除).
 const EXPECTED: [[&str; 7]; 4] = [
     [
         "ok", "absent", "wrong", "foreign", "foreign", "foreign", "missing",
     ],
     [
-        "ok", "create", "conflict", "conflict", "conflict", "conflict", "missing",
+        "ok", "create", "replace", "conflict", "conflict", "conflict", "missing",
     ],
     [
-        "ok", "create", "conflict", "conflict", "conflict", "conflict", "missing",
+        "ok", "create", "replace", "conflict", "conflict", "conflict", "missing",
     ],
     ["undo", "ok", "undo", "skip", "skip", "skip", "missing"],
 ];

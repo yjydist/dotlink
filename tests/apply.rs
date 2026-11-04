@@ -15,8 +15,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use support::{
-    Run, TempEnv, entry_lines, line_for, manifest_of, physical_repo, run, running_as_root,
-    snapshot_all, target_of, token_of, unlock,
+    Run, TempEnv, backup_path_from_output, entry_lines, line_for, manifest_of, physical_repo, run,
+    running_as_root, snapshot_all, target_of, token_of, unlock,
 };
 
 /// 断言每一次条目行的 token 都是 `token`.
@@ -374,6 +374,55 @@ fn adding_an_entry_only_creates_the_new_one() {
         vec![env.home().join(".zshrc")],
         "增量运行只允许新增新条目的目标路径"
     );
+}
+
+// ---------------------------------------------------------------------------
+// source 改名: 默认 skip 下 apply 自愈本工具留下的错误链接
+// ---------------------------------------------------------------------------
+
+#[test]
+fn apply_heals_a_link_left_behind_by_a_renamed_source_under_the_default_policy() {
+    let env = TempEnv::new();
+    env.write_source("shell/bashrc", "managed\n");
+    env.write_manifest(&manifest_of(&[("shell/bashrc", "~/.bashrc", "-")]));
+
+    let first = run(&env, &["apply"]);
+    assert_code(&first, 0);
+    assert_all_tokens(&first, "create");
+
+    // source 改名: 目标上的旧链接仍指向仓库内旧路径, 清单改指新路径.
+    // 该条目保持缺省 `on_conflict = skip`, 自愈不得依赖 `replace_and_backup`.
+    let repo = physical_repo(&env);
+    fs::rename(repo.join("shell/bashrc"), repo.join("shell/bashrc2")).expect("改名源文件");
+    env.write_manifest(&manifest_of(&[("shell/bashrc2", "~/.bashrc", "-")]));
+
+    let run = run(&env, &["apply"]);
+
+    assert_code(&run, 0);
+    let line = line_for(&run.stdout, "~/.bashrc");
+    assert_eq!(token_of(line), "replace", "自愈行必须是 replace: {line}");
+    assert!(
+        line.contains("本工具的链接指向错误"),
+        "自愈行必须说明这是本工具的错误链接: {line}"
+    );
+
+    // 旧链接本身被备份 (链接文本仍指向旧路径), 目标改指新 source.
+    let backup = backup_path_from_output(&run.stdout);
+    assert!(
+        fs::symlink_metadata(&backup)
+            .expect("备份应存在")
+            .file_type()
+            .is_symlink(),
+        "备份的必须是旧链接本身: {}",
+        backup.display()
+    );
+    assert_eq!(
+        fs::read_link(&backup).expect("读取备份链接"),
+        repo.join("shell/bashrc"),
+        "备份应保留旧链接的原始文本"
+    );
+    env.assert_symlink_to(&env.home().join(".bashrc"), &repo.join("shell/bashrc2"));
+    env.assert_content(&env.home().join(".bashrc"), "managed\n");
 }
 
 // ---------------------------------------------------------------------------
