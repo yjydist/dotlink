@@ -75,8 +75,16 @@ pub fn backup_path_for(target: &Path) -> PathBuf {
 }
 
 fn backup_candidates(target: &Path) -> impl Iterator<Item = PathBuf> {
+    backup_candidates_at(target, timestamp())
+}
+
+/// 给定时间戳的候选名序列 (裸名, `.2`, `.3` ...).
+///
+/// 时间戳是参数而不是在闭包里取当前时刻: 这样"同一秒内的两次替换产生 `.2`"可以被
+/// 确定性地测试, 不受墙钟是否跨秒的影响.
+fn backup_candidates_at(target: &Path, stamp: String) -> impl Iterator<Item = PathBuf> {
     let mut base = backup_base(target);
-    base.push(timestamp());
+    base.push(stamp);
     let base = parent_dir(target).join(base);
     (1_u64..).map(move |serial| {
         if serial == 1 {
@@ -148,7 +156,12 @@ pub(crate) fn find_latest_backup(target: &Path) -> Result<Option<PathBuf>> {
 /// 返回 `Ok` 意味着备份已完整落定并改名到最终名 -- 调用者此时才可以删除原对象
 /// (data-model.md 第 4 节的"先复制后删除的硬顺序"). 失败时不留下最终名.
 pub(crate) fn write_backup(object: &Path) -> Result<PathBuf> {
-    let mut candidates = backup_candidates(object);
+    write_backup_at(object, &timestamp())
+}
+
+/// 给定时间戳的备份写入 (见 [`backup_candidates_at`]): 测试用它绕过墙钟.
+fn write_backup_at(object: &Path, stamp: &str) -> Result<PathBuf> {
+    let mut candidates = backup_candidates_at(object, stamp.to_string());
     let first = candidates.next().expect("备份候选名非空");
     let partial = copy_to_staging(object, &first, PARTIAL_SUFFIX)?;
 
@@ -318,7 +331,15 @@ fn parent_dir(path: &Path) -> &Path {
 /// `now_local()` 在容器等环境下会失败 (无本地时区信息), 此时退化到 UTC: 秒级精度与
 /// 同秒消歧都不依赖时区, 因此退化只影响时间戳的字面值, 不影响任何不变量.
 fn timestamp() -> String {
-    let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
+    timestamp_at(OffsetDateTime::now_local().ok())
+}
+
+/// 时间戳的纯函数形式: `local` 为 `None` 表示本地时区不可用, 退化为 UTC.
+///
+/// 拆出参数是为了让"`now_local()` 失败"这一分支可被单元测试走到: 生产路径只传
+/// `OffsetDateTime::now_local().ok()`, 格式化规则与退化分支共用同一段代码.
+fn timestamp_at(local: Option<OffsetDateTime>) -> String {
+    let now = local.unwrap_or_else(OffsetDateTime::now_utc);
     format!(
         "{:04}{:02}{:02}T{:02}{:02}{:02}",
         now.year(),
@@ -525,6 +546,40 @@ mod tests {
         assert_eq!(fs::read_to_string(&second).unwrap(), "second");
     }
 
+    /// 同一秒内的两次替换: 序号消歧必须确定发生, 不依赖墙钟是否跨秒.
+    ///
+    /// 固定时间戳经 [`write_backup_at`] 注入, 断言两条: 后者取 `.2`, 前者内容不变.
+    #[test]
+    fn two_replacements_in_one_second_get_serial_two_deterministically() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("bashrc");
+        let stamp = "20260101T000000";
+
+        fs::write(&target, "first").unwrap();
+        let first = write_backup_at(&target, stamp).unwrap();
+        fs::write(&target, "second").unwrap();
+        let second = write_backup_at(&target, stamp).unwrap();
+
+        assert_eq!(suffix_of(&target, &first), stamp);
+        assert_eq!(suffix_of(&target, &second), format!("{stamp}.2"));
+        assert_eq!(fs::read_to_string(&first).unwrap(), "first");
+        assert_eq!(fs::read_to_string(&second).unwrap(), "second");
+    }
+
+    /// 本地时区不可用 (`now_local()` 失败) 时退化为 UTC: 退化只影响字面值, 形态不变,
+    /// 也不使备份失败. 传入 `None` 即该分支, 无需让主机的时区真的不可用.
+    #[test]
+    fn timestamp_falls_back_to_utc_without_changing_the_shape() {
+        let fixed = OffsetDateTime::from_unix_timestamp(0).unwrap();
+        assert_eq!(timestamp_at(Some(fixed)), "19700101T000000");
+
+        let fallback = timestamp_at(None);
+        assert!(
+            is_timestamp(&fallback),
+            "退化到 UTC 后仍必须是 15 位时间戳: {fallback}"
+        );
+    }
+
     #[test]
     fn disambiguation_also_handles_a_dangling_symlink_at_the_backup_name() {
         let dir = tempfile::tempdir().unwrap();
@@ -541,6 +596,37 @@ mod tests {
                 .unwrap()
                 .file_type()
                 .is_symlink()
+        );
+    }
+
+    /// 发布路径 (rename) 遇到悬空链接占用最终名时必须递增序号, 且不得覆盖该链接.
+    ///
+    /// 预检测试只覆盖 `backup_path_for`; 这里直接走 [`write_backup_at`], 使 rename 的
+    /// `AlreadyExists -> 下一候选` 分支有真实断言 (而不是仅靠代码审阅).
+    #[test]
+    fn write_backup_retries_when_the_final_name_is_occupied_by_a_dangling_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("bashrc");
+        let stamp = "20260101T000000";
+        fs::write(&target, "payload").unwrap();
+
+        let occupied = dir.path().join(format!("bashrc{MARKER}{stamp}"));
+        os::create_symlink(Path::new("/definitely/gone"), &occupied).unwrap();
+
+        let written = write_backup_at(&target, stamp).unwrap();
+
+        assert_eq!(suffix_of(&target, &written), format!("{stamp}.2"));
+        assert_eq!(fs::read_to_string(&written).unwrap(), "payload");
+        assert!(
+            fs::symlink_metadata(&occupied)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "占用最终名的悬空链接必须原样保留"
+        );
+        assert_eq!(
+            fs::read_link(&occupied).unwrap(),
+            Path::new("/definitely/gone")
         );
     }
 
@@ -597,6 +683,29 @@ mod tests {
         fs::write(&later, "x").unwrap();
 
         assert_eq!(find_latest_backup(&target).unwrap(), Some(later));
+    }
+
+    /// 时间戳相等且序号**数值**相等时 (`.02` 与 `.2`), 以文件名字典序兜底, 使结论
+    /// 与目录遍历顺序无关: 两种创建顺序下都必须取同一份 (字典序较大者).
+    #[test]
+    fn find_latest_backup_tiebreaks_equal_serials_by_file_name() {
+        let stamp = "20260101T000000";
+        for order in [[".02", ".2"], [".2", ".02"]] {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("bashrc");
+            for serial in order {
+                fs::write(
+                    dir.path().join(format!("bashrc{MARKER}{stamp}{serial}")),
+                    serial,
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                find_latest_backup(&target).unwrap(),
+                Some(dir.path().join(format!("bashrc{MARKER}{stamp}.2"))),
+                "创建顺序 {order:?} 下必须按文件名兜底取同一份, 不得依赖遍历顺序"
+            );
+        }
     }
 
     #[test]
@@ -1086,6 +1195,32 @@ mod tests {
         }
     }
 
+    /// 备份暂存名被占用时以排他方式取下一个序号, 既有对象不受影响.
+    #[test]
+    fn backup_staging_chooses_another_name_without_touching_occupants() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        fs::write(&source, "original").unwrap();
+        let base = dir.path().join("bashrc.dotlink-backup.20260101T000000");
+        let occupied = with_suffix(&base, &unique_staging_suffix(PARTIAL_SUFFIX));
+        fs::write(&occupied, "keep").unwrap();
+        let inode = fs::symlink_metadata(&occupied).unwrap().ino();
+
+        let staged = copy_to_staging(&source, &base, PARTIAL_SUFFIX).unwrap();
+
+        assert_ne!(staged, occupied, "不得覆盖已占用的暂存名");
+        assert_eq!(fs::symlink_metadata(&occupied).unwrap().ino(), inode);
+        assert_eq!(fs::read_to_string(&occupied).unwrap(), "keep");
+        assert_eq!(fs::read_to_string(&staged).unwrap(), "original");
+        assert!(
+            staged.to_string_lossy().ends_with(".2.partial"),
+            "应在 .partial 之前追加递增序号: {}",
+            staged.display()
+        );
+    }
+
     #[test]
     fn a_copy_failure_cleans_only_its_own_partial_directory() {
         let dir = tempfile::tempdir().unwrap();
@@ -1094,10 +1229,26 @@ mod tests {
         fs::create_dir(&source).unwrap();
         fs::write(source.join("file"), "original").unwrap();
         let _socket = std::os::unix::net::UnixListener::bind(source.join("socket")).unwrap();
+        // 失败清理只作用于本次创建的暂存对象: 预置一份既有备份与一个用户文件,
+        // 二者都必须在失败后原样保留 (而不是只断言"本次产物已清理").
+        let existing_backup = dir.path().join("bashrc.dotlink-backup.20250101T000000");
+        fs::write(&existing_backup, "earlier").unwrap();
+        let user_file = dir.path().join("user-file");
+        fs::write(&user_file, "keep").unwrap();
 
         assert!(copy_object(&source, &dest).is_err());
         assert!(!dest.exists());
         assert_eq!(fs::read_to_string(source.join("file")).unwrap(), "original");
+        assert_eq!(
+            fs::read_to_string(&existing_backup).unwrap(),
+            "earlier",
+            "既有备份必须保持原样"
+        );
+        assert_eq!(
+            fs::read_to_string(&user_file).unwrap(),
+            "keep",
+            "用户文件必须保持原样"
+        );
     }
 
     #[test]

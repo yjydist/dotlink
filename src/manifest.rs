@@ -60,7 +60,7 @@ pub fn load() -> Result<Manifest> {
 /// V-9 (目标落点不得退化) 与 V-10 (目标不得自指) 是其后新增的两条落点校验,
 /// 定义见 `contracts/manifest.md`.
 ///
-/// V-11 在全部条目解析后检查目标之间、目标与源之间的路径隔离.
+/// V-11 在全部条目解析后检查目标之间, 目标与源之间的路径隔离.
 /// 不校验源条目是否存在 (那是运行时状态 `SourceMissing`) 或条目数量上限.
 pub fn parse(text: &str, repo_root: &Path) -> Result<Manifest> {
     // 手工从 `toml::Table` 读而不是反序列化进一个 `#[derive(Deserialize)]` 的中间
@@ -99,6 +99,11 @@ pub fn parse(text: &str, repo_root: &Path) -> Result<Manifest> {
     // V-9 的仓库形态比较基准与 `entry::resolve_with` 的越界判定同源.
     let repo = os::normalize(repo_root);
     let home = entry::home().map(|path| os::normalize(&path));
+    // `HOME` 自身可能是符号链接 (例如 `/home/u -> /mnt/u`), 于是同一主目录有两个
+    // 路径形态: `HOME` 的书写形态, 以及解析它的符号链接后的物理形态. V-9 必须两种
+    // 都识别, 否则把主目录落点写成物理形态时会被静默放行, 一次 `replace_and_backup`
+    // 就会备份并替换整个主目录.
+    let home_physical = home.as_ref().ok().map(|home| physical_home(home));
     // V-5 的重复检测: 目标路径 -> 首次声明它的条目下标. 用哈希表把逐条目两两比较的
     // O(N^2) 降到 O(N), 并保持"报第一对冲突"的语义 (get 返回的是最早的下标).
     let mut first_declared_at: HashMap<std::path::PathBuf, usize> =
@@ -134,7 +139,7 @@ pub fn parse(text: &str, repo_root: &Path) -> Result<Manifest> {
 
         // V-6: `entry::resolve_with` 是路径形态"能否解析"的唯一裁决处 (`~` 展开 /
         // 相对仓库根的挂接 / 源侧只接受相对路径都在那里); 这里只补上条目下标与两个
-        // 书写形态. `error` 自身已说明是哪一侧、哪种形态非法, 因此不再加统一前缀.
+        // 书写形态. `error` 自身已说明是哪一侧, 哪种形态非法, 因此不再加统一前缀.
         let resolved = entry::resolve_with(
             &source,
             &target,
@@ -151,7 +156,13 @@ pub fn parse(text: &str, repo_root: &Path) -> Result<Manifest> {
         })?;
 
         // V-9: 目标落点不得退化 (文件系统根 / 主目录 / 仓库根本身或其祖先).
-        reject_degenerate_target(index, &resolved, &repo, home.as_deref().ok())?;
+        reject_degenerate_target(
+            index,
+            &resolved,
+            &repo,
+            home.as_deref().ok(),
+            home_physical.as_deref(),
+        )?;
         // V-10: 目标不得指向本条目自己的 source -- 归一化后重合时建出的链接指向
         // 自己, 恒为断链. 跨条目和祖先关系由全量 V-11 校验处理.
         if resolved.target_path == resolved.source_path {
@@ -242,6 +253,8 @@ fn syntax_error(text: &str, error: &toml::de::Error) -> Error {
                 + 1;
             format!("第 {line} 行")
         }
+        // 当前 toml 解析器的错误都带 span: 该回退只防御依赖版本行为变化, 不是可
+        // 构造的输入路径, 因此没有对应测试 (属 design.md 验证层级里的代码审阅证据).
         None => "位置未知".to_string(),
     };
 
@@ -318,17 +331,41 @@ fn entry_label(index: usize) -> String {
     format!("{ENTRY_KEY}[{index}]")
 }
 
+/// `physical_home` 用来"占位"的探针子项: 它不需要存在, 只是为了让 `HOME` 成为
+/// `normalize` 眼中的祖先段 (末段才不解析).
+const HOME_PHYSICAL_PROBE: &str = ".dotlink-home-probe";
+
+/// `HOME` 的物理形态: 末段也解析为符号链接链的终点.
+///
+/// [`os::normalize`] 刻意不解析末段 (末段往往是待判定的部署链接). 主目录不同: V-9
+/// 拒绝的是"主目录本身", 而 `HOME` 本身可能就是符号链接 (例如 `/home/u -> /mnt/u`),
+/// 用户也可能把该主目录写成解析后的物理路径.
+///
+/// 给 `HOME` 补一个不会存在的探针子项, 使 `HOME` 成为祖先段而被解析; 探针自身只
+/// 保持词法形态, 取父目录即主目录的物理形态. 不能用 `home.join(".")` 达到同一效果:
+/// `Path::components` 会把中间的 `.` 段消掉, 探针必须是一个真实的普通段.
+/// `HOME` 不存在时整条路径退化为词法形态, 与书写形态相同, 不引入新的拒绝面.
+fn physical_home(home: &Path) -> std::path::PathBuf {
+    let mut resolved = os::normalize(&home.join(HOME_PHYSICAL_PROBE));
+    resolved.pop();
+    resolved
+}
+
 /// V-9: 目标落点不得退化 -- 归一化后命中以下位置之一即整体拒绝.
 ///
 /// 三个落点的共同点是命中它们的条目一旦落地 (`replace_and_backup` 尤甚) 就会毁掉
 /// 远超单个链接范围的内容: 文件系统根或主目录本身被替换备份, 毁掉的是一整棵树;
 /// 仓库根本身或其祖先被替换备份, 毁掉的是源仓库. `.` / `..` / 裸 `~` 都是极易写出
 /// 的笔误形态, 与 V-6 的立场一致, 静默放行比报错危险得多.
+///
+/// 主目录有两个比较基准 (`HOME` 的书写形态与解析符号链接后的物理形态), 二者都要
+/// 拒绝: `HOME` 自身可能是符号链接, 只比较一种形态会让另一种写法的主目录落点漏过.
 fn reject_degenerate_target(
     index: usize,
     entry: &Entry,
     repo: &Path,
     home: Option<&Path>,
+    home_physical: Option<&Path>,
 ) -> Result<()> {
     let written = &entry.target;
     let landing = &entry.target_path;
@@ -341,10 +378,13 @@ fn reject_degenerate_target(
             format!("`{written}` 归一化后是文件系统根: 不能以整个文件系统根为落点"),
         ));
     }
-    // 主目录: 裸 `~` 与书成绝对路径的等价形态. HOME 无法确定时不作比较 -- 需要
-    // HOME 的 `~` 形态已由 V-6 报错, 绝对路径不得因缺 HOME 而被拒.
-    if let Some(home) = home
-        && landing.as_path() == home
+    // 主目录: 裸 `~`, 书成绝对路径的等价形态, 以及 `HOME` 是符号链接时同一主目录的
+    // 物理形态. HOME 无法确定时两个基准都为 None, 不作比较 -- 需要 HOME 的 `~` 形态
+    // 已由 V-6 报错, 绝对路径不得因缺 HOME 而被拒.
+    if [home, home_physical]
+        .into_iter()
+        .flatten()
+        .any(|basis| landing.as_path() == basis)
     {
         return Err(invalid_entry(
             index,
@@ -629,10 +669,10 @@ mod tests {
             "[[entry]]\nsource = \"a\"\ntarget = \"b\"\n\n[[entry]]\nsource = \"c\"\ntarget = \"d\"\non_conflict = \"ReplaceAndBackup\"\n",
             &["entry[1]", "on_conflict", "ReplaceAndBackup"],
         );
-        // 非字符串
+        // 非字符串: 说明必须带上 TOML 类型文本, 指出实际写成了什么类型
         assert_invalid(
             "[[entry]]\nsource = \"a\"\ntarget = \"b\"\non_conflict = 1\n",
-            &["entry[0]", "on_conflict"],
+            &["entry[0]", "on_conflict", "实际为 integer"],
         );
     }
 
@@ -804,5 +844,28 @@ mod tests {
         let text = "[[entry]]\nsource = \"definitely/gone\"\ntarget = \"link/gone\"\n";
         let manifest = parse(text, &repo()).expect("不校验源条目是否存在");
         assert_eq!(manifest.entries.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // V-9 的补充: HOME 自身是符号链接时, 物理形态同样要识别 (端到端用例见
+    // tests/manifest_errors.rs 的 v9_a_symlinked_home_is_rejected_through_its_physical_form)
+    // -----------------------------------------------------------------------
+
+    /// `physical_home` 必须解析 `HOME` 的**末段**符号链接: `os::normalize` 对末段
+    /// 刻意保留原样, 而 V-9 需要主目录的物理形态作为第二个比较基准.
+    #[test]
+    fn physical_home_resolves_a_symlinked_final_segment() {
+        let dir = tempfile::tempdir().expect("创建临时目录");
+        let root = std::fs::canonicalize(dir.path()).expect("临时目录的物理路径");
+        let physical = root.join("real-home");
+        std::fs::create_dir(&physical).expect("创建主目录");
+        let alias = root.join("home-alias");
+        std::os::unix::fs::symlink(&physical, &alias).expect("建立指向主目录的别名链接");
+
+        // 写入形态的末段不被解析, 因此与物理形态不同 -- 这正是 V-9 原先的漏点.
+        let written = os::normalize(&alias);
+        assert_ne!(written, os::normalize(&physical));
+        // 补一个 `.` 段后 HOME 成为祖先段, 其符号链接被解析.
+        assert_eq!(physical_home(&written), os::normalize(&physical));
     }
 }

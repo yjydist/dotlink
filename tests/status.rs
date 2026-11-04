@@ -136,9 +136,12 @@ fn a_link_outside_the_repo_is_foreign_and_a_link_inside_is_wrong() {
 
     let line = line_for(&run(&env, &["status"]).stdout, "~/.bashrc").to_string();
     assert_eq!(line.split_whitespace().nth(1), Some("foreign"), "{line}");
+    // 说明展示的是规范化后的实际指向: 链接文本可能带同义词路径 (macOS 上 /var 是
+    // /private/var 的符号链接), 报告行给出解析后的绝对目标.
+    let outside_resolved = fs::canonicalize(&outside).expect("解析外部文件的物理路径");
     assert!(
-        line.contains(&outside.display().to_string()),
-        "foreign (占用物为链接时) 必须给出实际指向: {line}"
+        line.contains(&outside_resolved.display().to_string()),
+        "foreign (占用物为链接时) 必须给出规范化后的实际指向: {line}"
     );
     assert!(
         line.contains("符号链接"),
@@ -177,6 +180,39 @@ fn a_link_outside_the_repo_is_foreign_and_a_link_inside_is_wrong() {
     let _ = fs::remove_file(&outside);
 }
 
+/// `wrong` / `foreign` 的"实际指向"是规范化后的绝对目标, 不是链接文本的原始写法.
+///
+/// 相对链接文本以链接所在目录为基准解析: status 行必须给出解析后的绝对路径,
+/// 使用户不必自行拼接相对前缀.
+#[test]
+fn status_reports_the_normalized_destination_of_a_relative_link() {
+    let env = TempEnv::new();
+    env.write_source("shell/bashrc", "managed\n");
+    env.write_manifest(&manifest_of(&[("shell/bashrc", "~/.bashrc", "-")]));
+
+    // 相对文本从 HOME (仓库内) 上溯两级落到仓库之外.
+    std::os::unix::fs::symlink("../../outside-target", env.home().join(".bashrc"))
+        .expect("建立相对链接");
+    let expected = env
+        .repo()
+        .parent()
+        .expect("仓库根有父目录")
+        .join("outside-target");
+
+    let observed = run(&env, &["status"]);
+    assert_eq!(observed.code, 1, "stdout:\n{}", observed.stdout);
+    let line = line_for(&observed.stdout, "~/.bashrc");
+    assert_eq!(token_of(line), "foreign", "{line}");
+    assert!(
+        line.contains(&expected.display().to_string()),
+        "必须给出规范化后的实际指向: {line}"
+    );
+    assert!(
+        !line.contains("../../outside-target"),
+        "不得回显相对链接文本: {line}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // T033 (c): 目标被普通文件 / 目录占用 -> foreign 并说明占用物类型
 // ---------------------------------------------------------------------------
@@ -212,6 +248,26 @@ fn a_directory_occupying_the_target_is_foreign_with_the_occupant_type() {
         line.contains("目录"),
         "foreign 必须说明占用物是目录: {line}"
     );
+}
+
+/// `status` 只渲染现状: 即使条目允许覆盖, 目标被占用时仍报 `foreign`, 不报动作.
+#[test]
+fn status_reports_foreign_regardless_of_the_overwrite_policy() {
+    let env = TempEnv::new();
+    env.write_source("shell/bashrc", "managed\n");
+    env.write_manifest(&manifest_of(&[(
+        "shell/bashrc",
+        "~/.bashrc",
+        "replace_and_backup",
+    )]));
+    fs::write(env.home().join(".bashrc"), "pre-existing\n").expect("写入占用物");
+
+    let run = run(&env, &["status"]);
+    assert_eq!(run.code, 1, "{}", run.stdout);
+    let line = line_for(&run.stdout, "~/.bashrc");
+    assert_eq!(token_of(line), "foreign", "{line}");
+    assert!(!line.contains("将"), "status 不得渲染动作: {line}");
+    env.assert_content(&env.home().join(".bashrc"), "pre-existing\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -302,6 +358,12 @@ fn status_never_touches_the_filesystem() {
     // 四种状态并存: 已是最新 / 目标被普通文件占用 / 源缺失 / 父目录不存在.
     link_correct(&env, "shell/bashrc", ".bashrc");
     fs::write(env.home().join(".zshrc"), "pre-existing\n").expect("写入占用物");
+    // 预置一份既有备份: "备份目录保持原样"必须进入只读快照, 而不只是"没有新备份".
+    fs::write(
+        env.home().join(".bashrc.dotlink-backup.20260101T000000"),
+        "old-backup\n",
+    )
+    .expect("写入既有备份");
 
     let before = snapshot_all(&env);
 

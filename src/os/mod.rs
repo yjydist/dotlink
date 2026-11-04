@@ -483,6 +483,25 @@ mod tests {
         );
     }
 
+    /// 相对路径没有已知的物理前缀, 因此只做词法规整: 已存在的符号链接段不被解析.
+    ///
+    /// 这条边界是刻意的 (见 [`normalize`] 的文档): 相对路径无法确定"当前目录"的物理
+    /// 形态, 解析链接段只会得到与绝对形态不一致的结果. 全部生产调用点都传绝对路径
+    /// (`entry` 解析后的源与目标, 仓库根, 链接文本解析后的绝对路径).
+    #[test]
+    fn relative_paths_are_normalized_lexically_only() {
+        let (_dir, root) = physical_tempdir();
+        std::fs::create_dir(root.join("actual")).unwrap();
+        std::os::unix::fs::symlink("actual", root.join("alias")).unwrap();
+
+        let relative = Path::new("alias/rc");
+        assert_eq!(normalize(relative), relative);
+
+        // 同一段在绝对形态下会被解析: 证明上一条断言来自"相对路径不解析",
+        // 而不是链接不存在.
+        assert_eq!(normalize(&root.join(relative)), root.join("actual/rc"));
+    }
+
     #[test]
     fn is_inside_repo_counts_the_root_itself_but_not_a_sibling_prefix() {
         assert!(is_inside_repo(

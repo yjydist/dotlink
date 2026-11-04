@@ -157,14 +157,15 @@ fn classify_entry(entry: &Entry, repo_root: &Path) -> EntryState {
     // 二者互斥且穷尽, 且都以同一个 os::normalize 为基准, 因此悬空链接也能正确归类.
     // 判定直接复用上面已解析出的 `actual` 与循环外算好的仓库根, 不再重读链接.
     //
-    // `detail` 与 `render.rs` 的分工 (`render` 不可改, 它按如下方式解释本字段):
-    // `wrong` 行取"实际指向"; `foreign` 行取链接文本并自行冠以"符号链接";
-    // `missing` 行冠以"仓库中不存在: <source>"; 其余行原样透出. 因此这里只放原始值.
-    let link_text = link_text.display().to_string();
+    // `detail` 与 `render.rs` 的分工: `wrong` 与 `foreign` 都取"实际指向" --
+    // 写规范化结果 (`link_destination` 的返回值) 而不是链接文本的原始写法, 使相对
+    // 链接文本也展示为解析后的绝对目标; `missing` 行冠以"仓库中不存在: <source>";
+    // 其余行原样透出.
+    let resolved = actual.display().to_string();
     if os::is_inside_repo(&actual, repo_root) {
-        new_state(Current::LinkedWrong, link_text, entry.on_conflict)
+        new_state(Current::LinkedWrong, resolved, entry.on_conflict)
     } else {
-        new_state(Current::ForeignLink, link_text, entry.on_conflict)
+        new_state(Current::ForeignLink, resolved, entry.on_conflict)
     }
 }
 
@@ -395,6 +396,39 @@ mod tests {
             state.detail,
             outside.display().to_string(),
             "foreign 行的说明即链接实际指向 (占用物类型由 Current 给出)"
+        );
+    }
+
+    /// `wrong` / `foreign` 的说明是**规范化后的实际指向**, 而不是链接文本的原始写法.
+    ///
+    /// 相对链接文本以链接所在目录为基准解析: 报告层拿到的应当是解析后的绝对路径,
+    /// 否则相对写法会迫使读者自行拼接前缀, 与"说明给出实际指向"的措辞不符.
+    #[test]
+    fn relative_link_text_is_reported_as_its_normalized_destination() {
+        let f = Fixture::new();
+        f.write_source("shell/bashrc", "hello");
+        let other = f.write_source("shell/zshrc", "other");
+        let target = f.home_path(".bashrc");
+
+        // 仓库之外的相对目标: 解析后落在 `home/zshrc`.
+        symlink("zshrc", &target).expect("建立相对链接");
+        let state = f.state("shell/bashrc", &target, OnConflict::Skip);
+        assert_eq!(state.current, Current::ForeignLink);
+        assert_eq!(
+            state.detail,
+            f.home_path("zshrc").display().to_string(),
+            "foreign 行的说明必须是解析后的绝对目标, 而不是相对链接文本"
+        );
+
+        // 仓库之内的相对目标: 从 home 经 `../repo/...` 回到仓库.
+        fs::remove_file(&target).expect("移除相对链接");
+        symlink("../repo/shell/zshrc", &target).expect("建立指向仓库内的相对链接");
+        let state = f.state("shell/bashrc", &target, OnConflict::Skip);
+        assert_eq!(state.current, Current::LinkedWrong);
+        assert_eq!(
+            state.detail,
+            other.display().to_string(),
+            "wrong 行的说明必须是解析后的绝对目标, 而不是相对链接文本"
         );
     }
 

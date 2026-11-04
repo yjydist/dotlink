@@ -1,6 +1,7 @@
 //! US4 / FR-009 / FR-010 / SC-005: 撤销部署 (tasks.md 的 T028 全部条目).
 //!
-//! 覆盖 (a)-(h). 本文件经真实二进制断言, 因此**依赖 `src/lib.rs` 的命令接入**
+//! 覆盖 (a)-(h), 以及备份生命周期的补充用例 (不可读备份 / 同目录多目标 / 同秒多备份).
+//! 本文件经真实二进制断言, 因此**依赖 `src/lib.rs` 的命令接入**
 //! (T015 / T026 / T031). 在那些接入完成之前, 这里的断言必然失败 -- 这是预期的
 //! TDD 红阶段 (测试先于实现存在), 不得为了让本文件变绿而改动 `src/lib.rs`.
 
@@ -11,7 +12,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use support::{
-    TempEnv, assert_token, backup_path_from_output, backups_in, line_for, manifest_of, run, unlock,
+    TempEnv, assert_token, backup_path_from_output, backups_in, line_for, manifest_of,
+    physical_repo, run, running_as_root, token_of, unlock,
 };
 
 /// 已部署的环境: 源在仓库中, 目标是指向源的链接.
@@ -67,6 +69,63 @@ fn undo_restores_each_targets_latest_backup_from_shared_and_separate_directories
             line_for(&result.stdout, &format!("~/{name}")).contains(&backup.display().to_string())
         );
     }
+    // `.partial` 残留不参与查找, 也不得在 undo 中被删除或改写.
+    for name in ["a", "b", "nested/a"] {
+        env.assert_content(
+            &env.home()
+                .join(format!("{name}.dotlink-backup.20990101T000000.partial")),
+            "incomplete",
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 同一目录下三个目标: 各自取自己的最新备份, 互不串用
+// ---------------------------------------------------------------------------
+
+/// 三个条目的 target 同在一个目录 (`~/a` / `~/b` / `~/c`): 备份查找对目录做一次
+/// 快照, 因此必须为每个**原始文件名**各自选出最新备份; 任何"取全目录最新一份"的
+/// 实现都会把 `.10` 错配给别的目标. 同秒两份备份 (`.9` / `.10`) 使序号比较一并被
+/// 覆盖: 字典序上 `.9` 大于 `.10`, 只有按数值比才能取对.
+#[test]
+fn three_targets_in_one_directory_each_restore_their_own_latest_backup() {
+    let env = TempEnv::new();
+    env.write_source("rc", "managed\n");
+    env.write_manifest(&manifest_of(&[
+        ("rc", "~/a", "-"),
+        ("rc", "~/b", "-"),
+        ("rc", "~/c", "-"),
+    ]));
+    assert_eq!(run(&env, &["apply"]).code, 0);
+
+    let home = env.home();
+    for name in ["a", "b", "c"] {
+        for serial in [9, 10] {
+            fs::write(
+                home.join(format!("{name}.dotlink-backup.20260101T000000.{serial}")),
+                format!("{name}/{serial}"),
+            )
+            .unwrap();
+        }
+    }
+
+    let undone = run(&env, &["undo"]);
+    assert_eq!(undone.code, 1, "{}", undone.stdout);
+    for name in ["a", "b", "c"] {
+        let latest = home.join(format!("{name}.dotlink-backup.20260101T000000.10"));
+        env.assert_content(&home.join(name), &format!("{name}/10"));
+        let line = line_for(&undone.stdout, &format!("~/{name}"));
+        assert_eq!(token_of(line), "restore", "{line}");
+        assert!(
+            line.contains(&latest.display().to_string()),
+            "restore 行必须给出该目标自己的最新备份 (.10) 的完整路径: {line}"
+        );
+        // 备份只被复制, 不被消费或改写: 同秒的两份都原样保留.
+        for serial in [9, 10] {
+            let backup = home.join(format!("{name}.dotlink-backup.20260101T000000.{serial}"));
+            env.assert_content(&backup, &format!("{name}/{serial}"));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -120,6 +179,83 @@ fn undo_restores_the_previous_content_and_reports_the_backup_source() {
 }
 
 // ---------------------------------------------------------------------------
+// (a2) 恢复过备份后再次撤销: 恢复出的普通文件被判为占用, 报 skip 且不被吞掉
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_second_undo_after_a_restore_reports_skip_and_keeps_the_file() {
+    let env = TempEnv::new();
+    env.write_source("shell/bashrc", "managed\n");
+    env.write_manifest(&manifest_of(&[(
+        "shell/bashrc",
+        "~/.bashrc",
+        "replace_and_backup",
+    )]));
+
+    let target = env.home().join(".bashrc");
+    fs::write(&target, "original\n").unwrap();
+    assert_eq!(run(&env, &["apply"]).code, 0);
+
+    let first = run(&env, &["undo"]);
+    assert_token(&first, "restore");
+    assert_eq!(first.code, 1, "{}", first.stdout);
+    let backup = backup_path_from_output(&first.stdout);
+    env.assert_content(&target, "original\n");
+
+    let second = run(&env, &["undo"]);
+    assert_eq!(second.code, 1, "{}", second.stdout);
+    let line = line_for(&second.stdout, "~/.bashrc");
+    assert_eq!(token_of(line), "skip", "{line}");
+
+    // 恢复出的文件不被再次消费或删除, 备份也仍在原地.
+    env.assert_content(&target, "original\n");
+    env.assert_content(&backup, "original\n");
+}
+
+// ---------------------------------------------------------------------------
+// (a3) 恢复出的内容本身是仓库内的链接: 第二次撤销按同一归属规则再次 restore
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_second_undo_of_a_restored_in_repo_link_reports_restore_again() {
+    let env = TempEnv::new();
+    env.write_source("shell/bashrc", "managed\n");
+    env.write_source("shell/stale", "stale\n");
+    env.write_manifest(&manifest_of(&[(
+        "shell/bashrc",
+        "~/.bashrc",
+        "replace_and_backup",
+    )]));
+
+    // 前置: 目标是指向仓库内另一个文件的链接 (LinkedWrong), 因此 apply 会备份链接本身.
+    let target = env.home().join(".bashrc");
+    let stale = physical_repo(&env).join("shell/stale");
+    std::os::unix::fs::symlink(&stale, &target).expect("建立指向仓库内其他文件的链接");
+    assert_eq!(run(&env, &["apply"]).code, 0);
+
+    let first = run(&env, &["undo"]);
+    assert_token(&first, "restore");
+    let backup = backup_path_from_output(&first.stdout);
+    assert_eq!(
+        fs::read_link(&target).unwrap(),
+        stale,
+        "恢复出的内容必须仍是指向仓库内的链接"
+    );
+
+    let second = run(&env, &["undo"]);
+    assert_eq!(second.code, 1, "{}", second.stdout);
+    let line = line_for(&second.stdout, "~/.bashrc");
+    assert_eq!(token_of(line), "restore", "{line}");
+
+    // 目标内容不变, 备份仍在原地 (只消费最新一份, 不删除).
+    assert_eq!(fs::read_link(&target).unwrap(), stale);
+    assert!(
+        fs::symlink_metadata(&backup).is_ok(),
+        "恢复后备份必须留在磁盘上"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // (b) 已部署但无备份: 链接被移除, 行为 undo, 原路径不再存在
 // ---------------------------------------------------------------------------
 
@@ -150,6 +286,57 @@ fn undo_removes_a_link_without_a_backup() {
     assert!(
         env.repo().join("shell/bashrc").is_file(),
         "源条目必须原样保留"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (b2) 只有 `.partial` 残留: 视为没有可用备份, 只移除链接而不恢复
+// ---------------------------------------------------------------------------
+
+#[test]
+fn undo_ignores_a_partial_only_backup_and_still_removes_the_link() {
+    let env = TempEnv::new();
+    env.write_manifest(&manifest_of(&[("shell/bashrc", "~/.bashrc", "-")]));
+    let target = deployed(&env, "shell/bashrc", ".bashrc");
+    let partial = env
+        .home()
+        .join(".bashrc.dotlink-backup.20990101T000000.partial");
+    fs::write(&partial, "half\n").unwrap();
+
+    let undone = run(&env, &["undo"]);
+    assert_eq!(undone.code, 1, "{}", undone.stdout);
+    let line = line_for(&undone.stdout, "~/.bashrc");
+    assert_eq!(token_of(line), "undo", "{line}");
+    assert!(
+        fs::symlink_metadata(&target).is_err(),
+        "只有残留时必须只移除链接"
+    );
+    // 残留不参与查找, 也不得被删除或当成"没有备份"的理由清理.
+    env.assert_content(&partial, "half\n");
+}
+
+// ---------------------------------------------------------------------------
+// (b3) 源缺失: undo 报 missing 并计入失败列 (不因目标不存在而归为 ok)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn undo_reports_missing_for_a_source_missing_entry() {
+    let env = TempEnv::new();
+    env.write_manifest(&manifest_of(&[("shell/gone", "~/.gone", "-")]));
+
+    let undone = run(&env, &["undo"]);
+    assert_eq!(undone.code, 1, "{}", undone.stdout);
+    let line = line_for(&undone.stdout, "~/.gone");
+    assert_eq!(token_of(line), "missing", "{line}");
+    assert!(
+        undone
+            .stdout
+            .lines()
+            .last()
+            .unwrap_or_default()
+            .contains("1 失败"),
+        "源缺失必须计入失败列: {}",
+        undone.stdout
     );
 }
 
@@ -221,6 +408,70 @@ fn undo_skips_a_link_pointing_outside_the_repo() {
         "外部链接可能是用户自己的配置, 绝不删除"
     );
     assert_eq!(fs::read_link(&target).unwrap(), elsewhere);
+}
+
+// ---------------------------------------------------------------------------
+// (d2) 悬空链接的归属: 仓库内仍属本工具 (可移除), 仓库外不是 (跳过)
+// ---------------------------------------------------------------------------
+
+/// 仓库内已失效的链接 (`path-normalization` 的 "指向仓库内但已失效"): 即使目标不
+/// 存在, 仍按链接文本落在仓库内判为 `LinkedWrong`, 撤销必须移除它而不是跳过.
+#[test]
+fn undo_removes_a_dangling_link_that_points_inside_the_repo() {
+    let env = TempEnv::new();
+    env.write_source("shell/bashrc", "managed\n");
+    env.write_manifest(&manifest_of(&[("shell/bashrc", "~/.bashrc", "-")]));
+    let target = env.home().join(".bashrc");
+
+    // 链接文本落在仓库内, 但指向的源文件从未存在 -> 悬空的仓库内链接.
+    let gone = env.repo().join("shell/deleted");
+    std::os::unix::fs::symlink(&gone, &target).expect("建立悬空链接");
+    assert!(
+        fs::symlink_metadata(&gone).is_err(),
+        "夹具要求链接文本指向不存在的路径"
+    );
+
+    let undone = run(&env, &["undo"]);
+
+    assert_token(&undone, "undo");
+    assert_eq!(undone.code, 1, "撤销了本工具的链接, 目标谓词在动手前为假");
+    assert!(
+        fs::symlink_metadata(&target).is_err(),
+        "仓库内的悬空链接是本工具产物, undo 必须移除它"
+    );
+    assert!(
+        env.repo().join("shell/bashrc").exists(),
+        "移除链接不得触碰仓库中的源"
+    );
+}
+
+/// 仓库外已失效的链接: 链接文本落在仓库外, 仍判为"别人的链接", 撤销必须跳过且
+/// 保持链接文本原样 (即使它指向的目标不存在).
+#[test]
+fn undo_skips_a_dangling_link_that_points_outside_the_repo() {
+    let env = TempEnv::new();
+    env.write_source("shell/bashrc", "managed\n");
+    env.write_manifest(&manifest_of(&[("shell/bashrc", "~/.bashrc", "-")]));
+    let target = env.home().join(".bashrc");
+
+    let outside = tempfile::tempdir().expect("创建仓库之外的目录");
+    let gone = outside.path().join("gone");
+    std::os::unix::fs::symlink(&gone, &target).expect("建立悬空链接");
+    assert!(
+        !gone.starts_with(env.repo()),
+        "构造 foreign 的路径必须在仓库之外"
+    );
+    assert!(fs::symlink_metadata(&gone).is_err(), "夹具要求链接悬空");
+
+    let undone = run(&env, &["undo"]);
+
+    assert_token(&undone, "skip");
+    assert_eq!(undone.code, 1, "跳过的条目使退出码非零");
+    assert_eq!(
+        fs::read_link(&target).expect("外部悬空链接必须原样保留"),
+        gone,
+        "别人的链接即使悬空也不得被删除或改写"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -462,12 +713,14 @@ fn undo_restores_the_newest_of_ten_same_second_backups() {
         line.contains(&newest.display().to_string()),
         "restore 行必须给出真正最新的备份 (.10) 的完整路径: {line}"
     );
-    for path in &backups {
+    for (round, path) in backups.iter().enumerate() {
         assert!(
             fs::symlink_metadata(path).is_ok(),
             "备份文件本身必须保留: {}",
             path.display()
         );
+        // 备份只被复制, 不得被消费或改写: 第 round 份的内容仍是 backup-{round}.
+        env.assert_content(path, &format!("backup-{round}"));
     }
 }
 
@@ -483,13 +736,18 @@ fn undo_restores_the_newest_of_ten_same_second_backups() {
 fn undo_reports_fail_with_the_cause_when_backups_cannot_be_listed() {
     let env = TempEnv::new();
     env.write_source("shell/zshrc", "managed-zsh\n");
-    env.write_manifest(&manifest_of(&[("shell/zshrc", "~/.locked/rc", "-")]));
+    env.write_source("shell/bashrc", "managed-bash\n");
+    env.write_manifest(&manifest_of(&[
+        ("shell/zshrc", "~/.locked/rc", "-"),
+        ("shell/bashrc", "~/.free/rc", "-"),
+    ]));
 
     let applied = run(&env, &["apply"]);
     assert_eq!(applied.code, 0, "{}", applied.stdout);
 
     let locked = env.home().join(".locked");
     let target = locked.join("rc");
+    let free_target = env.home().join(".free/rc");
     assert!(
         fs::symlink_metadata(&target)
             .unwrap()
@@ -523,14 +781,23 @@ fn undo_reports_fail_with_the_cause_when_backups_cannot_be_listed() {
         line.contains("Permission denied"),
         "fail 行必须给出底层原因: {line}"
     );
+
+    // 故障只作用于那一个目录; 另一目录的条目照常撤销.
+    let free_line = line_for(&undone.stdout, "~/.free/rc");
+    assert_eq!(
+        token_of(free_line),
+        "undo",
+        "其余条目必须照常处理: {free_line}"
+    );
     assert!(
-        undone
-            .stdout
-            .lines()
-            .last()
-            .unwrap_or_default()
-            .contains("1 失败"),
-        "该条目必须计入汇总的 `失败` 列: {}",
+        fs::symlink_metadata(&free_target).is_err(),
+        "其余目录的链接应被正常移除"
+    );
+
+    let summary = undone.stdout.lines().last().unwrap_or_default();
+    assert_eq!(
+        summary, "2 个条目: 1 成功, 0 已是最新, 0 未处理, 1 失败",
+        "故障条目计入失败列, 其余条目照常完成: {}",
         undone.stdout
     );
     assert!(
@@ -540,4 +807,74 @@ fn undo_reports_fail_with_the_cause_when_backups_cannot_be_listed() {
             .is_symlink(),
         "环境故障下不得移除链接 (与 Unreadable 同类处置)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 恢复阶段的备份读取故障: 报 fail, 链接回滚, 恢复权限后可重试
+// ---------------------------------------------------------------------------
+
+/// 备份文件已完整命名但内容不可读 (chmod 000): 恢复阶段的复制必然失败. 该条目必须
+/// 报 `fail` 并给出底层原因; 链接被回滚到原路径, 备份不被消费, 因此恢复权限后再次
+/// `undo` 仍能成功恢复 -- 这是"撤销失败可重试"的端到端证据.
+#[test]
+fn undo_reports_fail_and_can_be_retried_when_the_backup_is_unreadable() {
+    if running_as_root() {
+        eprintln!("以 root 运行: chmod 000 不生效, 跳过备份不可读的 undo 断言");
+        return;
+    }
+
+    let env = TempEnv::new();
+    env.write_source("shell/bashrc", "managed\n");
+    env.write_manifest(&manifest_of(&[(
+        "shell/bashrc",
+        "~/.bashrc",
+        "replace_and_backup",
+    )]));
+
+    let target = env.home().join(".bashrc");
+    fs::write(&target, "original\n").unwrap();
+    let applied = run(&env, &["apply"]);
+    assert_eq!(applied.code, 0, "前置部署必须成功: {}", applied.stdout);
+    let backup = backup_path_from_output(&applied.stdout);
+    env.assert_content(&backup, "original\n");
+
+    fs::set_permissions(&backup, fs::Permissions::from_mode(0o000)).unwrap();
+    let first = run(&env, &["undo"]);
+    // 立即放宽备份权限: 后续断言与重试都要求可读.
+    fs::set_permissions(&backup, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let line = line_for(&first.stdout, "~/.bashrc");
+    assert_eq!(token_of(line), "fail", "{line}");
+    assert_eq!(first.code, 1, "stdout:\n{}", first.stdout);
+    assert!(
+        line.contains("Permission denied"),
+        "fail 行必须给出底层原因: {line}"
+    );
+
+    // 失败不得消费链接与备份: 目标仍是本工具的链接, 备份原样留在磁盘上.
+    assert!(
+        fs::symlink_metadata(&target)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "恢复失败时链接必须回滚到原路径, 以便重试"
+    );
+    env.assert_symlink_to(&target, &env.repo().join("shell/bashrc"));
+    env.assert_content(&backup, "original\n");
+
+    // 权限恢复后重试: 链接还在, 因此走通恢复; 退出码 1 表示本次确实撤销了东西.
+    let second = run(&env, &["undo"]);
+    let second_line = line_for(&second.stdout, "~/.bashrc");
+    assert_eq!(token_of(second_line), "restore", "{second_line}");
+    assert_eq!(
+        second.code, 1,
+        "撤销了东西 (restore) 故退 1; stdout:\n{}",
+        second.stdout
+    );
+    env.assert_content(&target, "original\n");
+    assert!(
+        fs::symlink_metadata(&target).unwrap().file_type().is_file(),
+        "恢复后目标必须是普通文件, 不再是链接"
+    );
+    env.assert_content(&backup, "original\n");
 }

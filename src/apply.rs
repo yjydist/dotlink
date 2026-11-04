@@ -318,7 +318,7 @@ mod tests {
         }
     }
 
-    /// 备份已落定、替换后续步骤失败时, 错误必须给出备份路径 (FR-016).
+    /// 备份已落定, 替换后续步骤失败时, 错误必须给出备份路径 (FR-016).
     ///
     /// 构造: 目标目录内含一个只读可进的子目录 (`0o555`), 备份能读取它, 但删除原对象
     /// 时无法清空它 -- 于是备份成功而替换失败, 正是"原内容已备份但目标未就位"的情形.
@@ -363,6 +363,13 @@ mod tests {
             backup_path.display()
         );
 
+        // 备份保真复制了只读子目录的权限位: 两处都要恢复, 否则 TempDir 无法清空
+        // 0o555 目录, 会在 TMPDIR 留下残留 (只恢复原对象一处仍会留下备份副本).
+        fs::set_permissions(
+            backup_path.join("locked"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(fs::read_to_string(locked.join("secret")).unwrap(), "secret");
     }

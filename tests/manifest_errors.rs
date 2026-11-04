@@ -150,9 +150,63 @@ fn v1_a_missing_manifest_is_rejected() {
 
     // 说明必须给出相对当前工作目录的清单路径, 而不是泛泛的"失败".
     let run = run(&env, &["preview"]);
+    assert_eq!(
+        run.stderr.lines().count(),
+        1,
+        "清单不存在必须是单行说明: {}",
+        run.stderr
+    );
     assert!(
         run.stderr.contains("dotlink.toml"),
         "V-1 的说明必须给出清单位置: {}",
+        run.stderr
+    );
+}
+
+// ---------------------------------------------------------------------------
+// V-1 的后一半: 清单存在但不可读 (与"不存在"同为校验失败, 但说明可区分)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_unreadable_manifest_is_rejected_with_exit_code_two() {
+    if running_as_root() {
+        println!(
+            "跳过 an_unreadable_manifest_is_rejected_with_exit_code_two: 当前以 root 运行, chmod 000 无效"
+        );
+        return;
+    }
+
+    let env = env_with_source();
+    env.write_manifest("[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"~/.bashrc\"\n");
+    let manifest = env.repo().join("dotlink.toml");
+    fs::set_permissions(
+        &manifest,
+        std::os::unix::fs::PermissionsExt::from_mode(0o000),
+    )
+    .expect("设置权限位");
+
+    // 若权限位在本环境被绕过, 用例会退化成"正常读取", 断言无意义.
+    if fs::read_to_string(&manifest).is_ok() {
+        let _ = fs::set_permissions(
+            &manifest,
+            std::os::unix::fs::PermissionsExt::from_mode(0o644),
+        );
+        println!("跳过 an_unreadable_manifest_is_rejected_with_exit_code_two: 权限位在本环境无效");
+        return;
+    }
+
+    assert_all_commands_reject(&env, "无法读取清单");
+
+    let run = run(&env, &["preview"]);
+    assert_eq!(
+        run.stderr.lines().count(),
+        1,
+        "清单读取失败必须是单行说明: {}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("Permission denied") || run.stderr.contains("os error"),
+        "说明必须给出底层原因: {}",
         run.stderr
     );
 }
@@ -194,6 +248,13 @@ fn v3_a_manifest_without_the_entry_key_is_rejected() {
     env.write_manifest("# 只有注释, 没有任何条目\n");
 
     assert_all_commands_reject(&env, "entry");
+
+    let run = run(&env, &["preview"]);
+    assert!(
+        run.stderr.contains("至少需要一个条目"),
+        "V-3 必须指出至少需要一个条目: {}",
+        run.stderr
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -230,8 +291,27 @@ fn v4_a_missing_source_is_rejected() {
     );
 }
 
+/// 与上面相反的方向: 第一个条目合法, 第二个条目缺 `target`.
 #[test]
-fn v4_a_source_outside_the_repo_shape_is_rejected() {
+fn v4_a_missing_target_in_the_second_entry_is_rejected() {
+    let env = env_with_source();
+    env.write_manifest(
+        "[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"~/.bashrc\"\n\n\
+         [[entry]]\nsource = \"shell/bashrc\"\n",
+    );
+
+    assert_all_commands_reject(&env, "target");
+
+    let run = run(&env, &["preview"]);
+    assert!(
+        run.stderr.contains("entry[1]") && run.stderr.contains("target"),
+        "V-4 必须指出第二个条目的下标与键名: {}",
+        run.stderr
+    );
+}
+
+#[test]
+fn v6_a_source_outside_the_repo_shape_is_rejected() {
     let env = env_with_source();
     // 源条目只接受仓库内相对路径: `~/...` 与绝对路径都属非法形态 (T059).
     for written in ["~/src/rc", "/etc/hosts"] {
@@ -251,7 +331,7 @@ fn v4_a_source_outside_the_repo_shape_is_rejected() {
 }
 
 #[test]
-fn v4_a_source_that_resolves_outside_the_repo_is_rejected() {
+fn v6_a_source_that_resolves_outside_the_repo_is_rejected() {
     let env = env_with_source();
     // `..` 折叠能把 `repo_root.join(source)` 带出仓库: 建出的链接指向仓库外,
     // undo 的归属判定 (落在仓库内才算本工具创建) 会拒删自己的产物, 因此与
@@ -274,7 +354,7 @@ fn v4_a_source_that_resolves_outside_the_repo_is_rejected() {
 }
 
 #[test]
-fn v4_a_source_escaping_through_a_repo_symlink_is_rejected() {
+fn v6_a_source_escaping_through_a_repo_symlink_is_rejected() {
     let env = env_with_source();
     // 仓库内的符号链接同样能把源带出仓库: `os::normalize` 解析祖先段的符号链接,
     // 越界判定沿用同一语义.
@@ -290,6 +370,11 @@ fn v4_a_source_escaping_through_a_repo_symlink_is_rejected() {
     assert!(
         run.stderr.contains("entry[0]") && run.stderr.contains("escape/evil"),
         "必须指出条目下标与书写形态: {}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("归一化后为"),
+        "源越界时还必须给出越界结果: {}",
         run.stderr
     );
 }
@@ -313,6 +398,34 @@ fn a_missing_segment_cannot_hide_an_escaping_source_alias() {
 }
 
 #[test]
+fn a_missing_tail_does_not_resolve_a_symlink_after_it() {
+    let env = env_with_source();
+    let outside = tempfile::tempdir().expect("创建仓库外目录");
+    std::os::unix::fs::symlink(outside.path(), env.repo().join("alias")).expect("建立仓库外别名");
+    // `missing` 不存在: 规范化到此停止, 其后的 `alias` 只保留词法形态, 不得被解析为
+    // 越界. 若错误地继续解析, 清单会以"仓库根之外"退 2, 而不是按源缺失退 1.
+    env.write_manifest("[[entry]]\nsource = \"missing/alias/rc\"\ntarget = \"~/.bashrc\"\n");
+
+    let run = run(&env, &["apply"]);
+    assert_eq!(
+        run.code, 1,
+        "源缺失是运行时状态而不是清单校验失败:\nstdout:\n{}\nstderr:\n{}",
+        run.stdout, run.stderr
+    );
+    assert!(
+        !run.stderr.contains("无法读取清单") && !run.stderr.contains("仓库根之外"),
+        "缺失尾段之后的别名不得被解析为越界: {}",
+        run.stderr
+    );
+    assert_eq!(
+        token_of(line_for(&run.stdout, "~/.bashrc")),
+        "missing",
+        "缺失尾段使源不存在, 该条目应报 missing:\n{}",
+        run.stdout
+    );
+}
+
+#[test]
 fn target_aliases_after_missing_segments_still_count_as_duplicates() {
     let env = env_with_source();
     fs::create_dir(env.repo().join("actual")).unwrap();
@@ -322,7 +435,7 @@ fn target_aliases_after_missing_segments_still_count_as_duplicates() {
 }
 
 #[test]
-fn v4_parent_segments_that_fold_back_inside_the_repo_are_accepted() {
+fn v6_parent_segments_that_fold_back_inside_the_repo_are_accepted() {
     let env = env_with_source();
     // 仓库内的 `..` 折叠 (`a/../b` 形态) 归一化后仍在仓库内, 不得被越界规则误伤.
     env.write_manifest(
@@ -429,6 +542,25 @@ fn v7_an_illegal_on_conflict_value_is_rejected() {
     );
 }
 
+#[test]
+fn v7_a_mixed_case_on_conflict_value_is_rejected_in_the_second_entry() {
+    let env = env_with_source();
+    env.write_manifest(
+        "[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"~/.bashrc\"\n\n[[entry]]\nsource = \"shell/zshrc\"\ntarget = \"~/.zshrc\"\non_conflict = \"ReplaceAndBackup\"\n",
+    );
+
+    assert_all_commands_reject(&env, "on_conflict");
+
+    let run = run(&env, &["preview"]);
+    assert!(
+        run.stderr.contains("entry[1]")
+            && run.stderr.contains("on_conflict")
+            && run.stderr.contains("ReplaceAndBackup"),
+        "V-7 必须指出第二个条目的下标与该取值: {}",
+        run.stderr
+    );
+}
+
 // ---------------------------------------------------------------------------
 // V-8: 只出现已定义的键 (两层各自校验)
 // ---------------------------------------------------------------------------
@@ -446,8 +578,8 @@ fn v8_an_unknown_key_inside_an_entry_is_rejected() {
 
     let run = run(&env, &["preview"]);
     assert!(
-        run.stderr.contains("条目内"),
-        "V-8 必须指出键名与所在层级: {}",
+        run.stderr.contains("条目内") && run.stderr.contains("entry[0]"),
+        "V-8 必须指出条目下标, 键名与所在层级: {}",
         run.stderr
     );
 }
@@ -467,6 +599,20 @@ fn v8_an_unknown_top_level_table_is_rejected() {
         "V-8 必须指出键名与所在层级: {}",
         run.stderr
     );
+}
+
+/// 未知键出现在**最后一个**条目时, 前面本可部署的条目也不得被创建 (零改动).
+#[test]
+fn an_unknown_key_in_the_last_entry_still_rejects_the_whole_manifest() {
+    let env = env_with_source();
+    env.write_source("shell/zshrc", "managed-zsh\n");
+    env.write_manifest(
+        "[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"~/.bashrc\"\n\n\
+         [[entry]]\nsource = \"shell/zshrc\"\ntarget = \"~/.zshrc\"\n\
+         onconflict = \"skip\"\n",
+    );
+
+    assert_all_commands_reject(&env, "onconflict");
 }
 
 // ---------------------------------------------------------------------------
@@ -565,6 +711,73 @@ fn v9_legal_target_shapes_are_not_harmed() {
     );
 }
 
+#[test]
+fn v9_a_symlinked_home_is_rejected_through_its_physical_form() {
+    let env = env_with_source();
+    // `HOME` 自身是符号链接: 同一主目录有两个路径形态. 只比较 `HOME` 的字面形态会
+    // 让写在物理路径下的落点漏过 -- 一次 `replace_and_backup` 就会备份并替换整个
+    // 主目录 (与裸 `~` 同一种失效模式).
+    let alias = env.repo().join("home-alias");
+    std::os::unix::fs::symlink(env.home(), &alias).expect("建立指向临时 HOME 的别名链接");
+    let physical = env.home().display().to_string();
+
+    for written in ["~".to_string(), physical] {
+        env.write_manifest(&format!(
+            "[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"{written}\"\n"
+        ));
+        let before = snapshot_all(&env);
+
+        for command in COMMANDS {
+            let run = observe(
+                env.cmd()
+                    .env("HOME", &alias)
+                    .arg(command)
+                    .output()
+                    .expect("运行 dotlink"),
+            );
+            assert_eq!(
+                run.code, 2,
+                "`{command}` 必须整体拒绝 {written:?} 形态的主目录落点; 实际 {};\nstderr:\n{}",
+                run.code, run.stderr
+            );
+            assert_eq!(run.stdout, "", "校验失败不得产生标准输出 (`{command}`)");
+            assert!(
+                run.stderr.contains("主目录") && run.stderr.contains("entry[0]"),
+                "V-9 必须指出主目录落点与条目下标 (`{command}`): {}",
+                run.stderr
+            );
+        }
+
+        assert_eq!(before, snapshot_all(&env), "零改动 ({written})");
+    }
+}
+
+#[test]
+fn v9_a_symlinked_home_still_allows_targets_below_it() {
+    let env = env_with_source();
+    let alias = env.repo().join("home-alias");
+    std::os::unix::fs::symlink(env.home(), &alias).expect("建立指向临时 HOME 的别名链接");
+    // 主目录之下的 `~/...` 不是"主目录本身", 不得被物理形态的比较误伤.
+    env.write_manifest("[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"~/.bashrc\"\n");
+
+    let run = observe(
+        env.cmd()
+            .env("HOME", &alias)
+            .arg("apply")
+            .output()
+            .expect("运行 dotlink"),
+    );
+    assert_eq!(
+        run.code, 0,
+        "HOME 是符号链接不得影响主目录之下的合法落点:\nstdout:\n{}\nstderr:\n{}",
+        run.stdout, run.stderr
+    );
+    env.assert_symlink_to(
+        &env.home().join(".bashrc"),
+        &env.repo().join("shell/bashrc"),
+    );
+}
+
 // ---------------------------------------------------------------------------
 // V-10: 目标不得指向本条目自己的 source (自指链接恒为断链)
 // ---------------------------------------------------------------------------
@@ -585,6 +798,24 @@ fn v10_a_self_referential_target_is_rejected() {
 }
 
 #[test]
+fn v10_a_self_reference_that_normalizes_to_the_source_is_rejected() {
+    let env = env_with_source();
+    // 书写形态与 source 不同, 但归一化后重合: 自指判定必须基于规范化后的路径.
+    env.write_manifest(
+        "[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"shell/../shell/bashrc\"\n",
+    );
+
+    assert_all_commands_reject(&env, "自指");
+
+    let run = run(&env, &["preview"]);
+    assert!(
+        run.stderr.contains("entry[0]") && run.stderr.contains("shell/../shell/bashrc"),
+        "V-10 必须指出条目下标与书写形态: {}",
+        run.stderr
+    );
+}
+
+#[test]
 fn overlapping_source_and_target_paths_are_rejected_before_writes() {
     let env = env_with_source();
     env.make_source_dir("nvim");
@@ -593,6 +824,18 @@ fn overlapping_source_and_target_paths_are_rejected_before_writes() {
         for policy in ["skip", "replace_and_backup"] {
             env.write_manifest(&format!("[[entry]]\nsource = \"{source}\"\ntarget = \"{target}\"\non_conflict = \"{policy}\"\n"));
             assert_all_commands_reject(&env, "路径重叠");
+            // 说明必须同时给出条目下标与源在仓库根下的解析路径: 仅凭书写形态的
+            // target 无法让用户定位到与哪一条源路径冲突.
+            let result = run(&env, &["preview"]);
+            let resolved_source = env.repo().join(source);
+            assert!(
+                result.stderr.contains("entry[0]")
+                    && result
+                        .stderr
+                        .contains(&resolved_source.display().to_string()),
+                "V-11 必须指出条目下标与源的解析路径; 实际:\n{}",
+                result.stderr
+            );
         }
     }
     for target in ["nvim", "nvim/init.lua", "nvim/child"] {
@@ -624,6 +867,15 @@ fn nested_targets_are_rejected_regardless_of_order_or_existing_aliases() {
         for text in [format!("{parent}\n{child}"), format!("{child}\n{parent}")] {
             env.write_manifest(&text);
             assert_all_commands_reject(&env, "路径重叠");
+            // 嵌套方向不同, 但说明必须同时指出两侧条目下标与目标书写形态.
+            let result = run(&env, &["preview"]);
+            assert!(
+                result.stderr.contains("entry[0]")
+                    && result.stderr.contains("entry[1]")
+                    && result.stderr.contains("~/.config/nvim"),
+                "V-11 必须指出双方条目下标与目标书写形态; 实际:\n{}",
+                result.stderr
+            );
         }
     }
 }
@@ -732,6 +984,11 @@ fn home_is_unresolvable_without_the_home_variable() {
             "说明必须指出主目录无法确定: {}",
             run.stderr
         );
+        assert!(
+            run.stderr.contains("未设置或为空"),
+            "说明必须指出 HOME 未设置或为空: {}",
+            run.stderr
+        );
     }
 
     assert_eq!(before, snapshot_all(&env), "零改动");
@@ -752,7 +1009,14 @@ fn tilde_targets_reject_empty_or_relative_home_before_any_writes() {
                 "{}",
                 result.stderr
             );
-            if !home.is_empty() {
+            if home.is_empty() {
+                // 空串与未设置同义: 两种形态不得分开成两套说明
+                assert!(
+                    result.stderr.contains("未设置或为空"),
+                    "HOME 为空串时说明必须是 `未设置或为空`; 实际:\n{}",
+                    result.stderr
+                );
+            } else {
                 assert!(
                     result.stderr.contains("HOME 必须是绝对路径"),
                     "{}",
@@ -782,18 +1046,21 @@ fn targets_without_tilde_do_not_require_valid_home() {
 fn a_target_that_does_not_need_home_is_accepted_without_the_home_variable() {
     let env = env_with_source();
     // 绝对路径的目标不依赖 HOME: 该清单在无 HOME 时仍必须被接受 (否则上一条断言
-    // 只是"任何情况下都退 2", 没有把 V-6 钉在 `~` 上).
+    // 只是"任何情况下都退 2", 没有把 V-6 钉在 `~` 上). 用 apply 而不是 preview:
+    // "接受"必须真的落到链接上, 不能只是没报错.
+    let target = env.repo().join("linked/bashrc");
     env.write_manifest(&format!(
         "[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"{}\"\n",
-        env.repo().join("linked/bashrc").display()
+        target.display()
     ));
 
-    let run = run_without_home(&env, &["preview"]);
-    assert_ne!(
-        run.code, 2,
-        "绝对路径的目标不需要 HOME, 不得因缺少 HOME 而被拒绝;\nstderr:\n{}",
+    let run = run_without_home(&env, &["apply"]);
+    assert_eq!(
+        run.code, 0,
+        "绝对路径的目标不需要 HOME, 缺少 HOME 时 apply 也必须成功;\nstderr:\n{}",
         run.stderr
     );
+    env.assert_symlink_to(&target, &env.repo().join("shell/bashrc"));
 }
 
 // ---------------------------------------------------------------------------

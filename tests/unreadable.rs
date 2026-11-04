@@ -10,6 +10,10 @@
 //! 以 root 运行时权限位无效 (chmod 000 不阻止读取), 该断言必须跳过 -- 见
 //! `running_as_root`. 跳过时会向标准输出打印提示, 使"跳过"这件事不会被误读为"通过".
 //!
+//! 末尾另有一条"仅源侧不可读"的用例: 源路径穿过一个普通文件 (lstat 得到 ENOTDIR,
+//! 非 NotFound), 目标侧正常. 它不依赖权限位, 因此不需要 root 跳过, 并且覆盖
+//! "只有一侧故障"时说明只透出该侧原因 (与"双侧故障"用例互为对偶).
+//!
 //! 本文件经真实二进制断言, 因此依赖 `src/lib.rs` 的命令接入. 在那些接入完成之前,
 //! 这里的断言必然失败 -- 这是预期的 TDD 红阶段, 不得为了让本文件变绿而改动 `src/`.
 
@@ -254,5 +258,116 @@ fn a_doubly_unreadable_entry_reports_the_reason_of_both_sides() {
     assert!(
         line.contains("目标侧 Permission denied"),
         "fail 行必须给出目标侧的原因 (只透出一侧会让另一侧无从诊断): {line}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 仅源侧不可读: 源侧 ENOTDIR, 目标侧正常
+//
+// 与上一个用例互为对偶: 双侧故障时要求两侧原因都透出; 只有源侧故障时, 说明必须
+// 给出源侧原因, 且不得捏造目标侧原因. 故障由"中间段是普通文件"构造 (lstat 得到
+// ENOTDIR, 不是 NotFound), 因此不依赖权限位, 也不需要 root 跳过.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_source_side_only_failure_is_fail_under_every_command() {
+    for command in COMMANDS {
+        let env = TempEnv::new();
+        // 源侧故障: 中间段是普通文件, lstat 报 "Not a directory" (非 NotFound 的硬失败).
+        env.write_source("shell/file", "not a directory\n");
+        // 目标侧正常: 目标路径不存在 (Absent), 其父目录 (HOME) 存在.
+        env.write_manifest("[[entry]]\nsource = \"shell/file/rc\"\ntarget = \"~/.bashrc\"\n");
+
+        let target = env.home().join(".bashrc");
+        assert!(
+            fs::symlink_metadata(&target).is_err(),
+            "前置条件: 目标路径必须不存在"
+        );
+
+        let before = snapshot_all(&env);
+        let run = run(&env, &[command]);
+        let after = snapshot_all(&env);
+
+        assert_eq!(
+            run.code, 1,
+            "源侧环境故障是判定阶段的失败: 退出码必须是 1 (非 2/3);\
+             `{command}` 实际退 {};\nstdout:\n{}\nstderr:\n{}",
+            run.code, run.stdout, run.stderr
+        );
+        assert_eq!(
+            run.stderr, "",
+            "`Unreadable` 不是清单校验失败, 不得走标准错误的拒绝路径 (`{command}`)"
+        );
+
+        let line = line_for(&run.stdout, "~/.bashrc");
+        assert_eq!(
+            token_of(line),
+            "fail",
+            "仅源侧不可读时 token 不随命令变化, 四条命令下都是 fail (`{command}`): {line}"
+        );
+        // 说明必须给出源侧原因. 实际拼写为 "源侧读取失败: Not a directory (...)",
+        // 因此用 "源侧" 与 "Not a directory" 两个片段共同断言 "源侧 ENOTDIR".
+        assert!(
+            line.contains("源侧") && line.contains("Not a directory"),
+            "fail 行必须给出源侧的原因 (`{command}`): {line}"
+        );
+        assert!(
+            !line.contains("目标侧"),
+            "目标侧正常时不得捏造目标侧的原因 (`{command}`): {line}"
+        );
+
+        assert_eq!(
+            entry_line_count(&run.stdout),
+            1,
+            "单条目清单只有一行条目行 (`{command}`):\n{}",
+            run.stdout
+        );
+        assert_eq!(
+            run.stdout.lines().last().unwrap_or_default(),
+            "1 个条目: 0 成功, 0 已是最新, 0 未处理, 1 失败",
+            "`fail` 只能计入汇总的 `失败` 列 (`{command}`)"
+        );
+
+        // 目标路径, 其父目录 (HOME) 与备份目录都不得出现任何改动.
+        assert!(
+            fs::symlink_metadata(&target).is_err(),
+            "`{command}` 不得在目标路径上留下任何东西"
+        );
+        assert_eq!(
+            before, after,
+            "`{command}` 必须零改动 (含目标路径, 父目录与备份目录)"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 双侧都读不到 (不依赖权限位): 源侧与目标侧都穿过普通文件, lstat 得到 ENOTDIR
+//
+// 与上一条双侧故障用例互补: 那条用目标侧 chmod 000 构造 EACCES, root 下必须跳过;
+// 这条两侧都用"中间段是普通文件"触发 ENOTDIR, 在 root 下同样可执行, 使"双侧原因
+// 都透出"不只在非 root 环境成立.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_doubly_unreadable_entry_is_reported_without_permission_bits() {
+    let env = TempEnv::new();
+    // 源侧故障: `shell/file` 是普通文件, `shell/file/rc` 的 lstat 报 ENOTDIR.
+    env.write_source("shell/file", "not a directory\n");
+    // 目标侧故障: `~/.occupied` 是普通文件, `~/.occupied/rc` 的 lstat 同样报 ENOTDIR.
+    fs::write(env.home().join(".occupied"), "not a directory\n").expect("写入目标侧占位文件");
+    env.write_manifest("[[entry]]\nsource = \"shell/file/rc\"\ntarget = \"~/.occupied/rc\"\n");
+
+    let run = run(&env, &["status"]);
+
+    assert_eq!(
+        run.code, 1,
+        "双侧环境故障是判定阶段的失败, 退出码必须是 1 (非 2/3);\nstdout:\n{}\nstderr:\n{}",
+        run.stdout, run.stderr
+    );
+    let line = line_for(&run.stdout, "~/.occupied/rc");
+    assert_eq!(token_of(line), "fail", "双侧都读不到必须是 fail: {line}");
+    assert!(
+        line.contains("源侧") && line.contains("目标侧") && line.contains("Not a directory"),
+        "fail 行必须同时给出两侧原因 (只透出一侧会让另一侧无从诊断): {line}"
     );
 }

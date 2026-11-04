@@ -10,12 +10,13 @@
 mod support;
 
 use std::fs;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use support::{
-    Run, TempEnv, entry_lines, line_for, manifest_of, physical_repo, run, snapshot_all, target_of,
-    token_of,
+    Run, TempEnv, entry_lines, line_for, manifest_of, physical_repo, run, running_as_root,
+    snapshot_all, target_of, token_of, unlock,
 };
 
 /// 断言每一次条目行的 token 都是 `token`.
@@ -174,6 +175,26 @@ fn a_missing_parent_directory_is_created_automatically() {
 }
 
 // ---------------------------------------------------------------------------
+// V-6: `~/` 之后多写的分隔符仍属主目录简写
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_duplicate_separator_after_tilde_still_lands_in_home() {
+    let env = TempEnv::new();
+    env.write_source("shell/bashrc", "managed\n");
+    env.write_manifest(&manifest_of(&[("shell/bashrc", "~//.bashrc", "-")]));
+
+    let run = run(&env, &["apply"]);
+
+    assert_code(&run, 0);
+    assert_all_tokens(&run, "create");
+    assert_link(&env, &env.home().join(".bashrc"), "shell/bashrc");
+    // 剩余段若被当成绝对路径, 链接会落到文件系统根下: 主目录里就不该只有这一项之外
+    // 的东西, 这里以"主目录恰好只有该链接"锁住展开基准.
+    assert_eq!(env.list_dir(env.home()), vec![".bashrc"]);
+}
+
+// ---------------------------------------------------------------------------
 // T013 (d): 目录条目建立的是整目录软链接 (FR-018)
 // ---------------------------------------------------------------------------
 
@@ -229,6 +250,22 @@ fn a_second_apply_is_idempotent_and_produces_no_new_files() {
     assert_code(&first, 0);
     assert_all_tokens(&first, "create");
 
+    // 记录 inode: 幂等不仅是"内容相同", 正确的链接不得被删除后重建 (重建会换 inode,
+    // 并让外部持有者看到的路径短暂消失).
+    let targets = [
+        env.home().join(".bashrc"),
+        env.home().join(".config/nvim"),
+        env.home().join(".zshrc"),
+    ];
+    let inodes: Vec<u64> = targets
+        .iter()
+        .map(|path| {
+            fs::symlink_metadata(path)
+                .unwrap_or_else(|error| panic!("{} 应存在: {error}", path.display()))
+                .ino()
+        })
+        .collect();
+
     let before = snapshot_all(&env);
 
     let second = run(&env, &["apply"]);
@@ -242,6 +279,17 @@ fn a_second_apply_is_idempotent_and_produces_no_new_files() {
     );
     assert_all_tokens(&second, "ok");
     assert_summary(&second, "3 个条目: 0 成功, 3 已是最新, 0 未处理, 0 失败");
+
+    for (path, inode) in targets.iter().zip(inodes) {
+        assert_eq!(
+            fs::symlink_metadata(path)
+                .unwrap_or_else(|error| panic!("{} 应仍存在: {error}", path.display()))
+                .ino(),
+            inode,
+            "第二次 apply 不得替换已正确的链接: {}",
+            path.display()
+        );
+    }
 
     let after = snapshot_all(&env);
     assert_eq!(
@@ -445,6 +493,11 @@ fn a_missing_source_does_not_block_the_other_entries() {
 
     assert_code(&run, 1);
     assert_eq!(token_of(line_for(&run.stdout, "~/.gone")), "missing");
+    let missing_line = line_for(&run.stdout, "~/.gone");
+    assert!(
+        missing_line.contains("仓库中不存在: shell/gone"),
+        "missing 行必须给出缺失的源条目: {missing_line}"
+    );
     assert_eq!(token_of(line_for(&run.stdout, "~/.bashrc")), "create");
     assert_eq!(token_of(line_for(&run.stdout, "~/.zshrc")), "create");
     assert_summary(&run, "3 个条目: 2 成功, 0 已是最新, 0 未处理, 1 失败");
@@ -455,6 +508,106 @@ fn a_missing_source_does_not_block_the_other_entries() {
     assert!(
         fs::symlink_metadata(env.home().join(".gone")).is_err(),
         "源缺失的条目不得建立任何链接"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T039: 执行期失败不阻塞其余条目 (FR-014)
+//
+// 与上一条的区别: 这里的失败发生在 `create_symlink` (动作执行期), 而不是分类阶段的
+// `SourceMissing` / `Unreadable`. 它覆盖 `src/lib.rs` apply 循环里 `Err -> fail_row`
+// 之后继续处理后续条目的路径.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_link_creation_failure_does_not_block_the_other_entries() {
+    if running_as_root() {
+        println!(
+            "跳过 a_link_creation_failure_does_not_block_the_other_entries: 当前以 root 运行, chmod 0555 不阻止写入"
+        );
+        return;
+    }
+
+    let env = TempEnv::new();
+    env.write_source("a", "a\n");
+    env.write_source("locked/rc", "locked\n");
+    env.write_source("c", "c\n");
+    env.write_manifest(&manifest_of(&[
+        ("a", "~/.a", "-"),
+        ("locked/rc", "~/.locked/rc", "-"),
+        ("c", "~/.c", "-"),
+    ]));
+
+    // 父目录可进入/可 stat (分类得到 Absent), 但不可写 (建链失败).
+    let locked = env.home().join(".locked");
+    fs::create_dir_all(&locked).expect("创建目标父目录");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).expect("设置只读父目录");
+    let probe = locked.join("probe");
+    if fs::write(&probe, "x").is_ok() {
+        let _ = fs::remove_file(&probe);
+        unlock(&locked);
+        println!(
+            "跳过 a_link_creation_failure_does_not_block_the_other_entries: 权限位在本环境无效"
+        );
+        return;
+    }
+
+    // W-1: 预览预测的是动作而不是执行结果. 同一夹具上 `preview` 报 `create`,
+    // 随后 `apply` 因父目录只读报 `fail`; 这是 `fail` 的适用面, 不是 token 表的分歧.
+    let preview = run(&env, &["preview"]);
+    assert_code(&preview, 1);
+    assert_eq!(
+        token_of(line_for(&preview.stdout, "~/.locked/rc")),
+        "create",
+        "预览必须预测动作: {}",
+        preview.stdout
+    );
+
+    let run = run(&env, &["apply"]);
+    unlock(&locked);
+
+    assert_code(&run, 1);
+    assert_eq!(token_of(line_for(&run.stdout, "~/.a")), "create");
+    let failed = line_for(&run.stdout, "~/.locked/rc");
+    assert_eq!(token_of(failed), "fail", "{failed}");
+    assert!(
+        failed.contains("操作失败"),
+        "执行期失败必须附带原因: {failed}"
+    );
+    assert_eq!(token_of(line_for(&run.stdout, "~/.c")), "create");
+    assert_summary(&run, "3 个条目: 2 成功, 0 已是最新, 0 未处理, 1 失败");
+
+    // 失败条目之前的条目与之后的条目都已完成.
+    assert_link(&env, &env.home().join(".a"), "a");
+    assert_link(&env, &env.home().join(".c"), "c");
+    assert!(
+        env.list_dir(&locked).is_empty(),
+        "失败的条目不得在目标目录留下任何内容: {:?}",
+        env.list_dir(&locked)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// cli-contract: 四条命令都不维护持久化状态
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_four_commands_do_not_create_a_state_or_index_file() {
+    let env = TempEnv::new();
+    env.write_source("shell/bashrc", "managed\n");
+    env.write_manifest(&manifest_of(&[("shell/bashrc", "~/.bashrc", "-")]));
+
+    let before = snapshot_all(&env);
+    for command in ["preview", "status", "apply", "undo"] {
+        let _ = run(&env, &[command]);
+    }
+    let after = snapshot_all(&env);
+
+    // apply 建立链接, undo 再移除它, 因此四条命令依次跑完后文件系统应与开始时一致;
+    // 任何多出的路径都是状态文件/索引文件的证据.
+    assert_eq!(
+        before, after,
+        "四条命令不得留下状态或索引文件; after = {after:?}"
     );
 }
 

@@ -520,22 +520,35 @@ mod tests {
         // 判定时刻: 它是本工具的链接.
         os::create_symlink(&repo.join("managed"), &target).unwrap();
 
-        // 判定之后、撤销之前: 用户在原路径放上了自己的真实文件.
+        // 判定之后, 撤销之前: 用户在原路径放上了自己的真实文件.
         fs::remove_file(&target).unwrap();
         fs::write(&target, "user own content").unwrap();
 
         let entry = entry_for(&repo, "managed", &target);
-        let error = undo_entry(&entry, &state(Current::LinkedCorrect), None).unwrap_err();
+        // 同目录确有一份备份: "复核失败时不消费备份"必须有真实备份才可验证.
+        let backup = repo.join("bashrc.dotlink-backup.20260101T000000");
+        fs::write(&backup, "original").unwrap();
+
+        let error = undo_entry(&entry, &state(Current::LinkedCorrect), Some(&backup)).unwrap_err();
 
         assert!(matches!(error, Error::EntryFailed(_)));
         assert!(
             error.to_string().contains("拒绝"),
             "说明应指出拒绝移除的原因: {error}"
         );
+        assert!(
+            error.to_string().contains("判定之后被替换"),
+            "说明必须指出判定与动手之间目标已改变: {error}"
+        );
         assert_eq!(
             fs::read_to_string(&target).unwrap(),
             "user own content",
             "判定之后出现在目标路径上的真实文件不得被删除"
+        );
+        assert_eq!(
+            fs::read_to_string(&backup).unwrap(),
+            "original",
+            "复核失败时备份不得被消费或删除"
         );
     }
 

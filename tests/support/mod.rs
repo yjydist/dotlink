@@ -277,6 +277,21 @@ pub fn backup_path_from_output(stdout: &str) -> PathBuf {
     panic!("输出中未给出可定位的备份文件完整路径: {stdout}");
 }
 
+/// 从命令输出中取出备份路径的词, **不要求该路径已存在** (preview 的预测值).
+///
+/// 与 [`backup_path_from_output`] 共用同一套收尾标点处理; preview 只报告"将会使用"
+/// 的名字, 因此不能像 apply / undo 那样用存在性筛选.
+#[track_caller]
+pub fn backup_candidate_from_output(stdout: &str) -> PathBuf {
+    for word in stdout.split_whitespace() {
+        if !word.contains(".dotlink-backup.") {
+            continue;
+        }
+        return PathBuf::from(word.trim_end_matches([',', ';', '.', ')']));
+    }
+    panic!("输出中未给出备份路径: {stdout}");
+}
+
 /// 以 root 运行时权限位无效 (chmod 000 不阻止读取), 依赖 `EACCES` 的断言必须跳过.
 pub fn running_as_root() -> bool {
     let probe = std::env::temp_dir().join(format!("dotlink-root-probe-{}", std::process::id()));

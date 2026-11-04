@@ -43,11 +43,17 @@ use crate::render::ReportRow;
 /// 顺序是契约的一部分 (FR-015 / FR-019, `research.md` R6): 平台检查早于参数解析与
 /// 清单读取, 使不受支持的平台上不产生任何标准输出, 也不触碰文件系统.
 pub fn run() -> i32 {
+    run_on(platform_supported())
+}
+
+/// 带平台门禁结果的入口: 平台支持与否作为参数传入, 使门禁的退出码, 输出契约与
+/// "先于参数解析"可被单元测试锁定 (本机是受支持平台, 端到端测试走不到该分支). 测试
+/// 进程自身的命令行不是 dotlink 的子命令, 因此若门禁晚于 `cli::parse`, 这里会以 2
+/// 结束进程而不是返回 3.
+fn run_on(supported: bool) -> i32 {
     // 1. 平台门禁. 唯一来源是 `Error::exit_code` (退 3).
-    if !platform_supported() {
-        let error = Error::UnsupportedPlatform;
-        eprintln!("dotlink: {error}");
-        return error.exit_code();
+    if let Some(code) = platform_gate(supported, &mut std::io::stderr()) {
+        return code;
     }
 
     // 2. 参数解析. `clap` 自行处理 `-h` / `-V` 与"子命令缺失或拼错 / 未知选项":
@@ -79,6 +85,21 @@ pub fn run() -> i32 {
     // 6. 渲染与退出码. 逐条结果侧的 0 / 1 全部由 `exit_code_for` 给出.
     print!("{}", render::render(&rows));
     exit_code_of(command, &rows)
+}
+
+/// 平台门禁的唯一实现: `Some(退出码)` 表示进程应在此结束, `None` 表示继续.
+///
+/// 排除平台时只向 `stderr` 写**一行**说明, 不向标准输出写任何内容, 也不触碰清单或
+/// 文件系统. 三个不变量都集中在本函数内且可被单元测试逐条锁定 (生产路径传入
+/// `platform_supported()` 与真实标准错误). 写标准错误失败时与 `eprintln!` 一致地
+/// 忽略 -- 输出能力不应改变退出码.
+fn platform_gate(supported: bool, stderr: &mut impl std::io::Write) -> Option<i32> {
+    if supported {
+        return None;
+    }
+    let error = Error::UnsupportedPlatform;
+    let _ = writeln!(stderr, "dotlink: {error}");
+    Some(error.exit_code())
 }
 
 /// FR-019 / `research.md` R6: 仅 macOS 与 Linux 受支持.
@@ -255,4 +276,41 @@ fn undo(manifest: &Manifest, states: &[EntryState]) -> Vec<ReportRow> {
             ),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 不受支持的平台: 退出码 3, 且不进入参数解析.
+    ///
+    /// 测试进程的命令行 (`--test-threads` 等) 不是 dotlink 的子命令: 若门禁晚于
+    /// `cli::parse`, `clap` 会以 2 结束整个进程, 这个断言就取不到 3. 测试进程的 cwd
+    /// 是 crate 根 (没有 `dotlink.toml`), 而门禁不读清单, 因此这里同时覆盖"平台检查与
+    /// 清单无关": 结果仍是 3 而不是清单错误 2.
+    #[test]
+    fn an_unsupported_platform_exits_three_before_parsing_arguments() {
+        assert_eq!(run_on(false), 3);
+    }
+
+    /// 门禁的输出契约: 标准错误恰好一行, 标准输出为空白 (本函数没有 stdout 写入面),
+    /// 受支持时门禁不写任何字节并让调用方继续.
+    #[test]
+    fn the_platform_gate_writes_exactly_one_stderr_line_and_nothing_to_stdout() {
+        let mut stderr = Vec::new();
+        assert_eq!(platform_gate(false, &mut stderr), Some(3));
+
+        let text = String::from_utf8(stderr).expect("平台说明必须是 UTF-8");
+        assert_eq!(
+            text,
+            format!("dotlink: {}\n", Error::UnsupportedPlatform),
+            "门禁失败必须恰好写一行完整说明 (含一个换行)"
+        );
+        assert_eq!(text.lines().count(), 1, "标准错误必须只有一行: {text:?}");
+
+        // 门禁只接受 stderr: 没有任何写入标准输出的面, 故 stdout 为空由类型保证.
+        let mut untouched = Vec::new();
+        assert_eq!(platform_gate(true, &mut untouched), None);
+        assert!(untouched.is_empty(), "受支持时门禁不得写标准错误");
+    }
 }

@@ -1,7 +1,8 @@
 //! 错误类型与退出码映射.
 //!
-//! `Error::exit_code` 是派发**之前**的结局 (清单校验失败 / 平台不支持) 的唯一来源;
-//! `exit_code_for` 是逐条结果侧的 0/1 的唯一来源, 二者不重复硬编码同一个数字.
+//! `Error::exit_code` 覆盖派发**之前**的结局 (清单校验失败 / 平台不支持), 并保留
+//! `EntryFailed` 的便捷映射; 顶层 `run` 只使用前两者, 逐条结果侧的 0/1 的唯一来源是
+//! `exit_code_for`, 二者不重复硬编码同一个数字.
 
 use crate::cli::Command;
 
@@ -27,9 +28,11 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl Error {
-    /// 该错误对应的进程退出码.
+    /// 该错误对应的退出码.
     ///
-    /// 只覆盖**派发之前**的结局; 逐条结果侧的 0/1 由 `exit_code_for` 负责.
+    /// `ManifestInvalid` / `UnsupportedPlatform` 是派发之前的进程结局; `EntryFailed`
+    /// 的 1 只是条目级失败的便捷映射, 顶层 `run` 不使用它 (逐条结果侧的 0/1 唯一
+    /// 来源是 `exit_code_for`).
     pub fn exit_code(&self) -> i32 {
         match self {
             Error::ManifestInvalid(_) => 2,
@@ -182,6 +185,27 @@ mod tests {
     fn missing_source_forces_exit_code_one_for_every_command() {
         for command in COMMANDS {
             assert_eq!(exit_code_for(command, &[EntryOutcome::Missing]), 1);
+        }
+    }
+
+    /// 契约 (`entry-classification` 的"目标谓词对特殊状态的计数基准"): `SourceMissing`
+    /// 与 `Unreadable` (token `missing` / `fail`) **不参与**条件 1, 其残留待办只由
+    /// 条件 2 表达. 若谓词误计它们, 条件 1 与条件 2 会在同一批条目上重复生效; 退出码
+    /// 的行为级断言无法区分, 因此这里直接对两个条件做分解断言.
+    #[test]
+    fn special_states_are_excluded_from_the_target_predicate() {
+        for command in COMMANDS {
+            for outcome in [EntryOutcome::Missing, EntryOutcome::Fail] {
+                assert!(
+                    goal_reached(command, &[outcome]),
+                    "{command:?}: {outcome:?} 不得使目标谓词为假"
+                );
+                assert!(
+                    !no_pending_work(&[outcome]),
+                    "{command:?}: {outcome:?} 属于遗留待办"
+                );
+                assert_eq!(exit_code_for(command, &[outcome]), 1);
+            }
         }
     }
 

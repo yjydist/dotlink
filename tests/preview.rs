@@ -11,8 +11,8 @@ use std::path::PathBuf;
 
 use predicates::str::contains;
 use support::{
-    TempEnv, entry_lines, line_for, manifest_of, physical_repo, run, snapshot_all, target_of,
-    token_of,
+    TempEnv, backup_candidate_from_output, backups_in, entry_lines, line_for, manifest_of,
+    physical_repo, run, snapshot_all, target_of, token_of,
 };
 
 // ---------------------------------------------------------------------------
@@ -256,4 +256,168 @@ fn a_manifest_without_any_entry_key_is_rejected_with_exit_code_two() {
         .code(2)
         .stdout("")
         .stderr(contains("entry"));
+}
+
+// ---------------------------------------------------------------------------
+// 预览行必须同时给出当前状态与将执行的动作 (link-deployment)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn preview_reports_the_current_state_and_the_planned_action() {
+    let env = TempEnv::new();
+    env.write_source("shell/bashrc", "managed\n");
+    env.write_source("shell/zshrc", "managed-zsh\n");
+    env.write_manifest(&manifest_of(&[
+        ("shell/bashrc", "~/.bashrc", "-"),
+        ("shell/zshrc", "~/.zshrc", "-"),
+    ]));
+
+    // ~/.bashrc 未部署; ~/.zshrc 已是最新.
+    std::os::unix::fs::symlink(
+        physical_repo(&env).join("shell/zshrc"),
+        env.home().join(".zshrc"),
+    )
+    .expect("建立已是最新的链接");
+
+    let run = run(&env, &["preview"]);
+    assert_eq!(run.code, 1, "{}", run.stdout);
+
+    let create = line_for(&run.stdout, "~/.bashrc");
+    assert!(create.contains("未部署"), "必须给出当前状态: {create}");
+    assert!(
+        create.contains("将创建链接"),
+        "必须给出将执行的动作: {create}"
+    );
+
+    let ok = line_for(&run.stdout, "~/.zshrc");
+    assert!(ok.contains("已是最新"), "必须给出当前状态: {ok}");
+    assert!(!ok.contains("将"), "已是最新的条目不得报告动作: {ok}");
+}
+
+// ---------------------------------------------------------------------------
+// 预览不创建缺失的父目录 (link-deployment 的 "预览不建目录")
+// ---------------------------------------------------------------------------
+
+#[test]
+fn preview_does_not_create_missing_parent_directories() {
+    let env = TempEnv::new();
+    env.write_source("nvim/init.lua", "managed\n");
+    env.write_manifest(&manifest_of(&[(
+        "nvim/init.lua",
+        "~/.config/nvim/init.lua",
+        "-",
+    )]));
+
+    let run = run(&env, &["preview"]);
+    assert_eq!(run.code, 1, "{}", run.stdout);
+    let line = line_for(&run.stdout, "~/.config/nvim/init.lua");
+    assert_eq!(token_of(line), "create", "{line}");
+    assert!(
+        fs::symlink_metadata(env.home().join(".config")).is_err(),
+        "preview 不得创建任何父目录"
+    );
+}
+
+/// `YYYYMMDDThhmmss`: 15 个字符, 第 9 个是 `T`, 其余是数字.
+fn is_timestamp(stamp: &str) -> bool {
+    let bytes = stamp.as_bytes();
+    bytes.len() == 15
+        && bytes[8] == b'T'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| index == 8 || byte.is_ascii_digit())
+}
+
+#[test]
+fn preview_reports_the_backup_path_it_would_use() {
+    let env = TempEnv::new();
+    env.write_source("shell/bashrc", "managed\n");
+    env.write_manifest(&manifest_of(&[(
+        "shell/bashrc",
+        "~/.bashrc",
+        "replace_and_backup",
+    )]));
+    fs::write(env.home().join(".bashrc"), "pre-existing\n").expect("写入占用物");
+
+    let preview = run(&env, &["preview"]);
+    assert_eq!(preview.code, 1, "stdout:\n{}", preview.stdout);
+    let line = line_for(&preview.stdout, "~/.bashrc");
+    assert_eq!(token_of(line), "replace");
+
+    // preview 给出的必须是完整路径, 且落在被覆盖对象所在目录.
+    let predicted = backup_candidate_from_output(line);
+    assert_eq!(
+        predicted.parent(),
+        Some(env.home()),
+        "备份必须与被覆盖对象同目录: {}",
+        predicted.display()
+    );
+    let predicted_name = predicted
+        .file_name()
+        .expect("预测路径必须有文件名")
+        .to_string_lossy()
+        .into_owned();
+    let predicted_stamp = predicted_name
+        .strip_prefix(".bashrc.dotlink-backup.")
+        .unwrap_or_else(|| panic!("预测的备份名形态不对: {predicted_name}"));
+    assert!(
+        is_timestamp(predicted_stamp),
+        "预测的备份名必须带 15 位时间戳: {predicted_name}"
+    );
+    assert!(
+        fs::symlink_metadata(&predicted).is_err(),
+        "preview 不得创建备份: {}",
+        predicted.display()
+    );
+
+    // apply 实际生成的备份必须遵循同一规则 (同目录, 同一前缀, 同一时间戳形态).
+    let apply = run(&env, &["apply"]);
+    assert_eq!(apply.code, 0, "stdout:\n{}", apply.stdout);
+    let backups = backups_in(env.home());
+    assert_eq!(backups.len(), 1, "应只有一份备份: {backups:?}");
+    let actual = &backups[0];
+    let actual_stamp = actual
+        .strip_prefix(".bashrc.dotlink-backup.")
+        .unwrap_or_else(|| panic!("实际备份名形态不对: {actual}"));
+    assert!(
+        is_timestamp(actual_stamp),
+        "实际备份名必须带 15 位时间戳: {actual}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 汇总四列: 四个条目分别落入 成功 / 已是最新 / 未处理 / 失败, 各行计数为 1
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_summary_puts_one_entry_in_each_of_the_four_columns() {
+    let env = TempEnv::new();
+    env.write_source("shell/bashrc", "managed\n");
+    env.write_source("shell/zshrc", "managed-zsh\n");
+    env.write_source("git/gitconfig", "managed-git\n");
+    env.write_manifest(&manifest_of(&[
+        // 未部署 -> create -> 成功.
+        ("shell/bashrc", "~/.bashrc", "-"),
+        // 已是最新 -> ok.
+        ("shell/zshrc", "~/.zshrc", "-"),
+        // 被普通文件占用 + 默认策略 -> conflict -> 未处理.
+        ("git/gitconfig", "~/.gitconfig", "-"),
+        // 源缺失 -> missing -> 失败.
+        ("shell/gone", "~/.gone", "-"),
+    ]));
+
+    let source = physical_repo(&env).join("shell/zshrc");
+    std::os::unix::fs::symlink(&source, env.home().join(".zshrc")).expect("建立已是最新的链接");
+    fs::write(env.home().join(".gitconfig"), "pre-existing\n").expect("写入占用物");
+
+    let run = run(&env, &["preview"]);
+
+    assert_eq!(
+        run.stdout.lines().last().unwrap_or_default(),
+        "4 个条目: 1 成功, 1 已是最新, 1 未处理, 1 失败",
+        "四列必须各计一个且和等于总数:\n{}",
+        run.stdout
+    );
+    assert_eq!(run.code, 1, "存在待办与失败, preview 必须退 1");
 }

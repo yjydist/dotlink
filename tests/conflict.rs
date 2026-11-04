@@ -1,6 +1,6 @@
 //! US3 / FR-007 / FR-008 / SC-004: 冲突的安全处理 (tasks.md 的 T022 全部条目).
 //!
-//! 覆盖 (a)-(i). 本文件经真实二进制断言, 因此**依赖 `src/lib.rs` 的命令接入**
+//! 覆盖 (a)-(j). 本文件经真实二进制断言, 因此**依赖 `src/lib.rs` 的命令接入**
 //! (T015 / T026 / T031). 在那些接入完成之前, 这里的断言必然失败 -- 这是预期的
 //! TDD 红阶段 (测试先于实现存在), 不得为了让本文件变绿而改动 `src/lib.rs`.
 
@@ -10,7 +10,8 @@ use std::fs;
 use std::path::Path;
 
 use support::{
-    TempEnv, assert_token, backup_path_from_output, backups_in, manifest_of, run, running_as_root,
+    TempEnv, assert_token, backup_path_from_output, backups_in, line_for, manifest_of, run,
+    running_as_root, token_of, unlock,
 };
 
 // ---------------------------------------------------------------------------
@@ -29,6 +30,13 @@ fn plain_file_occupied_target_is_refused_by_default() {
     let run = run(&env, &["apply"]);
     assert_token(&run, "conflict");
     assert_eq!(run.code, 1, "被拒绝的条目使退出码为 1");
+
+    // apply 侧同样必须给出冲突原因与占用物类型 (不只是 preview 侧).
+    let line = line_for(&run.stdout, "~/.bashrc");
+    assert!(
+        line.contains("未覆盖") && line.contains("普通文件"),
+        "apply 的 conflict 行必须给出未覆盖与占用物类型: {line}"
+    );
 
     env.assert_content(&target, "pre-existing\n");
     assert!(masks_as_regular_file(&target), "该路径必须仍是普通文件");
@@ -117,7 +125,10 @@ fn foreign_link_is_refused_by_default() {
     env.write_source("shell/bashrc", "managed\n");
     env.write_manifest(&manifest_of(&[("shell/bashrc", "~/.bashrc", "-")]));
 
-    let elsewhere = env.repo().join("elsewhere");
+    // 链接必须真的落在仓库之外, 否则它只是"本工具的失效链接" (`wrong`), 走不到
+    // `foreign` 这一分类. 仓库根与 HOME 各自是临时目录, 仓库外另取一个临时目录.
+    let outside = tempfile::tempdir().expect("创建仓库之外的目录");
+    let elsewhere = outside.path().join("elsewhere");
     fs::write(&elsewhere, "foreign\n").unwrap();
     let target = env.home().join(".bashrc");
     std::os::unix::fs::symlink(&elsewhere, &target).unwrap();
@@ -181,9 +192,57 @@ fn replace_and_backup_copies_the_link_itself() {
 }
 
 // ---------------------------------------------------------------------------
-// (f) 目录递归备份, 且不残留 .partial
+// (e2) 指向仓库之外的链接在允许覆盖时同样只备份链接本身 (link-deployment 的
+//      "替换别人的符号链接")
 // ---------------------------------------------------------------------------
 
+#[test]
+fn replace_and_backup_copies_a_foreign_link_without_following_it() {
+    let env = TempEnv::new();
+    env.write_source("shell/bashrc", "managed\n");
+    env.write_manifest(&manifest_of(&[(
+        "shell/bashrc",
+        "~/.bashrc",
+        "replace_and_backup",
+    )]));
+
+    // 链接落在仓库之外: 状态是 `ForeignLink` (别人的链接), 与 (e) 的
+    // `LinkedWrong` 走同一条 `ReplaceAndBackup` 动作, 但分类路径不同.
+    let outside = tempfile::tempdir().expect("创建仓库之外的目录");
+    let elsewhere = outside.path().join("elsewhere");
+    fs::write(&elsewhere, "foreign\n").unwrap();
+    let target = env.home().join(".bashrc");
+    std::os::unix::fs::symlink(&elsewhere, &target).unwrap();
+
+    let run = run(&env, &["apply"]);
+    assert_token(&run, "replace");
+    assert_eq!(run.code, 0, "{}", run.stdout);
+
+    let backup = backup_path_from_output(&run.stdout);
+    assert!(
+        fs::symlink_metadata(&backup)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "备份的必须是链接本身, 而非其目标的内容: {}",
+        backup.display()
+    );
+    assert_eq!(
+        fs::read_link(&backup).unwrap(),
+        elsewhere,
+        "备份应保留链接的原始文本"
+    );
+    assert_eq!(
+        fs::read_to_string(&elsewhere).unwrap(),
+        "foreign\n",
+        "原链接指向的内容不得被删除或改动"
+    );
+    env.assert_symlink_to(&target, &env.repo().join("shell/bashrc"));
+}
+
+// ---------------------------------------------------------------------------
+// (f) 目录递归备份, 且不残留 .partial
+// ---------------------------------------------------------------------------
 #[test]
 fn replace_and_backup_copies_a_directory_recursively_without_partial_residue() {
     let env = TempEnv::new();
@@ -398,4 +457,71 @@ fn a_failed_backup_keeps_the_original_and_leaves_no_final_name() {
             "{name} 不是 .partial 残留, 会被误认为完整备份"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// (j) 备份成功但替换失败: 失败行给出备份路径, 原对象仍在原路径
+// ---------------------------------------------------------------------------
+
+/// 构造: 目标目录内含一个只读可进的子目录 (`0o555`), 备份能读取它, 但删除原对象时
+/// 无法清空它 -- 于是备份已完整落定而替换失败, 正是"原内容已备份但目标未就位"的
+/// 情形. 这条失败行必须给出备份路径 (FR-016), 且原对象不得被移走.
+#[test]
+fn a_failed_replacement_reports_the_backup_path_and_keeps_the_original() {
+    if running_as_root() {
+        eprintln!("以 root 运行: chmod 555 不生效, 跳过替换失败的备份路径断言");
+        return;
+    }
+
+    let env = TempEnv::new();
+    env.write_source("nvim/init.lua", "managed\n");
+    env.write_manifest(&manifest_of(&[(
+        "nvim/init.lua",
+        "~/.config/nvim",
+        "replace_and_backup",
+    )]));
+
+    let target = env.home().join(".config/nvim");
+    let locked = target.join("locked");
+    fs::create_dir_all(&locked).unwrap();
+    fs::write(locked.join("secret"), "secret\n").unwrap();
+    fs::write(target.join("init.lua"), "old\n").unwrap();
+    fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o555)).unwrap();
+
+    let run = run(&env, &["apply"]);
+
+    // 备份副本会保留原目录的只读权限位, 原对象内的只读子目录也仍在原路径: 两者都要
+    // 在断言之前恢复, 否则临时目录清理会因无法清空 0o555 子目录而失败.
+    let backup = backup_path_from_output(&run.stdout);
+    unlock(&locked);
+    unlock(&backup.join("locked"));
+
+    let line = line_for(&run.stdout, "~/.config/nvim");
+    assert_eq!(token_of(line), "fail", "{line}");
+    assert_eq!(run.code, 1, "条目失败使退出码为 1");
+
+    // 失败行必须给出备份路径, 且该路径真实存在, 内容就是被覆盖前的原对象.
+    assert!(
+        line.contains("原内容已备份到"),
+        "替换失败的 fail 行必须说明原内容已备份: {line}"
+    );
+    assert!(
+        line.contains(&backup.display().to_string()),
+        "fail 行必须给出备份文件的完整路径: {line}"
+    );
+    assert!(
+        fs::symlink_metadata(&backup).unwrap().is_dir(),
+        "备份的必须是原目录: {}",
+        backup.display()
+    );
+    env.assert_content(&backup.join("init.lua"), "old\n");
+    env.assert_content(&backup.join("locked/secret"), "secret\n");
+
+    // 原对象仍在原路径: 备份先行, 删除失败不得把原内容移走或替换成链接.
+    assert!(
+        fs::symlink_metadata(&target).unwrap().is_dir(),
+        "原目录必须保留在原路径: {}",
+        target.display()
+    );
+    env.assert_content(&target.join("locked/secret"), "secret\n");
 }

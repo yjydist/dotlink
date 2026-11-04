@@ -72,7 +72,7 @@ pub(crate) fn resolve_with(
 
     // 源条目解析与归一化后必须仍落在仓库根之内: `..` 段或仓库内的符号链接能把
     // `repo_root.join(...)` 的结果带出仓库. 越出仓库的源建出的链接指向仓库外, 而
-    // `undo` 的归属判定要求链接文本落在仓库内才算本工具创建 (`os::link_is_inside_repo`),
+    // `undo` 的归属判定要求链接文本落在仓库内才算本工具创建 (`os::is_inside_repo`),
     // 于是自己的产物会被自己拒删 (`undo.rs` 的不变量). 与 `~` 前缀 / 绝对路径同一类
     // 整体拒绝. 两侧都过 `os::normalize` 再比较: 祖先段解析符号链接的语义必须与归属
     // 判定完全一致, 末段不解析 (`normalize` 的既有语义).
@@ -105,6 +105,10 @@ fn expand_target(
     home: std::result::Result<&Path, &Error>,
 ) -> Result<PathBuf> {
     if let Some(rest) = written.strip_prefix("~/") {
+        // `~/` 之后多写的分隔符仍属主目录简写: 剩余段以分隔符开头时若原样交给
+        // `PathBuf::join`, 它会被当成绝对路径并**丢弃主目录** (`~//etc/hosts` ->
+        // `/etc/hosts`), 把一次笔误变成对主目录之外路径的替换 (V-6).
+        let rest = rest.trim_start_matches(std::path::MAIN_SEPARATOR);
         return Ok(require_home(home)?.join(rest));
     }
     if written == "~" {
@@ -217,6 +221,27 @@ mod tests {
 
         let bare = resolve("shell/bashrc", "~", OnConflict::Skip, &repo()).unwrap();
         assert_eq!(bare.target_path, os::normalize(&home));
+    }
+
+    #[test]
+    fn duplicate_separators_after_tilde_still_expand_under_home() {
+        // `~//x` 仍属 `~/...`: 剩余段不得被当成绝对路径 (`PathBuf::join` 会丢弃
+        // 主目录, 使 `~//etc/hosts` 落到 `/etc/hosts`). 主目录不可用时两种写法同样
+        // 报错 -- 它们都需要 `~` 展开, 不属于"绝对路径不受 HOME 影响"的例外.
+        let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) else {
+            return;
+        };
+        let home = PathBuf::from(home);
+
+        for written in ["~//.bashrc", "~///.bashrc"] {
+            let entry = resolve("shell/bashrc", written, OnConflict::Skip, &repo()).unwrap();
+            assert_eq!(
+                entry.target_path,
+                os::normalize(&home.join(".bashrc")),
+                "{} 必须展开到主目录下",
+                written
+            );
+        }
     }
 
     #[test]

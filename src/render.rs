@@ -283,7 +283,8 @@ fn status_token(current: Current) -> EntryOutcome {
 ///
 /// `Absent` -> `Ok` 是幂等的关键行: 它使"撤销后目标为空的清单上再次运行 `undo`"落入
 /// "已是最新"列并退 0; 若误归为 `skip`, 第二次 `undo` 将退 1. 若上一次恢复过备份,
-/// 目标被原内容占用而判为冲突类, 第二次 `undo` 报 `skip` 并退 1 (状态不变, 但不退 0).
+/// 目标被恢复出的原内容占用: 普通文件 / 目录 / 仓库外链接判为冲突类 -> `skip` 并退 1;
+/// 恢复出的内容本身是仓库内链接时按归属规则重新归类, 有备份 -> `restore` 并退 1.
 fn undo_token(current: Current, has_backup: bool) -> EntryOutcome {
     match current {
         Current::LinkedCorrect | Current::LinkedWrong => {
@@ -378,7 +379,7 @@ fn note_for_token(
 /// 占用物类型与 (符号链接时的) 实际指向.
 ///
 /// `foreign` / `wrong` / `conflict` / `skip` 的必现信息都靠它: 实际指向取自
-/// `classify` 写在 `detail` 里的链接文本, 占用物类型取自 `Current` 的取值.
+/// `classify` 写在 `detail` 里的规范化实际指向, 占用物类型取自 `Current` 的取值.
 fn occupied(current: Current, detail: &str) -> String {
     match current {
         Current::LinkedWrong | Current::ForeignLink => match non_empty(detail) {
@@ -391,7 +392,7 @@ fn occupied(current: Current, detail: &str) -> String {
     }
 }
 
-/// 链接的实际指向: 取自 `detail` (由 `classify` 写入的链接文本).
+/// 链接的实际指向: 取自 `detail` (由 `classify` 写入的规范化目标).
 fn actual_target(detail: &str) -> String {
     match non_empty(detail) {
         Some(target) => target.to_string(),
@@ -582,6 +583,30 @@ mod tests {
                 for action in ACTIONS {
                     for has_backup in BACKUPS {
                         let actual = token_for(command, current, action, has_backup);
+                        // 撤销类 token 只属于撤销命令; 其余命令不得产出它们. 反向由
+                        // 撤销命令的 token 集合收口 (`ok` / `missing` / `fail` 是四
+                        // 条命令共用的三格).
+                        match command {
+                            Command::Undo => assert!(
+                                matches!(
+                                    actual,
+                                    EntryOutcome::Ok
+                                        | EntryOutcome::Missing
+                                        | EntryOutcome::Fail
+                                        | EntryOutcome::Undo
+                                        | EntryOutcome::Restore
+                                        | EntryOutcome::Skip
+                                ),
+                                "撤销命令的 token 越界: {actual:?}"
+                            ),
+                            _ => assert!(
+                                !matches!(
+                                    actual,
+                                    EntryOutcome::Undo | EntryOutcome::Restore | EntryOutcome::Skip
+                                ),
+                                "{command:?} 不得产出撤销类 token: {actual:?}"
+                            ),
+                        }
                         match contract_token(command, current, action, has_backup) {
                             Some(expected) => {
                                 assert_eq!(
