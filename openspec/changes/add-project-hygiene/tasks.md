@@ -37,7 +37,7 @@
 - [x] 6.2 在同一工作流增加 `msrv` job: `ubuntu-latest`, 安装 1.97.0, 运行 `cargo +1.97.0 test --locked`, `timeout-minutes: 15`. 验证: job 日志显示确切命令且通过; 本地运行 `cargo +1.97.0 test --locked` 通过.
 - [x] 6.3 增加 `cross-check` job: `ubuntu-latest`, 安装 1.97.0 与 `x86_64-pc-windows-gnu` 目标, 依次运行 `cargo check --locked --target x86_64-unknown-linux-gnu` 与 `cargo check --locked --target x86_64-pc-windows-gnu`, `timeout-minutes: 15`; job 名称或注释注明 compile-only. 验证: 日志显示两条命令通过; 工作流中没有 Windows 测试步骤或 Windows runner.
 - [x] 6.4 配置缓存与时长: 每个 job 使用按 job 与 OS 区分的 rust-cache key, 记录首次无缓存与第二次有缓存的时长; 触发第二次运行. 验证: 第二次运行日志出现 cache hit; 总时长不高于首次; 若 macOS job 超过 30 分钟, 记录原因并调整缓存或检查范围.
-- [x] 6.5 新增可选的 `.github/workflows/audit.yml`: 每周 cron 与 `workflow_dispatch`, 使用 `rustsec/audit-check@v2` 或固定版本的 cargo-audit 步骤, 明确不进入 PR 必需检查. 验证: 若采纳, 手动 dispatch 一次并确认运行完成; 若不采纳, 在 PR 描述记录决定并说明依赖审计仍由维护者手工执行. `rg -n 'audit' scripts/check.sh` 在两种情况下都应零命中.
+- [ ] 6.5 新增可选的 `.github/workflows/audit.yml`: 每周 cron 与 `workflow_dispatch`, 使用 `rustsec/audit-check@v2` 或固定版本的 cargo-audit 步骤, 明确不进入 PR 必需检查. 验证: 若采纳, 手动 dispatch 一次并确认运行完成; 若不采纳, 在 PR 描述记录决定并说明依赖审计仍由维护者手工执行. `rg -n 'audit' scripts/check.sh` 在两种情况下都应零命中.
 - [x] 6.6 在 README 增加 CI 徽章 (可选) 并在开发段列出 `check`, `msrv`, `cross-check` 三个 job 与 "Windows 仅交叉编译" 的边界. 验证: 若采纳徽章, URL 中的 workflow 文件名与 6.1 一致且 `rg -n 'badge|ci.yml|Windows' README.md` 可定位; 若不采纳, 在 PR 描述记录决定并保留 job 说明, 视为完成.
 - [ ] 6.7 组验证: 推送分支或开 PR, 确认 `check (ubuntu-latest)`, `check (macos-latest)`, `msrv`, `cross-check` 全部成功; 记录 run URL; 若采纳 6.5, 手动 dispatch audit 成功; 确认没有把交叉编译写成 Windows 运行时验证.
 
