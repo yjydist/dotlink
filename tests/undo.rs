@@ -13,8 +13,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use support::{
-    TempEnv, assert_token, backup_path_from_output, backups_in, line_for, manifest_of,
-    physical_repo, run, running_as_root, token_of, unlock,
+    TempEnv, assert_token, backup_path_from_output, backups_in, file_identity,
+    heal_backup_from_output, heal_backups_in, line_for, make_fifo, make_socket, manifest_of,
+    physical_repo, run, running_as_root, snapshot_all, token_of, unlock,
 };
 
 /// 已部署的环境: 源在仓库中, 目标是指向源的链接.
@@ -228,15 +229,19 @@ fn a_second_undo_of_a_restored_in_repo_link_reports_restore_again() {
         "replace_and_backup",
     )]));
 
-    // 前置: 目标是指向仓库内另一个文件的链接 (LinkedWrong), 因此 apply 会备份链接本身.
+    // 前置: 目标是指向仓库内另一个路径的链接 (LinkedWrong), 同目录另有一份用户
+    // 备份, 其内容也是指向仓库内的链接. 该备份可来自旧版本或人工放置; 本变更后
+    // apply 的自愈备份不再进入用户命名空间, 因此不能再由 apply 构造这一前置.
+    let repo = physical_repo(&env);
+    let stale = repo.join("shell/stale");
     let target = env.home().join(".bashrc");
-    let stale = physical_repo(&env).join("shell/stale");
-    std::os::unix::fs::symlink(&stale, &target).expect("建立指向仓库内其他文件的链接");
-    assert_eq!(run(&env, &["apply"]).code, 0);
+    std::os::unix::fs::symlink(repo.join("shell/elsewhere"), &target)
+        .expect("建立指向仓库内其他路径的链接");
+    let backup = env.home().join(".bashrc.dotlink-backup.20260101T000000");
+    std::os::unix::fs::symlink(&stale, &backup).expect("建立用户备份链接");
 
     let first = run(&env, &["undo"]);
     assert_token(&first, "restore");
-    let backup = backup_path_from_output(&first.stdout);
     assert_eq!(
         fs::read_link(&target).unwrap(),
         stale,
@@ -253,6 +258,127 @@ fn a_second_undo_of_a_restored_in_repo_link_reports_restore_again() {
     assert!(
         fs::symlink_metadata(&backup).is_ok(),
         "恢复后备份必须留在磁盘上"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 自愈备份不参与撤销: 情形 A (目标原本不存在) 与情形 B (用户备份优先)
+// ---------------------------------------------------------------------------
+
+/// 情形 A: 目标原本不存在. 自愈后撤销只移除链接, 回到未部署态; 自愈备份保留,
+/// 第二次撤销无待办并以 0 退出.
+#[test]
+fn undo_after_self_heal_returns_to_the_undeployed_state() {
+    let env = TempEnv::new();
+    env.write_source("shell/bashrc", "managed\n");
+    env.write_manifest(&manifest_of(&[("shell/bashrc", "~/.bashrc", "-")]));
+    assert_eq!(run(&env, &["apply"]).code, 0);
+
+    let repo = physical_repo(&env);
+    fs::rename(repo.join("shell/bashrc"), repo.join("shell/bashrc2")).expect("改名源文件");
+    env.write_manifest(&manifest_of(&[("shell/bashrc2", "~/.bashrc", "-")]));
+
+    let healed = run(&env, &["apply"]);
+    assert_eq!(healed.code, 0, "{}", healed.stdout);
+    let heal = heal_backup_from_output(&healed.stdout);
+    let heal_text = fs::read_link(&heal).expect("自愈备份必须是链接");
+    assert_eq!(heal_text, repo.join("shell/bashrc"));
+    assert!(
+        backups_in(env.home()).is_empty(),
+        "自愈不得产生用户备份: {:?}",
+        backups_in(env.home())
+    );
+
+    let target = env.home().join(".bashrc");
+    let undone = run(&env, &["undo"]);
+    assert_eq!(undone.code, 1, "{}", undone.stdout);
+    let line = line_for(&undone.stdout, "~/.bashrc");
+    assert_eq!(token_of(line), "undo", "{line}");
+    assert!(
+        fs::symlink_metadata(&target).is_err(),
+        "撤销后目标必须回到不存在"
+    );
+    assert_eq!(
+        fs::read_link(&heal).unwrap(),
+        heal_text,
+        "自愈备份不得被消费"
+    );
+    assert!(backups_in(env.home()).is_empty());
+
+    let second = run(&env, &["undo"]);
+    assert_eq!(second.code, 0, "{}", second.stdout);
+    let line = line_for(&second.stdout, "~/.bashrc");
+    assert_eq!(token_of(line), "ok", "{line}");
+    assert!(fs::symlink_metadata(&target).is_err());
+    assert_eq!(heal_backups_in(env.home()).len(), 1);
+}
+
+/// 情形 B: 目标原本是用户文件, 用户备份 B1 在自愈备份 B2 之前. 撤销恢复 B1,
+/// token 为 restore, B2 保持原样.
+#[test]
+fn undo_after_self_heal_restores_the_user_backup_not_the_heal_backup() {
+    let env = TempEnv::new();
+    env.write_source("shell/bashrc", "managed\n");
+    env.write_manifest(&manifest_of(&[(
+        "shell/bashrc",
+        "~/.bashrc",
+        "replace_and_backup",
+    )]));
+    let target = env.home().join(".bashrc");
+    fs::write(&target, "original\n").unwrap();
+
+    let applied = run(&env, &["apply"]);
+    assert_eq!(applied.code, 0, "{}", applied.stdout);
+    let user_backup = backup_path_from_output(&applied.stdout);
+    env.assert_content(&user_backup, "original\n");
+
+    let repo = physical_repo(&env);
+    fs::rename(repo.join("shell/bashrc"), repo.join("shell/bashrc2")).expect("改名源文件");
+    env.write_manifest(&manifest_of(&[(
+        "shell/bashrc2",
+        "~/.bashrc",
+        "replace_and_backup",
+    )]));
+
+    let healed = run(&env, &["apply"]);
+    assert_eq!(healed.code, 0, "{}", healed.stdout);
+    let heal = heal_backup_from_output(&healed.stdout);
+    let heal_text = fs::read_link(&heal).expect("自愈备份必须是链接");
+    assert_eq!(heal_text, repo.join("shell/bashrc"));
+    assert_eq!(
+        backups_in(env.home()),
+        vec![
+            user_backup
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        ],
+        "自愈后用户备份集合不得变化"
+    );
+
+    let undone = run(&env, &["undo"]);
+    assert_eq!(undone.code, 1, "{}", undone.stdout);
+    let line = line_for(&undone.stdout, "~/.bashrc");
+    assert_eq!(token_of(line), "restore", "{line}");
+    assert!(
+        line.contains(&user_backup.display().to_string()),
+        "restore 行必须给出用户备份路径: {line}"
+    );
+    assert!(
+        !line.contains(&heal.display().to_string()),
+        "restore 行不得使用自愈备份: {line}"
+    );
+    assert!(
+        fs::symlink_metadata(&target).is_ok_and(|meta| !meta.file_type().is_symlink()),
+        "恢复出的内容必须是用户原始文件"
+    );
+    env.assert_content(&target, "original\n");
+    env.assert_content(&user_backup, "original\n");
+    assert_eq!(
+        fs::read_link(&heal).unwrap(),
+        heal_text,
+        "自愈备份不得被删除或改写"
     );
 }
 
@@ -941,4 +1067,111 @@ fn undo_escapes_control_characters_in_the_restored_backup_path() {
         "恢复说明必须显示转义后的备份路径: {line}"
     );
     env.assert_content(&target, "original\n");
+}
+
+// ---------------------------------------------------------------------------
+// 特殊文件目标: skip, 不触碰
+// ---------------------------------------------------------------------------
+
+#[test]
+fn undo_skips_special_file_targets() {
+    let env = TempEnv::new();
+    env.write_source("shell/bashrc", "managed\n");
+    env.write_source("shell/zshrc", "managed-zsh\n");
+    env.write_manifest(&manifest_of(&[
+        ("shell/bashrc", "~/.fifo", "replace_and_backup"),
+        ("shell/zshrc", "~/.sock", "-"),
+    ]));
+
+    let fifo = env.home().join(".fifo");
+    make_fifo(&fifo);
+    let sock = env.home().join(".sock");
+    let _listener = make_socket(&sock);
+    let before = snapshot_all(&env);
+    let identities = (file_identity(&fifo), file_identity(&sock));
+
+    let run = run(&env, &["undo"]);
+    assert_eq!(
+        run.code, 1,
+        "skip 属于未处理; stdout:\n{}\nstderr:\n{}",
+        run.stdout, run.stderr
+    );
+
+    let fifo_line = line_for(&run.stdout, "~/.fifo");
+    assert_eq!(token_of(fifo_line), "skip", "{fifo_line}");
+    assert!(fifo_line.contains("特殊文件: FIFO"), "{fifo_line}");
+    let sock_line = line_for(&run.stdout, "~/.sock");
+    assert_eq!(token_of(sock_line), "skip", "{sock_line}");
+    assert!(sock_line.contains("特殊文件: socket"), "{sock_line}");
+
+    assert_eq!(before, snapshot_all(&env), "undo 不得触碰特殊文件");
+    assert_eq!(
+        identities,
+        (file_identity(&fifo), file_identity(&sock)),
+        "特殊文件必须保持同一个对象"
+    );
+    assert!(!run.stdout.contains(".dotlink-backup."), "{}", run.stdout);
+}
+
+// ---------------------------------------------------------------------------
+// 目标为空且同目录有完整备份: undo 恢复该备份 (apply 末段失败或崩溃后的收敛路径)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn undo_restores_a_backup_when_the_target_is_absent() {
+    let env = TempEnv::new();
+    env.write_source("shell/bashrc", "managed\n");
+    env.write_source("shell/zshrc", "managed\n");
+    env.write_manifest(&manifest_of(&[
+        ("shell/bashrc", "~/.bashrc", "-"),
+        ("shell/zshrc", "~/.zshrc", "-"),
+    ]));
+
+    let backup = env.home().join(".bashrc.dotlink-backup.20260101T000000");
+    fs::write(&backup, "original\n").unwrap();
+
+    let first = run(&env, &["undo"]);
+    assert_eq!(first.code, 1, "恢复属于撤销动作, 故退 1: {}", first.stdout);
+    let restored = line_for(&first.stdout, "~/.bashrc");
+    assert_eq!(token_of(restored), "restore", "{restored}");
+    assert!(
+        restored.contains(&backup.display().to_string()),
+        "restore 行必须给出备份路径: {restored}"
+    );
+    assert!(
+        restored.contains("目标为空"),
+        "目标为空时的恢复必须与移除链接后的恢复可辨: {restored}"
+    );
+    env.assert_content(&env.home().join(".bashrc"), "original\n");
+    env.assert_content(&backup, "original\n");
+
+    // 同目录无备份的空目标仍是 ok, 不得被误归为 skip.
+    let untouched = line_for(&first.stdout, "~/.zshrc");
+    assert_eq!(token_of(untouched), "ok", "{untouched}");
+    assert!(fs::symlink_metadata(env.home().join(".zshrc")).is_err());
+
+    // 第二次: 恢复出的是普通文件, 不属于本工具创建 -> skip; 目标与备份不变.
+    let second = run(&env, &["undo"]);
+    assert_eq!(second.code, 1, "{}", second.stdout);
+    let skipped = line_for(&second.stdout, "~/.bashrc");
+    assert_eq!(token_of(skipped), "skip", "{skipped}");
+    env.assert_content(&env.home().join(".bashrc"), "original\n");
+    env.assert_content(&backup, "original\n");
+    assert_eq!(token_of(line_for(&second.stdout, "~/.zshrc")), "ok");
+}
+
+#[test]
+fn undo_with_an_absent_target_and_no_backup_is_ok() {
+    let env = TempEnv::new();
+    env.write_source("shell/bashrc", "managed\n");
+    env.write_manifest(&manifest_of(&[("shell/bashrc", "~/.bashrc", "-")]));
+
+    let result = run(&env, &["undo"]);
+    assert_eq!(result.code, 0, "无备份的空目标保持幂等: {}", result.stdout);
+    assert_eq!(token_of(line_for(&result.stdout, "~/.bashrc")), "ok");
+    assert!(
+        fs::symlink_metadata(env.home().join(".bashrc")).is_err(),
+        "无备份时不得创建任何内容"
+    );
+    assert!(backups_in(env.home()).is_empty());
 }

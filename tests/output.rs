@@ -7,7 +7,17 @@ mod support;
 
 use std::process::Stdio;
 
-use support::TempEnv;
+use support::{TempEnv, run};
+
+/// 测试侧的近似显示宽度: CJK 计 2 列, 其余计 1 列 (与报告层规则一致).
+fn display_width(text: &str) -> usize {
+    text.chars()
+        .map(|character| match u32::from(character) {
+            0x2E80..=0x9FFF | 0xF900..=0xFAFF | 0xFF00..=0xFF60 => 2,
+            _ => 1,
+        })
+        .sum()
+}
 
 /// 生成含 `count` 条目的清单: 所有条目共享一个已存在的源, 目标全部不存在.
 fn large_manifest(env: &TempEnv, count: usize) {
@@ -80,4 +90,55 @@ fn a_closed_stderr_does_not_panic_and_keeps_the_exit_code() {
         "清单错误在标准错误不可写时仍退 2, 而不是 panic 的 101"
     );
     assert!(output.stdout.is_empty(), "清单错误不得写标准输出");
+}
+
+/// 12 条含 ASCII 与 CJK target 的清单: 序号右对齐, token 与说明列按显示宽度对齐.
+#[test]
+fn report_columns_align_for_twelve_entries_with_cjk_targets() {
+    let env = TempEnv::new();
+    env.write_source("shared/rc", "x\n");
+    let mut manifest = String::new();
+    for index in 1..=12 {
+        let target = if index % 2 == 0 {
+            format!("~/.配置{index}")
+        } else {
+            format!("~/.target{index}")
+        };
+        manifest.push_str(&format!(
+            "[[entry]]\nsource = \"shared/rc\"\ntarget = \"{target}\"\n"
+        ));
+    }
+    env.write_manifest(&manifest);
+
+    let run = run(&env, &["status"]);
+    assert_eq!(run.code, 1, "{}", run.stdout);
+    let lines: Vec<&str> = run.stdout.lines().collect();
+    assert_eq!(lines.len(), 13, "12 条条目加一行汇总:\n{}", run.stdout);
+
+    let mut token_starts = Vec::new();
+    let mut note_starts = Vec::new();
+    for line in &lines[..12] {
+        let token_index = line.find("absent").expect("token");
+        let note_index = line.find("未部署").expect("note");
+        token_starts.push(display_width(&line[..token_index]));
+        note_starts.push(display_width(&line[..note_index]));
+    }
+    assert!(
+        token_starts.iter().all(|start| *start == token_starts[0]),
+        "token 列未对齐: {token_starts:?}\n{}",
+        run.stdout
+    );
+    assert!(
+        note_starts.iter().all(|start| *start == note_starts[0]),
+        "说明列未对齐: {note_starts:?}\n{}",
+        run.stdout
+    );
+    // ` 1/12 ` 宽 6, token 列 9, 分隔空格 1, target 列宽 20.
+    assert_eq!(token_starts[0], 6);
+    assert_eq!(note_starts[0], 6 + 9 + 1 + 20);
+
+    assert_eq!(
+        lines[12], "12 个条目: 0 成功, 0 已是最新, 12 未处理, 0 失败",
+        "汇总行必须是最后一行"
+    );
 }

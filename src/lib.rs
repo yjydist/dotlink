@@ -184,9 +184,14 @@ fn preview(manifest: &Manifest, states: &[EntryState]) -> Vec<ReportRow> {
         .zip(states)
         .map(|(entry, state)| {
             // FR-016 要求 `replace` 行给出备份的**完整路径**. preview 不产生备份,
-            // 因此给出按当前实况算出的那个名字 -- 与随后 apply 的写入结果同源.
+            // 因此给出按当前实况算出的那个名字 -- 与随后 apply 的写入结果同源:
+            // 命名空间由同一个 `backup_kind_for` 选择, 命名规则由 `backup_path_for`
+            // 共用, 跨秒时只有字面时间戳可以不同 (设计 D3).
             let predicted = match state.action {
-                Action::ReplaceAndBackup => Some(backup::backup_path_for(&entry.target_path)),
+                Action::ReplaceAndBackup => Some(backup::backup_path_for(
+                    &entry.target_path,
+                    apply::backup_kind_for(state.current),
+                )),
                 _ => None,
             };
             render::row_from_state(
@@ -271,6 +276,8 @@ struct UndoItem<'a> {
 /// 因此这里先由判定结果取一份快照 (逐条 token + 备份), 再执行移除; 快照同时就是报告
 /// 与退出码的输入 -- 二者同源, 不需要第二份逻辑.
 fn undo(manifest: &Manifest, states: &[EntryState]) -> Vec<ReportRow> {
+    // 撤销只查用户备份命名空间: `BackupFinder` 不扫描 `.dotlink-heal.`, 因此自愈
+    // 备份既不会让 token 变成 `restore`, 也不会被恢复或消费 (设计 D4).
     let mut backups = backup::BackupFinder::default();
     let mut plan: Vec<UndoItem> = manifest
         .entries
@@ -280,8 +287,11 @@ fn undo(manifest: &Manifest, states: &[EntryState]) -> Vec<ReportRow> {
             // 备份查找取不到结果不等于"无备份": 目录读取失败是环境故障, 与
             // `Unreadable` 同类处置 -- 该条目记为 `fail` 且不再触碰文件系统, 底层原因
             // 随行报告; 把它吞成"无备份"会让条目落进成功列的 `undo` 并移除链接.
+            //
+            // `Absent` 也要查: 目标为空且有完整备份时 `undo` 负责恢复该备份 (例如
+            // `apply` 末段建链失败或崩溃后), 无备份才是"已是最新" (设计 D5).
             let snapshot = match state.current {
-                Current::LinkedCorrect | Current::LinkedWrong => {
+                Current::LinkedCorrect | Current::LinkedWrong | Current::Absent => {
                     backups.find_latest(&entry.target_path)
                 }
                 _ => Ok(None),

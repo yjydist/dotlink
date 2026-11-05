@@ -10,6 +10,10 @@
 //! 复制或 rename 失败且原路径仍为空时回滚链接, 因此下一次 `undo` 仍可重试; 路径被
 //! 重新占用时保留占用物和暂存链接, 并报告暂存位置. rename 之后的父目录同步失败表示
 //! 内容已就位, 此时不回滚, 只清理旧链接副本并在说明中指出内容已恢复.
+//!
+//! 目标路径本就不存在且同目录有完整备份时, 直接恢复该备份而不先移除任何对象. 移除
+//! 暂存链接失败时先尝试把链接移回原路径; 恢复成功但清理暂存链接失败会报告残留路径;
+//! 恢复失败的说明给出所尝试的备份路径与原因.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -51,24 +55,66 @@ pub fn undo_entry(
         },
         // 非本工具创建的内容: 绝不删除
         // (`openspec/specs/link-teardown/spec.md` 的"只移除本工具创建的链接").
-        Current::ForeignLink | Current::ForeignFile | Current::ForeignDir => Ok(()),
-        // 该路径本就没有本工具创建的链接 (含撤销后目标为空的第二次运行).
-        Current::Absent => Ok(()),
+        Current::ForeignLink
+        | Current::ForeignFile
+        | Current::ForeignDir
+        | Current::ForeignOther => Ok(()),
+        // 该路径本就没有本工具创建的链接. 若同目录有完整备份 (例如 `apply` 末段
+        // 建链失败或崩溃后目标为空), 则恢复该备份; 没有备份才是"已是最新"
+        // (`openspec/specs/link-teardown/spec.md` 的"撤销的 token 由状态与备份有无共同决定").
+        Current::Absent => match backup {
+            Some(backup) => restore_absent(target, backup),
+            None => Ok(()),
+        },
         // 源缺失是终态; `Unreadable` 是环境故障. 二者都无文件系统改动.
         Current::SourceMissing | Current::Unreadable => Ok(()),
     }
 }
 
+/// 目标为空且同目录有完整备份时恢复该备份.
+///
+/// 不先移除任何对象: 目标本就为空, [`backup::restore_backup`] 的排他落位会拒绝覆盖
+/// 期间新建的内容. 恢复失败说明给出所尝试的备份路径 (设计 D5 / D6).
+fn restore_absent(target: &Path, backup: &Path) -> Result<()> {
+    backup::restore_backup(target, backup)
+        .map_err(|error| Error::EntryFailed(format!("{error}; 所尝试的备份: {}", backup.display())))
+}
+
 /// 移除目标路径上的符号链接: 先原子暂存并复核身份与归属, 再删除暂存链接.
 fn remove_link(target: &Path, entry: &Entry, repo_root: &Path) -> Result<()> {
     let staged = stage_verified_link(target, entry, repo_root)?;
-    fs::remove_file(&staged).map_err(|error| {
-        Error::EntryFailed(format!(
-            "移除链接 {} 失败: {error}; 链接已暂存于 {}",
-            target.display(),
-            staged.display()
-        ))
-    })
+    remove_staged_link(target, &staged)
+}
+
+/// 删除已复核的暂存链接; 删除失败时先尝试把链接移回原路径.
+///
+/// 移回成功使下一次 `undo` 仍看到本工具的链接, 可在工具内重试; 移回失败时保留暂存
+/// 链接并给出完整路径, 不覆盖期间新建的内容 (设计 D3).
+fn remove_staged_link(target: &Path, staged: &Path) -> Result<()> {
+    match remove_staged_file(staged) {
+        Ok(()) => Ok(()),
+        Err(error) => match os::rename_noreplace(staged, target) {
+            Ok(()) => Err(Error::EntryFailed(format!(
+                "移除链接 {} 失败: {error}; 已把链接移回原路径, 可重试",
+                target.display()
+            ))),
+            Err(rollback) => Err(Error::EntryFailed(format!(
+                "移除链接 {} 失败: {error}; 且移回原路径 {} 失败: {rollback}; 链接暂存于 {}",
+                target.display(),
+                target.display(),
+                staged.display()
+            ))),
+        },
+    }
+}
+
+/// 删除暂存链接; 测试接缝可让下一次删除失败.
+fn remove_staged_file(staged: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if take_next_removal_failure() {
+        return Err(std::io::Error::other("模拟移除暂存链接失败"));
+    }
+    fs::remove_file(staged)
 }
 
 /// 移除链接并把快照指定的备份恢复到原路径.
@@ -84,22 +130,39 @@ fn replace_link_with_backup(
     let staged = stage_verified_link(target, entry, repo_root)?;
 
     match backup::restore_backup(target, backup) {
-        Ok(()) => {
-            // 恢复已就位; 旧链接副本的清理失败只是残留, 不外抛.
-            let _ = fs::remove_file(&staged);
-            Ok(())
-        }
-        // 内容尚未落位: 原路径仍为空, 可以把链接移回以便重试.
-        Err(backup::RestoreError::NotLanded(error)) => Err(rollback_link(target, &staged, error)),
-        // 内容已就位: 回滚只会因目标被占用而失败, 清理旧链接副本即可.
-        Err(backup::RestoreError::LandedButUnsynced(error)) => match fs::remove_file(&staged) {
-            Ok(()) => Err(error),
+        Ok(()) => match remove_staged_file(&staged) {
+            Ok(()) => Ok(()),
+            // 恢复已就位, 内容保持原样; 残留的旧链接副本必须报告而不是静默 (设计 D4).
             Err(cleanup) => Err(Error::EntryFailed(format!(
-                "{error}; 清理旧链接副本 {} 失败: {cleanup}",
+                "备份已恢复到 {}; 清理旧链接副本 {} 失败: {cleanup}",
+                target.display(),
                 staged.display()
             ))),
         },
+        // 内容尚未落位: 原路径仍为空, 可以把链接移回以便重试. 回滚前后都保留所尝试
+        // 的备份路径与底层原因 (设计 D6).
+        Err(backup::RestoreError::NotLanded(error)) => Err(rollback_link(
+            target,
+            &staged,
+            with_backup_path(error, backup),
+        )),
+        // 内容已就位: 回滚只会因目标被占用而失败, 清理旧链接副本即可.
+        Err(backup::RestoreError::LandedButUnsynced(error)) => {
+            let error = with_backup_path(error, backup);
+            match remove_staged_file(&staged) {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(Error::EntryFailed(format!(
+                    "{error}; 清理旧链接副本 {} 失败: {cleanup}",
+                    staged.display()
+                ))),
+            }
+        }
     }
+}
+
+/// 给恢复失败的原因补上所尝试的备份路径.
+fn with_backup_path(error: Error, backup: &Path) -> Error {
+    Error::EntryFailed(format!("{error}; 所尝试的备份: {}", backup.display()))
 }
 
 /// 原子暂存目标, 再复核暂存对象仍是本工具创建的符号链接.
@@ -154,6 +217,25 @@ fn rollback_link(target: &Path, aside: &Path, error: Error) -> Error {
             aside.display()
         )),
     }
+}
+
+// 测试接缝: 下一次删除暂存链接一次性失败.
+//
+// 只读父目录会同时拒绝 rename, 无法覆盖"移回成功"的分支; 单元测试用它在暂存之后
+// 制造一次可控的删除失败 (设计 D3).
+#[cfg(test)]
+thread_local! {
+    static NEXT_REMOVAL_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn fail_next_removal() {
+    NEXT_REMOVAL_FAILURE.with(|slot| slot.set(true));
+}
+
+#[cfg(test)]
+fn take_next_removal_failure() -> bool {
+    NEXT_REMOVAL_FAILURE.with(|slot| slot.replace(false))
 }
 
 #[cfg(all(test, unix))]
@@ -342,6 +424,10 @@ mod tests {
         assert!(message.contains("同步父目录"), "{message}");
         assert!(message.contains("备份内容已恢复到"), "{message}");
         assert!(
+            message.contains(&format!("所尝试的备份: {}", backup_path.display())),
+            "恢复失败说明必须给出所尝试的备份路径: {message}"
+        );
+        assert!(
             !message.contains("回滚链接失败"),
             "内容已恢复时不得尝试回滚: {message}"
         );
@@ -512,7 +598,12 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error.to_string().contains(&backup.display().to_string()));
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("所尝试的备份: {}", backup.display())),
+            "说明必须给出所尝试的备份路径: {message}"
+        );
+        assert!(message.contains("读取"), "说明必须保留底层原因: {message}");
         assert_eq!(fs::read_link(&target).unwrap(), link_text);
         assert!(fs::symlink_metadata(aside_path(&target)).is_err());
         fs::write(&backup, "original").unwrap();
@@ -739,12 +830,10 @@ mod tests {
         );
     }
 
-    /// 恢复出的是普通文件, 不是链接: 真实的第二次 `undo` 会由 `classify` 判为
-    /// `ForeignFile` 并报 `skip` (见 `openspec/specs/link-teardown/spec.md` 的
-    /// "撤销幂等且退出码随备份情形而异"). 这里直接以
-    /// `Absent` 调用, 只锁定"`Absent` 不触碰文件系统"这一行.
+    /// 无备份的 `Absent` 不触碰文件系统: 这是第二次 `undo` 幂等退 0 的那一行.
+    /// `Absent` 且有备份时走恢复分支, 由后续用例覆盖.
     #[test]
-    fn undo_entry_is_a_noop_when_the_target_is_already_absent() {
+    fn undo_entry_is_a_noop_when_the_absent_target_has_no_backup() {
         let dir = tempfile::tempdir().unwrap();
         let (target, entry) = deployed(dir.path(), "bashrc", "managed");
         let backup_path = target
@@ -817,5 +906,207 @@ mod tests {
         .unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "original");
         assert!(fs::symlink_metadata(&backup_path).is_ok());
+    }
+
+    /// 移除暂存链接失败且原路径为空: 链接被移回原路径, 下一次 `undo` 可重试.
+    #[test]
+    fn a_failed_removal_moves_the_link_back_for_a_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (target, entry) = deployed(dir.path(), "bashrc", "managed");
+        let repo_root = os::normalize(dir.path());
+        let staged = stage_verified_link(&target, &entry, &repo_root).unwrap();
+        let inode = fs::symlink_metadata(&staged).unwrap().ino();
+        assert!(fs::symlink_metadata(&target).is_err());
+
+        fail_next_removal();
+        let error = remove_staged_link(&target, &staged).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("已把链接移回原路径"), "{message}");
+        assert!(
+            fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "移回成功时目标必须重新是可撤销的链接"
+        );
+        assert_eq!(fs::symlink_metadata(&target).unwrap().ino(), inode);
+        assert!(fs::symlink_metadata(&staged).is_err());
+
+        // 下一次 undo 仍看到本工具的链接, 因而已工具内可重试.
+        undo_entry_in(dir.path(), &entry, &state(Current::LinkedCorrect), None).unwrap();
+        assert!(fs::symlink_metadata(&target).is_err());
+    }
+
+    /// 移除失败且原路径已被占用: 新内容保持原样, 链接留在暂存名并给出完整路径.
+    #[test]
+    fn a_failed_removal_and_rollback_keeps_the_link_staged() {
+        let dir = tempfile::tempdir().unwrap();
+        let (target, entry) = deployed(dir.path(), "bashrc", "managed");
+        let repo_root = os::normalize(dir.path());
+        let staged = stage_verified_link(&target, &entry, &repo_root).unwrap();
+        let link_text = fs::read_link(&staged).unwrap();
+        fs::write(&target, "new user content").unwrap();
+
+        fail_next_removal();
+        let error = remove_staged_link(&target, &staged).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("移回原路径"), "{message}");
+        assert!(
+            message.contains(&staged.display().to_string()),
+            "说明必须给出暂存链接的完整路径: {message}"
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new user content");
+        assert_eq!(fs::read_link(&staged).unwrap(), link_text);
+    }
+
+    /// 恢复成功但清理暂存链接失败: 内容保留, 该行报失败并给出残留路径.
+    #[test]
+    fn a_cleanup_failure_after_a_restore_reports_the_residue() {
+        let dir = tempfile::tempdir().unwrap();
+        let (target, entry) = deployed(dir.path(), "bashrc", "managed");
+        let backup = target.with_file_name("bashrc.dotlink-backup.20260101T000000");
+        fs::write(&backup, "original").unwrap();
+
+        fail_next_removal();
+        let error = undo_entry_in(
+            dir.path(),
+            &entry,
+            &state(Current::LinkedCorrect),
+            Some(&backup),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("清理旧链接副本"), "{message}");
+        let marker = "清理旧链接副本 ";
+        let start = message
+            .find(marker)
+            .unwrap_or_else(|| panic!("说明必须给出残留路径: {message}"))
+            + marker.len();
+        let end = start
+            + message[start..]
+                .find(" 失败")
+                .unwrap_or_else(|| panic!("残留路径应以 ` 失败` 收尾: {message}"));
+        let residue = PathBuf::from(&message[start..end]);
+        assert!(
+            fs::symlink_metadata(&residue)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "残留的旧链接副本必须仍在说明给出的路径上: {}",
+            residue.display()
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "original");
+        assert!(fs::symlink_metadata(&backup).is_ok(), "备份不得被删除");
+
+        // 调用方 (`lib::undo`) 把条目错误渲染为 `fail`; 清理失败不得留在成功列.
+        let row = crate::render::fail_row(&entry, &message);
+        assert_eq!(
+            row.token,
+            crate::error::EntryOutcome::Fail,
+            "清理失败必须走 fail 通道"
+        );
+    }
+
+    /// 恢复失败说明必须同时给出所尝试的备份路径与底层原因; 回滚成功与失败都保留它.
+    #[test]
+    fn a_restore_failure_keeps_the_backup_path_in_both_rollback_endings() {
+        // 回滚成功: 原路径为空.
+        let dir = tempfile::tempdir().unwrap();
+        let (target, entry) = deployed(dir.path(), "bashrc", "managed");
+        let repo_root = os::normalize(dir.path());
+        let staged = stage_verified_link(&target, &entry, &repo_root).unwrap();
+        let backup = target.with_file_name("bashrc.dotlink-backup.20260101T000000");
+        let error = rollback_link(
+            &target,
+            &staged,
+            with_backup_path(
+                Error::EntryFailed("恢复失败: 底层原因".to_string()),
+                &backup,
+            ),
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("所尝试的备份: {}", backup.display())),
+            "{message}"
+        );
+        assert!(message.contains("底层原因"), "{message}");
+        assert!(
+            fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "回滚成功时链接必须回到原路径"
+        );
+
+        // 回滚失败: 原路径已被新内容占用.
+        let dir = tempfile::tempdir().unwrap();
+        let (target, _entry) = deployed(dir.path(), "bashrc", "managed");
+        let aside = aside_path(&target);
+        fs::rename(&target, &aside).unwrap();
+        fs::write(&target, "new user content").unwrap();
+        let backup = target.with_file_name("bashrc.dotlink-backup.20260101T000000");
+        let error = rollback_link(
+            &target,
+            &aside,
+            with_backup_path(
+                Error::EntryFailed("恢复失败: 底层原因".to_string()),
+                &backup,
+            ),
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("所尝试的备份: {}", backup.display())),
+            "{message}"
+        );
+        assert!(message.contains("回滚链接失败"), "{message}");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new user content");
+    }
+
+    /// 目标为空且同目录有完整备份: 恢复该备份, 不先移除任何对象.
+    #[test]
+    fn undo_restores_a_backup_when_the_target_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = os::normalize(dir.path());
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("bashrc"), "managed").unwrap();
+        let target = repo.join("home/bashrc");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let entry = entry_for(&repo, "bashrc", &target);
+        let backup = target.with_file_name("bashrc.dotlink-backup.20260101T000000");
+        fs::write(&backup, "original").unwrap();
+
+        undo_entry_in(dir.path(), &entry, &state(Current::Absent), Some(&backup)).unwrap();
+
+        assert_eq!(fs::read_to_string(&target).unwrap(), "original");
+        assert!(fs::symlink_metadata(&backup).is_ok(), "备份不得被消费");
+    }
+
+    /// 目标为空且备份不可用: 失败说明给出所尝试的备份路径, 目标保持为空.
+    #[test]
+    fn a_failed_restore_on_an_absent_target_names_the_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = os::normalize(dir.path());
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("bashrc"), "managed").unwrap();
+        let target = repo.join("home/bashrc");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let entry = entry_for(&repo, "bashrc", &target);
+        let backup = target.with_file_name("bashrc.dotlink-backup.20260101T000000");
+
+        let error =
+            undo_entry_in(dir.path(), &entry, &state(Current::Absent), Some(&backup)).unwrap_err();
+        let message = error.to_string();
+
+        assert!(
+            message.contains(&format!("所尝试的备份: {}", backup.display())),
+            "{message}"
+        );
+        assert!(
+            fs::symlink_metadata(&target).is_err(),
+            "恢复失败时目标必须仍为空"
+        );
     }
 }

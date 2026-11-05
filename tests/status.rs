@@ -12,7 +12,8 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use support::{
-    Run, TempEnv, entry_lines, line_for, manifest_of, physical_repo, run, snapshot_all, token_of,
+    Run, TempEnv, entry_lines, file_identity, line_for, make_fifo, make_socket, manifest_of,
+    physical_repo, run, snapshot_all, token_of,
 };
 
 /// 某条目的 token (`status` 输出中按 target 定位).
@@ -469,12 +470,16 @@ fn a_link_written_with_the_tmp_alias_is_still_ok() {
     };
 
     // 前置条件自证: 别名形态与物理形态必须**指向同一个文件**, 否则本用例什么也没证明.
-    // 这正是 R2"macOS 路径别名"陷阱的成立条件.
+    // 这正是 R2"macOS 路径别名"陷阱的成立条件. Linux 的 /tmp 不是符号链接, 无法
+    // 构造别名分支, 跳过而不是制造失败.
     let physical_source = fs::canonicalize(&alias).expect("解析源文件的物理路径");
-    assert_ne!(
-        alias, physical_source,
-        "前置条件: /tmp 别名与物理路径必须不同, 否则本用例测不到 R2 的别名分支"
-    );
+    if alias == physical_source {
+        eprintln!(
+            "跳过 a_link_written_with_the_tmp_alias_is_still_ok: \
+             /tmp 不是符号链接别名, 无法构造 R2 分支"
+        );
+        return;
+    }
     let alias_meta = fs::metadata(&alias).expect("别名形态必须可 stat");
     let physical_meta = fs::metadata(&physical_source).expect("物理形态必须可 stat");
     assert_eq!(
@@ -641,4 +646,99 @@ fn status_escapes_control_characters_in_the_actual_target() {
         "实际指向必须显示转义形式: {line}"
     );
     assert_eq!(run.code, 1, "存在偏离; stdout:\n{}", run.stdout);
+}
+
+// ---------------------------------------------------------------------------
+// 特殊文件目标: 第九状态 -> foreign, 说明给出精确类型
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fifo_and_socket_targets_are_foreign_with_exact_type() {
+    let env = TempEnv::new();
+    env.write_source("shell/bashrc", "managed\n");
+    env.write_source("shell/zshrc", "managed-zsh\n");
+    env.write_manifest(&manifest_of(&[
+        ("shell/bashrc", "~/.fifo", "replace_and_backup"),
+        ("shell/zshrc", "~/.sock", "-"),
+    ]));
+
+    let fifo = env.home().join(".fifo");
+    make_fifo(&fifo);
+    let sock = env.home().join(".sock");
+    let _listener = make_socket(&sock);
+    let before = (file_identity(&fifo), file_identity(&sock));
+
+    let run = run(&env, &["status"]);
+    assert_eq!(
+        run.code, 1,
+        "特殊文件属于未处理; stdout:\n{}\nstderr:\n{}",
+        run.stdout, run.stderr
+    );
+
+    let fifo_line = line_for(&run.stdout, "~/.fifo");
+    assert_eq!(token_of(fifo_line), "foreign", "{fifo_line}");
+    assert!(fifo_line.contains("特殊文件: FIFO"), "{fifo_line}");
+    assert!(
+        !fifo_line.contains("普通文件"),
+        "FIFO 不得被描述为普通文件: {fifo_line}"
+    );
+
+    let sock_line = line_for(&run.stdout, "~/.sock");
+    assert_eq!(token_of(sock_line), "foreign", "{sock_line}");
+    assert!(sock_line.contains("特殊文件: socket"), "{sock_line}");
+
+    assert_eq!(
+        before,
+        (file_identity(&fifo), file_identity(&sock)),
+        "status 不得触碰特殊文件"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 实际指向保真: 首尾空白不被裁剪
+// ---------------------------------------------------------------------------
+
+#[test]
+fn status_preserves_trailing_spaces_in_the_actual_target() {
+    let env = TempEnv::new();
+    env.write_source("shell/bashrc", "managed\n");
+    env.write_source("shell/own ", "managed\n");
+    env.write_manifest(&manifest_of(&[
+        ("shell/bashrc", "~/.wrong", "-"),
+        ("shell/bashrc", "~/.foreign", "-"),
+    ]));
+
+    // wrong: 本工具的链接指向仓库内的另一个条目 (名称尾部含空格).
+    let wrong_actual = physical_repo(&env).join("shell/own ");
+    std::os::unix::fs::symlink(&wrong_actual, env.home().join(".wrong")).expect("建立错误链接");
+    // foreign: 仓库之外的目标, 名称尾部同样含空格.
+    let foreign_actual = outside_file(&env, "outside ");
+    std::os::unix::fs::symlink(&foreign_actual, env.home().join(".foreign")).expect("建立外部链接");
+
+    let run = run(&env, &["status"]);
+    assert_eq!(run.code, 1, "stdout:\n{}", run.stdout);
+
+    let wrong_line = line_for(&run.stdout, "~/.wrong");
+    assert_eq!(token_of(wrong_line), "wrong", "{wrong_line}");
+    let wrong_text = wrong_actual.display().to_string();
+    assert!(
+        wrong_line.ends_with(&format!("{wrong_text})")),
+        "实际指向必须保留尾部空格: {wrong_line:?}"
+    );
+    assert!(
+        !wrong_line.ends_with(&format!("{})", wrong_text.trim_end())),
+        "不得显示 trim 之后的实际指向: {wrong_line:?}"
+    );
+
+    let foreign_line = line_for(&run.stdout, "~/.foreign");
+    assert_eq!(token_of(foreign_line), "foreign", "{foreign_line}");
+    let foreign_text = foreign_actual.display().to_string();
+    assert!(
+        foreign_line.ends_with(&format!("{foreign_text})")),
+        "实际指向必须保留尾部空格: {foreign_line:?}"
+    );
+    assert!(
+        !foreign_line.ends_with(&format!("{})", foreign_text.trim_end())),
+        "不得显示 trim 之后的实际指向: {foreign_line:?}"
+    );
 }

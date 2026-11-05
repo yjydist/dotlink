@@ -4,6 +4,7 @@ set -euo pipefail
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd -- "$project_root"
 
+python3 scripts/check-punctuation.py
 cargo fmt --check
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings

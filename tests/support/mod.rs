@@ -248,6 +248,59 @@ pub fn physical_repo(env: &TempEnv) -> PathBuf {
     fs::canonicalize(env.repo()).expect("解析仓库根的物理路径")
 }
 
+/// 在 `path` 上创建一个 FIFO (调用系统 `mkfifo`; macOS 与 Linux 都自带该工具).
+pub fn make_fifo(path: &Path) {
+    let status = std::process::Command::new("mkfifo")
+        .arg(path)
+        .status()
+        .expect("执行 mkfifo");
+    assert!(status.success(), "mkfifo 退出码非零: {status}");
+}
+
+/// 在 `path` 上监听 Unix socket; 返回的监听器必须存活到断言结束.
+pub fn make_socket(path: &Path) -> std::os::unix::net::UnixListener {
+    std::os::unix::net::UnixListener::bind(path).expect("绑定 Unix socket")
+}
+
+/// 对象身份 (设备号 + inode), 用于断言特殊文件没有被替换.
+pub fn file_identity(path: &Path) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = fs::symlink_metadata(path)
+        .unwrap_or_else(|error| panic!("读取 {} 失败: {error}", path.display()));
+    (meta.dev(), meta.ino())
+}
+
+/// 两个路径是否指向同一文件系统对象 (跟随末段符号链接).
+pub fn same_identity(left: &Path, right: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        match (fs::metadata(left), fs::metadata(right)) {
+            (Ok(left), Ok(right)) => left.dev() == right.dev() && left.ino() == right.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (left, right);
+        false
+    }
+}
+
+/// 当前卷是否大小写不敏感: 仅大小写不同的两个路径能取到同一身份.
+///
+/// 用身份判等而不是读内容: 大小写敏感卷上大写路径不存在; 允许两个名字并存的文件
+/// 系统上也必须比较身份才能区分"同一对象"与"两个不同对象".
+pub fn case_insensitive_volume() -> bool {
+    let dir = tempfile::tempdir().expect("创建大小写探测目录");
+    let lower = dir.path().join("dotlink-case-probe");
+    let upper = dir.path().join("DOTLINK-CASE-PROBE");
+    fs::write(&lower, "probe").expect("写入大小写探测文件");
+    same_identity(&lower, &upper)
+}
+
 /// 某目录下所有备份文件名 (含最终名与 `.partial` 残留).
 pub fn backups_in(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = fs::read_dir(dir)
@@ -258,6 +311,32 @@ pub fn backups_in(dir: &Path) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+/// 某目录下所有自愈备份文件名 (含最终名与 `.partial` 残留).
+pub fn heal_backups_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap_or_else(|error| panic!("列举 {} 失败: {error}", dir.display()))
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".dotlink-heal."))
+        .collect();
+    names.sort();
+    names
+}
+
+/// 从命令输出中取出 `.dotlink-heal.` 备份路径的词.
+///
+/// 不要求路径已存在: preview 只报告预测值, apply / undo 的输出则可在调用点断言存在.
+#[track_caller]
+pub fn heal_backup_from_output(stdout: &str) -> PathBuf {
+    for word in stdout.split_whitespace() {
+        if !word.contains(".dotlink-heal.") {
+            continue;
+        }
+        return PathBuf::from(word.trim_end_matches([',', ';', '.', ')']));
+    }
+    panic!("输出中未给出自愈备份路径: {stdout}");
 }
 
 /// 从命令输出中取出备份文件的完整路径 (FR-016 的"必现信息").

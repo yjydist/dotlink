@@ -137,8 +137,8 @@ mod imp {
     mod tests {
         use super::*;
 
-        fn set_xattr(path: &Path, name: &str, value: &[u8]) {
-            setxattr(path, name, value, XattrFlags::empty()).expect("设置测试扩展属性");
+        fn set_xattr(path: &Path, name: &str, value: &[u8]) -> Result<(), Errno> {
+            setxattr(path, name, value, XattrFlags::empty())
         }
 
         fn get_xattr(path: &Path, name: &str) -> Vec<u8> {
@@ -156,7 +156,17 @@ mod imp {
             fs::write(&dest, "content").unwrap();
 
             let value = vec![0x5a_u8; 8 * 1024];
-            set_xattr(&source, "user.test", &value);
+            match set_xattr(&source, "user.test", &value) {
+                Ok(()) => {}
+                Err(error) if error == Errno::NOSPC => {
+                    eprintln!(
+                        "跳过 copy_xattrs_copies_a_large_user_attribute: \
+                         文件系统无法保存 8 KiB 扩展属性: {error}"
+                    );
+                    return;
+                }
+                Err(error) => panic!("设置测试扩展属性: {error}"),
+            }
 
             copy_xattrs(&source, &dest).unwrap();
 

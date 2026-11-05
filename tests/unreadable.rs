@@ -252,13 +252,18 @@ fn a_doubly_unreadable_entry_reports_the_reason_of_both_sides() {
 
     let line = line_for(&run.stdout, "~/.locked/rc");
     assert_eq!(token_of(line), "fail", "两侧都读不到必须是 fail: {line}");
+    let source = env.repo().join("shell/file/rc");
+    let target = env.home().join(".locked/rc");
     assert!(
-        line.contains("源侧 Not a directory"),
-        "fail 行必须给出源侧的原因 (只透出一侧会让另一侧无从诊断): {line}"
+        line.contains(&format!("源侧路径 {}: Not a directory", source.display())),
+        "fail 行必须给出源侧路径与原因: {line}"
     );
     assert!(
-        line.contains("目标侧 Permission denied"),
-        "fail 行必须给出目标侧的原因 (只透出一侧会让另一侧无从诊断): {line}"
+        line.contains(&format!(
+            "目标侧路径 {}: Permission denied",
+            target.display()
+        )),
+        "fail 行必须给出目标侧路径与原因: {line}"
     );
 }
 
@@ -306,11 +311,15 @@ fn a_source_side_only_failure_is_fail_under_every_command() {
             "fail",
             "仅源侧不可读时 token 不随命令变化, 四条命令下都是 fail (`{command}`): {line}"
         );
-        // 说明必须给出源侧原因. 实际拼写为 "源侧读取失败: Not a directory (...)",
-        // 因此用 "源侧" 与 "Not a directory" 两个片段共同断言 "源侧 ENOTDIR".
+        // 说明必须给出源侧路径与原因. 实际拼写为
+        // "源侧读取失败: 路径 <source>: Not a directory (...)".
+        let source = env.repo().join("shell/file/rc");
         assert!(
-            line.contains("源侧") && line.contains("Not a directory"),
-            "fail 行必须给出源侧的原因 (`{command}`): {line}"
+            line.contains(&format!(
+                "源侧读取失败: 路径 {}: Not a directory",
+                source.display()
+            )),
+            "fail 行必须给出源侧路径与原因 (`{command}`): {line}"
         );
         assert!(
             !line.contains("目标侧"),
@@ -367,8 +376,47 @@ fn a_doubly_unreadable_entry_is_reported_without_permission_bits() {
     );
     let line = line_for(&run.stdout, "~/.occupied/rc");
     assert_eq!(token_of(line), "fail", "双侧都读不到必须是 fail: {line}");
+    let source = env.repo().join("shell/file/rc");
+    let target = env.home().join(".occupied/rc");
     assert!(
-        line.contains("源侧") && line.contains("目标侧") && line.contains("Not a directory"),
-        "fail 行必须同时给出两侧原因 (只透出一侧会让另一侧无从诊断): {line}"
+        line.contains(&format!("源侧路径 {}: Not a directory", source.display())),
+        "fail 行必须给出源侧路径与原因: {line}"
     );
+    assert!(
+        line.contains(&format!("目标侧路径 {}: Not a directory", target.display())),
+        "fail 行必须给出目标侧路径与原因: {line}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 仅目标侧不可读: 目标路径穿过普通文件, 源侧正常
+//
+// 与"仅源侧不可读"互为对偶: 说明只给出目标侧路径与原因, 不得以源路径代替.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_target_side_only_failure_reports_the_target_path() {
+    let env = TempEnv::new();
+    env.write_source("shell/bashrc", "managed\n");
+    fs::write(env.home().join(".occupied"), "not a directory\n").expect("写入目标侧占位文件");
+    env.write_manifest("[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"~/.occupied/rc\"\n");
+
+    let run = run(&env, &["status"]);
+
+    assert_eq!(
+        run.code, 1,
+        "stdout:\n{}\nstderr:\n{}",
+        run.stdout, run.stderr
+    );
+    let line = line_for(&run.stdout, "~/.occupied/rc");
+    assert_eq!(token_of(line), "fail", "{line}");
+    let target = env.home().join(".occupied/rc");
+    assert!(
+        line.contains(&format!(
+            "目标侧读取失败: 路径 {}: Not a directory",
+            target.display()
+        )),
+        "fail 行必须给出目标侧路径与原因: {line}"
+    );
+    assert!(!line.contains("源侧"), "源侧正常时不得捏造源侧原因: {line}");
 }

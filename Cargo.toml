@@ -3,12 +3,15 @@ name = "dotlink"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
+license = "MIT"
+description = "Declarative dotfile symlink manager"
+repository = "https://github.com/yjydist/dotlink"
 
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }
 toml = "1.1"
 thiserror = "2.0"
-time = { version = "0.3", features = ["local-offset"] }
+time = "0.3"
 
 [target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
 rustix = { version = "1.1", features = ["fs"] }

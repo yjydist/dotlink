@@ -20,8 +20,8 @@ use std::path::Path;
 use std::process::Command;
 
 use support::{
-    Run, TempEnv, entry_line_count, env_with_locked_target, line_for, run, running_as_root,
-    snapshot_all, token_of,
+    Run, TempEnv, backups_in, case_insensitive_volume, entry_line_count, env_with_locked_target,
+    line_for, run, running_as_root, same_identity, snapshot_all, token_of,
 };
 
 /// V-1 到 V-10 逐条: 四条命令都必须拒绝, 且拒绝必须是零改动.
@@ -712,6 +712,42 @@ fn v9_the_manifest_file_itself_is_rejected() {
 }
 
 #[test]
+fn v9_case_aliases_of_the_repo_root_and_manifest_are_rejected() {
+    if !case_insensitive_volume() {
+        println!(
+            "跳过 v9_case_aliases_of_the_repo_root_and_manifest_are_rejected: 当前卷大小写敏感, 无法构造大小写别名"
+        );
+        return;
+    }
+
+    let env = env_with_source();
+    // 仅大小写不同的写法在大小写不敏感卷上指向同一对象, 但规范化字符串不同:
+    // 只有身份判等能命中 V-9 的仓库根与清单文件两个落点.
+    let repo_alias = env.repo().display().to_string().to_uppercase();
+    let manifest_alias = format!("{repo_alias}/DOTLINK.TOML");
+
+    for (written, needle) in [
+        (repo_alias, "仓库根本身或其祖先"),
+        (manifest_alias, "清单文件自身"),
+    ] {
+        env.write_manifest(&format!(
+            "[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"{written}\"\n"
+        ));
+
+        // assert_all_commands_reject 同时断言四条命令退 2 与快照零改动: 仓库与
+        // 清单文件都必须保持原样.
+        assert_all_commands_reject(&env, needle);
+
+        let run = run(&env, &["preview"]);
+        assert!(
+            run.stderr.contains("entry[0]") && run.stderr.contains(&format!("`{written}`")),
+            "V-9 必须指出条目下标与书写形态 {written}: {}",
+            run.stderr
+        );
+    }
+}
+
+#[test]
 fn v9_legal_target_shapes_are_not_harmed() {
     let env = env_with_source();
     env.write_source("git/gitconfig", "managed\n");
@@ -851,6 +887,36 @@ fn v10_a_self_reference_that_normalizes_to_the_source_is_rejected() {
 }
 
 #[test]
+fn v10_case_aliases_that_are_self_referential_are_rejected() {
+    if !case_insensitive_volume() {
+        println!(
+            "跳过 v10_case_aliases_that_are_self_referential_are_rejected: 当前卷大小写敏感, 无法构造大小写别名"
+        );
+        return;
+    }
+
+    let env = env_with_source();
+    env.write_source("a", "original\n");
+    // `A` 与 `a` 在大小写不敏感卷上是同一个文件, 但路径字符串不同.
+    env.write_manifest("[[entry]]\nsource = \"a\"\ntarget = \"A\"\n");
+
+    assert_all_commands_reject(&env, "自指");
+
+    let run = run(&env, &["preview"]);
+    assert!(
+        run.stderr.contains("entry[0]") && run.stderr.contains("`A`"),
+        "V-10 必须指出条目下标与书写形态: {}",
+        run.stderr
+    );
+    // 快照已证明零改动; 这里再显式锁定源内容与原路径, 并确认没有生成备份.
+    env.assert_content(&env.repo().join("a"), "original\n");
+    assert!(
+        backups_in(env.repo()).is_empty(),
+        "自指清单不得在任何位置创建备份"
+    );
+}
+
+#[test]
 fn overlapping_source_and_target_paths_are_rejected_before_writes() {
     let env = env_with_source();
     env.make_source_dir("nvim");
@@ -913,6 +979,73 @@ fn nested_targets_are_rejected_regardless_of_order_or_existing_aliases() {
             );
         }
     }
+}
+
+#[test]
+fn v11_alias_directory_nesting_is_rejected_before_writes() {
+    if !case_insensitive_volume() {
+        println!(
+            "跳过 v11_alias_directory_nesting_is_rejected_before_writes: 当前卷大小写敏感, 无法构造大小写别名"
+        );
+        return;
+    }
+
+    let env = env_with_source();
+    env.make_source_dir("nvim");
+    // 预先创建目标目录, 使两个目标的祖先在文件系统上存在且身份可比较.
+    fs::create_dir_all(env.home().join(".config/nvim")).expect("创建目标目录");
+    env.write_manifest(
+        "[[entry]]\nsource = \"nvim\"\ntarget = \"~/.config/nvim\"\n\n\
+         [[entry]]\nsource = \"shell/bashrc\"\ntarget = \"~/.CONFIG/nvim/rc\"\n",
+    );
+
+    // 断言四条命令都拒绝, 且快照证明没有任何文件系统改动.
+    assert_all_commands_reject(&env, "路径重叠");
+
+    let run = run(&env, &["preview"]);
+    assert!(
+        run.stderr.contains("entry[0]") && run.stderr.contains("entry[1]"),
+        "V-11 必须指出相关条目: {}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains(".CONFIG") || run.stderr.contains(".config"),
+        "V-11 必须指出重叠路径: {}",
+        run.stderr
+    );
+}
+
+#[test]
+fn v9_a_firmlink_alias_of_home_is_rejected() {
+    if !cfg!(target_os = "macos") {
+        println!("跳过 v9_a_firmlink_alias_of_home_is_rejected: firmlink 仅存在于 macOS");
+        return;
+    }
+
+    let env = env_with_source();
+    let home = env.home();
+    let alias = Path::new("/System/Volumes/Data").join(home.strip_prefix("/").unwrap_or(home));
+    if !same_identity(&alias, home) {
+        println!(
+            "跳过 v9_a_firmlink_alias_of_home_is_rejected: firmlink 别名 {} 与临时主目录不是同一对象",
+            alias.display()
+        );
+        return;
+    }
+
+    env.write_manifest(&format!(
+        "[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"{}\"\n",
+        alias.display()
+    ));
+
+    assert_all_commands_reject(&env, "主目录");
+
+    let run = run(&env, &["preview"]);
+    assert!(
+        run.stderr.contains("entry[0]") && run.stderr.contains(&alias.display().to_string()),
+        "V-9 必须指出条目下标与书写形态: {}",
+        run.stderr
+    );
 }
 
 // ---------------------------------------------------------------------------
