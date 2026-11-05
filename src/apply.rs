@@ -55,13 +55,23 @@ pub fn apply_entry(entry: &Entry, state: &EntryState) -> Result<Option<PathBuf>>
 fn create_link(entry: &Entry) -> Result<()> {
     create_parent_dirs(&entry.target_path)?;
 
-    os::create_symlink(&entry.source_path, &entry.target_path).map_err(|error| {
-        Error::EntryFailed(format!(
+    match create_symlink(&entry.source_path, &entry.target_path) {
+        Ok(()) => Ok(()),
+        Err(error) => Err(Error::EntryFailed(format!(
             "建立链接 {} -> {} 失败: {error}",
             entry.target_path.display(),
             entry.source_path.display()
-        ))
-    })
+        ))),
+    }
+}
+
+/// 建立符号链接; 测试接缝可让"下一次建链"失败.
+fn create_symlink(source: &Path, target: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if take_next_link_failure() {
+        return Err(std::io::Error::other("模拟建链失败"));
+    }
+    os::create_symlink(source, target)
 }
 
 /// 创建 `path` 缺失的各级父目录.
@@ -81,11 +91,12 @@ fn create_dir_all(dir: &Path) -> Result<()> {
 /// `Action::ReplaceAndBackup` 的严格顺序 (openspec/specs/link-deployment/spec.md 的
 /// "获许可的替换先完成备份再删除原对象" 与 "替换删除前必须原子复核身份").
 ///
-/// 1. 用 `symlink_metadata` 记录目标的对象身份 (设备号, inode 与对象类型);
-/// 2. 把 `target_path` 上的**现有对象**备份出去 (文件 / 目录递归 / 符号链接本身);
-/// 3. `write_backup` 返回即意味着备份已完整落定**并被改名为最终名**;
-/// 4. 以原子不覆盖的 rename 把目标移入同目录暂存名, 复核暂存对象仍是第 1 步记录的
-///    那一个, 只有复核通过才删除暂存对象并建立新链接.
+/// 1. 把 `target_path` 上的**现有对象**备份出去 (文件 / 目录递归 / 符号链接本身);
+///    备份写入在复制起点 lstat 到顶层对象的元数据, 并随 `PublishedBackup` 返回;
+/// 2. `write_backup` 返回即意味着备份已完整落定**并被改名为最终名**;
+/// 3. 以备份复制起点的元数据作为身份基准, 用原子不覆盖的 rename 把目标移入同目录
+///    暂存名, 复核暂存对象仍是备份实际复制的那个对象, 只有复核通过才删除暂存对象
+///    并建立新链接.
 ///
 /// 顺序不可颠倒: 原对象是唯一副本, 先删除再复制会让一次中途失败变成不可恢复的
 /// 数据丢失. 暂存与复核把"判定"和"删除"之间的竞态收窄为一次 rename: 外部替换物
@@ -94,33 +105,57 @@ fn create_dir_all(dir: &Path) -> Result<()> {
 fn replace_and_backup(entry: &Entry, kind: BackupKind) -> Result<Option<PathBuf>> {
     let target = entry.target_path.as_path();
 
-    let identity = ObjectIdentity::snapshot(target)
-        .map_err(|error| Error::EntryFailed(format!("读取 {} 失败: {error}", target.display())))?;
+    #[cfg(test)]
+    run_before_backup_hook();
 
     // 备份落定之后才允许删除原对象, 因此这之后的失败都发生在"原内容已被备份"之后:
     // 错误里带上备份路径, 用户才知道去哪儿找回它 (FR-016).
-    let backup_path = backup::write_backup(target, kind)?;
+    let published = backup::write_backup(target, kind)?;
     #[cfg(test)]
     run_after_backup_hook();
-    replace_with_backup(entry, identity).map_err(|error| {
+
+    // 身份基准与备份内容同源: 以复制起点 lstat 到的对象为准, 而不是备份前的另一次
+    // 快照 (设计 D1). 备份前目标被替换时, 备份复制的就是替换后的对象, 复核因此通过;
+    // 备份后被替换时, 替换物与基准不一致, 会被移回并保留.
+    let identity = ObjectIdentity::from_metadata(&published.source_metadata);
+    replace_with_backup(entry, identity, &published.path).map_err(|error| {
         Error::EntryFailed(format!(
             "{error} (原内容已备份到 {})",
-            backup_path.display()
+            published.path.display()
         ))
     })?;
 
-    Ok(Some(backup_path))
+    Ok(Some(published.path))
 }
 
 /// 备份完成后的替换: 暂存并复核身份, 复核通过才删除暂存对象, 最后建立链接.
-fn replace_with_backup(entry: &Entry, identity: ObjectIdentity) -> Result<()> {
+///
+/// 删除已复核的暂存对象后建链失败时, 目标已经为空, 原内容只在备份里: 立即从本次
+/// 刚发布的备份恢复, 备份保留不消费 (设计 D2).
+fn replace_with_backup(entry: &Entry, identity: ObjectIdentity, backup: &Path) -> Result<()> {
     let target = entry.target_path.as_path();
     let staged = stage_and_verify(target, identity)?;
     remove_staged(target, &staged)?;
-    create_link(entry)
+    match create_link(entry) {
+        Ok(()) => Ok(()),
+        Err(error) => Err(recover_original(target, backup, error)),
+    }
 }
 
-/// 对象身份快照: 设备号, inode 与对象类型 (设计 D2).
+/// 建链失败后的收尾: 从本次备份恢复原内容, 备份不删除.
+///
+/// 恢复成功与失败分别组装说明; 外层 [`replace_and_backup`] 统一补上备份路径, 因此
+/// 两条说明都能让用户找回原内容 (FR-016, 设计 D2 / D6).
+fn recover_original(target: &Path, backup: &Path, cause: Error) -> Error {
+    match backup::restore_backup(target, backup) {
+        Ok(()) => Error::EntryFailed(format!("{cause}; 已从备份恢复原内容, 备份未删除")),
+        Err(error) => Error::EntryFailed(format!(
+            "{cause}; 从备份恢复原内容失败: {error}, 备份未删除"
+        )),
+    }
+}
+
+/// 对象身份快照: 设备号, inode 与对象类型 (设计 D1).
 ///
 /// 只比较这三项: 足以区分"刚备份的对象"与外部替换物, 又不依赖 mtime 等易变字段.
 #[cfg(unix)]
@@ -143,11 +178,6 @@ enum ObjectKind {
 
 #[cfg(unix)]
 impl ObjectIdentity {
-    fn snapshot(path: &Path) -> std::io::Result<Self> {
-        let metadata = fs::symlink_metadata(path)?;
-        Ok(Self::from_metadata(&metadata))
-    }
-
     fn from_metadata(metadata: &fs::Metadata) -> Self {
         use std::os::unix::fs::MetadataExt;
 
@@ -167,6 +197,13 @@ impl ObjectIdentity {
             kind,
         }
     }
+
+    /// 供单测直接构造期望身份; 生产路径的身份来自备份复制起点的元数据.
+    #[cfg(test)]
+    fn snapshot(path: &Path) -> std::io::Result<Self> {
+        let metadata = fs::symlink_metadata(path)?;
+        Ok(Self::from_metadata(&metadata))
+    }
 }
 
 /// 不受支持平台的占位实现: 平台门禁会在运行到替换之前拒绝, 这里只需可编译.
@@ -176,34 +213,33 @@ struct ObjectIdentity;
 
 #[cfg(not(unix))]
 impl ObjectIdentity {
-    fn snapshot(_path: &Path) -> std::io::Result<Self> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "当前平台不支持对象身份复核",
-        ))
+    fn from_metadata(_metadata: &fs::Metadata) -> Self {
+        Self
     }
 }
 
-/// 原子暂存目标并复核它仍是备份前快照记录的对象 (设计 D2).
+/// 原子暂存目标并复核它仍是备份复制起点记录的对象 (设计 D1).
 ///
 /// 复核失败时把暂存对象移回原路径 (原路径为空时), **不删除**它; 无法移回时在
 /// 说明里给出暂存路径. 调用者只应在复核通过后删除返回的暂存对象.
 fn stage_and_verify(target: &Path, expected: ObjectIdentity) -> Result<PathBuf> {
     let staged = os::stage_aside(target, REPLACE_STAGING_LABEL)
         .map_err(|error| Error::EntryFailed(error.to_string()))?;
-    let actual = ObjectIdentity::snapshot(&staged).map_err(|error| {
-        staged_failure(
-            target,
-            &staged,
-            format!("复核暂存对象 {} 失败: {error}", staged.display()),
-        )
-    })?;
+    let actual = fs::symlink_metadata(&staged)
+        .map(|metadata| ObjectIdentity::from_metadata(&metadata))
+        .map_err(|error| {
+            staged_failure(
+                target,
+                &staged,
+                format!("复核暂存对象 {} 失败: {error}", staged.display()),
+            )
+        })?;
     if actual != expected {
         return Err(staged_failure(
             target,
             &staged,
             format!(
-                "拒绝删除 {}: 备份之后目标被外部替换 (暂存对象的身份与备份时不一致)",
+                "拒绝删除 {}: 备份时的对象与删除时的对象不一致 (暂存对象的身份与备份实际复制的对象不同)",
                 target.display()
             ),
         ));
@@ -281,6 +317,57 @@ fn run_after_backup_hook() {
             hook();
         }
     });
+}
+
+// 测试接缝: 备份开始之前运行一次注入的动作.
+//
+// 用于覆盖"备份前目标被替换": 备份复制的就是替换后的对象, 身份基准随之改变,
+// 复核应当通过 (设计 D1 / D2).
+#[cfg(test)]
+thread_local! {
+    static BEFORE_BACKUP: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn before_backup_hook(hook: impl FnOnce() + 'static) {
+    BEFORE_BACKUP.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_before_backup_hook() {
+    BEFORE_BACKUP.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+// 测试接缝: 下一次建链一次性失败, 并在失败前运行注入的动作.
+//
+// 注入动作用于在删除暂存对象之后, 恢复尝试之前布置目标占用, 以覆盖"恢复也失败"
+// (设计 D2 / D5).
+#[cfg(test)]
+thread_local! {
+    static NEXT_LINK_FAILURE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn fail_next_link(before_failure: impl FnOnce() + 'static) {
+    NEXT_LINK_FAILURE.with(|slot| *slot.borrow_mut() = Some(Box::new(before_failure)));
+}
+
+#[cfg(test)]
+fn take_next_link_failure() -> bool {
+    let hook = NEXT_LINK_FAILURE.with(|slot| slot.borrow_mut().take());
+    match hook {
+        Some(hook) => {
+            hook();
+            true
+        }
+        None => false,
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -612,7 +699,10 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(fs::read_to_string(&target).unwrap(), "replacement");
-        assert!(message.contains("被外部替换"), "{message}");
+        assert!(
+            message.contains("备份时的对象与删除时的对象不一致"),
+            "{message}"
+        );
         assert!(message.contains("原内容已备份到"), "{message}");
 
         // 备份是替换前那一刻的原内容, 且说明里给出的路径真实存在.
@@ -639,6 +729,45 @@ mod tests {
                     .contains(".dotlink-replace.partial")),
             "身份不一致时不得遗留暂存副本"
         );
+    }
+
+    /// 备份开始前目标被替换: 备份复制的就是替换后的对象, 身份基准随之改变, 替换放行.
+    ///
+    /// 旧实现以"备份开始前"的另一次快照为基准, 会在这条路径上拒绝替换; 新实现以
+    /// 复制起点为准, 替换后的对象已经进入备份, 删除它不会丢失内容 (设计 D1).
+    #[test]
+    fn a_replacement_before_backup_uses_the_copied_object_as_the_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        fs::write(repo.join("bashrc"), "managed").unwrap();
+        fs::create_dir_all(repo.join("home")).unwrap();
+
+        let target = repo.join("home/bashrc");
+        fs::write(&target, "original").unwrap();
+        let entry = entry_for(repo, "bashrc", &target);
+
+        let replaced = target.clone();
+        before_backup_hook(move || {
+            fs::remove_file(&replaced).unwrap();
+            fs::write(&replaced, "replacement").unwrap();
+        });
+
+        let backup_path = apply_entry(
+            &entry,
+            &state_with(Current::ForeignFile, Action::ReplaceAndBackup),
+        )
+        .unwrap()
+        .expect("替换成功时仍必须报告备份路径");
+
+        // 备份保存的是复制起点看到的对象, 也就是替换物; 它已被安全删除, 目标改为链接.
+        assert_eq!(fs::read_to_string(&backup_path).unwrap(), "replacement");
+        assert!(
+            fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "managed");
     }
 
     #[test]
@@ -671,7 +800,12 @@ mod tests {
 
         let error = stage_and_verify(&target, identity).unwrap_err();
 
-        assert!(error.to_string().contains("被外部替换"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("备份时的对象与删除时的对象不一致"),
+            "{error}"
+        );
         assert_eq!(fs::read_to_string(&target).unwrap(), "replacement");
         assert!(
             fs::read_dir(dir.path())
@@ -699,12 +833,47 @@ mod tests {
 
         let error = stage_and_verify(&target, identity).unwrap_err();
 
-        assert!(error.to_string().contains("被外部替换"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("备份时的对象与删除时的对象不一致"),
+            "{error}"
+        );
         assert!(fs::symlink_metadata(&target).unwrap().is_dir());
         assert_eq!(
             fs::read_to_string(target.join("nested")).unwrap(),
             "replacement"
         );
+    }
+
+    #[test]
+    fn stage_and_verify_moves_a_replaced_symlink_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("bashrc");
+        fs::write(&target, "original").unwrap();
+        let identity = ObjectIdentity::snapshot(&target).unwrap();
+
+        // 目标被替换成另一个符号链接: 身份不同, 必须移回并保留.
+        fs::remove_file(&target).unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        fs::write(&elsewhere, "replacement").unwrap();
+        os::create_symlink(&elsewhere, &target).unwrap();
+
+        let error = stage_and_verify(&target, identity).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("备份时的对象与删除时的对象不一致"),
+            "{error}"
+        );
+        assert!(
+            fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_link(&target).unwrap(), elsewhere);
     }
 
     #[test]
@@ -839,6 +1008,131 @@ mod tests {
         assert_eq!(
             fs::read_to_string(staged.join("locked/secret")).unwrap(),
             "secret"
+        );
+    }
+
+    /// 从条目说明的 `(原内容已备份到 ...)` 尾缀取出备份路径.
+    fn backup_from_message(message: &str) -> PathBuf {
+        let marker = "(原内容已备份到 ";
+        let start = message
+            .find(marker)
+            .unwrap_or_else(|| panic!("错误必须给出备份路径: {message}"))
+            + marker.len();
+        let end = message
+            .rfind(')')
+            .unwrap_or_else(|| panic!("备份路径应以 `)` 收尾: {message}"));
+        PathBuf::from(&message[start..end])
+    }
+
+    /// 建链失败时目标为空, 原内容从本次备份恢复; 备份保留, 该行仍是失败.
+    #[test]
+    fn a_failed_link_restores_the_backed_up_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        fs::write(repo.join("bashrc"), "managed").unwrap();
+        fs::create_dir_all(repo.join("home")).unwrap();
+
+        let target = repo.join("home/bashrc");
+        fs::write(&target, "original").unwrap();
+        let entry = entry_for(repo, "bashrc", &target);
+
+        fail_next_link(|| {});
+        let error = apply_entry(
+            &entry,
+            &state_with(Current::ForeignFile, Action::ReplaceAndBackup),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+
+        // 目标重新拥有原内容, 不是链接; 备份保留, 说明同时给出恢复结论与备份路径.
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "original",
+            "建链失败后必须恢复原内容"
+        );
+        assert!(
+            !fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(message.contains("模拟建链失败"), "{message}");
+        assert!(message.contains("已从备份恢复原内容"), "{message}");
+        let backup = backup_from_message(&message);
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "original");
+    }
+
+    /// 建链失败后恢复也失败: 期间出现的内容保持原样, 说明给出备份路径与恢复原因.
+    #[test]
+    fn a_failed_restore_after_a_failed_link_keeps_the_occupant() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        fs::write(repo.join("bashrc"), "managed").unwrap();
+        fs::create_dir_all(repo.join("home")).unwrap();
+
+        let target = repo.join("home/bashrc");
+        fs::write(&target, "original").unwrap();
+        let entry = entry_for(repo, "bashrc", &target);
+
+        // 删除暂存对象之后, 恢复尝试之前: 并发内容占用了目标路径.
+        let occupied = target.clone();
+        fail_next_link(move || {
+            fs::write(&occupied, "concurrent").unwrap();
+        });
+        let error = apply_entry(
+            &entry,
+            &state_with(Current::ForeignFile, Action::ReplaceAndBackup),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "concurrent",
+            "恢复不得覆盖并发新建的内容"
+        );
+        assert!(message.contains("模拟建链失败"), "{message}");
+        assert!(message.contains("从备份恢复原内容失败"), "{message}");
+        let backup = backup_from_message(&message);
+        assert_eq!(
+            fs::read_to_string(&backup).unwrap(),
+            "original",
+            "恢复失败时原内容必须仍可从备份找回"
+        );
+    }
+
+    /// 原对象是目录: 建链失败后恢复完整的目录树, 备份保留.
+    #[test]
+    fn a_failed_link_restores_a_backed_up_directory_completely() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        fs::write(repo.join("nvim.lua"), "managed").unwrap();
+        let target = repo.join("home/nvim");
+        fs::create_dir_all(target.join("lua/plugins")).unwrap();
+        fs::write(target.join("init.lua"), "old").unwrap();
+        fs::write(target.join("lua/plugins/a.lua"), "old-a").unwrap();
+        let entry = entry_for(repo, "nvim.lua", &target);
+
+        fail_next_link(|| {});
+        let error = apply_entry(
+            &entry,
+            &state_with(Current::ForeignDir, Action::ReplaceAndBackup),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+
+        assert!(fs::symlink_metadata(&target).unwrap().is_dir());
+        assert_eq!(fs::read_to_string(target.join("init.lua")).unwrap(), "old");
+        assert_eq!(
+            fs::read_to_string(target.join("lua/plugins/a.lua")).unwrap(),
+            "old-a",
+            "目录必须完整恢复"
+        );
+        assert!(message.contains("已从备份恢复原内容"), "{message}");
+        let backup = backup_from_message(&message);
+        assert_eq!(
+            fs::read_to_string(backup.join("lua/plugins/a.lua")).unwrap(),
+            "old-a"
         );
     }
 }

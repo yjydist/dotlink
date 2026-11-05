@@ -1112,3 +1112,66 @@ fn undo_skips_special_file_targets() {
     );
     assert!(!run.stdout.contains(".dotlink-backup."), "{}", run.stdout);
 }
+
+// ---------------------------------------------------------------------------
+// 目标为空且同目录有完整备份: undo 恢复该备份 (apply 末段失败或崩溃后的收敛路径)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn undo_restores_a_backup_when_the_target_is_absent() {
+    let env = TempEnv::new();
+    env.write_source("shell/bashrc", "managed\n");
+    env.write_source("shell/zshrc", "managed\n");
+    env.write_manifest(&manifest_of(&[
+        ("shell/bashrc", "~/.bashrc", "-"),
+        ("shell/zshrc", "~/.zshrc", "-"),
+    ]));
+
+    let backup = env.home().join(".bashrc.dotlink-backup.20260101T000000");
+    fs::write(&backup, "original\n").unwrap();
+
+    let first = run(&env, &["undo"]);
+    assert_eq!(first.code, 1, "恢复属于撤销动作, 故退 1: {}", first.stdout);
+    let restored = line_for(&first.stdout, "~/.bashrc");
+    assert_eq!(token_of(restored), "restore", "{restored}");
+    assert!(
+        restored.contains(&backup.display().to_string()),
+        "restore 行必须给出备份路径: {restored}"
+    );
+    assert!(
+        restored.contains("目标为空"),
+        "目标为空时的恢复必须与移除链接后的恢复可辨: {restored}"
+    );
+    env.assert_content(&env.home().join(".bashrc"), "original\n");
+    env.assert_content(&backup, "original\n");
+
+    // 同目录无备份的空目标仍是 ok, 不得被误归为 skip.
+    let untouched = line_for(&first.stdout, "~/.zshrc");
+    assert_eq!(token_of(untouched), "ok", "{untouched}");
+    assert!(fs::symlink_metadata(env.home().join(".zshrc")).is_err());
+
+    // 第二次: 恢复出的是普通文件, 不属于本工具创建 -> skip; 目标与备份不变.
+    let second = run(&env, &["undo"]);
+    assert_eq!(second.code, 1, "{}", second.stdout);
+    let skipped = line_for(&second.stdout, "~/.bashrc");
+    assert_eq!(token_of(skipped), "skip", "{skipped}");
+    env.assert_content(&env.home().join(".bashrc"), "original\n");
+    env.assert_content(&backup, "original\n");
+    assert_eq!(token_of(line_for(&second.stdout, "~/.zshrc")), "ok");
+}
+
+#[test]
+fn undo_with_an_absent_target_and_no_backup_is_ok() {
+    let env = TempEnv::new();
+    env.write_source("shell/bashrc", "managed\n");
+    env.write_manifest(&manifest_of(&[("shell/bashrc", "~/.bashrc", "-")]));
+
+    let result = run(&env, &["undo"]);
+    assert_eq!(result.code, 0, "无备份的空目标保持幂等: {}", result.stdout);
+    assert_eq!(token_of(line_for(&result.stdout, "~/.bashrc")), "ok");
+    assert!(
+        fs::symlink_metadata(env.home().join(".bashrc")).is_err(),
+        "无备份时不得创建任何内容"
+    );
+    assert!(backups_in(env.home()).is_empty());
+}

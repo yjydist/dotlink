@@ -386,10 +386,12 @@ fn status_token(current: Current) -> EntryOutcome {
 /// `LinkedCorrect` / `LinkedWrong` 的 token 由同目录**有无备份**决定 -- 与 `Current`
 /// 是哪一个无关 (后者只决定"是否允许移除", 前者决定"移除后是否恢复").
 ///
-/// `Absent` -> `Ok` 是幂等的关键行: 它使"撤销后目标为空的清单上再次运行 `undo`"落入
-/// "已是最新"列并退 0; 若误归为 `skip`, 第二次 `undo` 将退 1. 若上一次恢复过备份,
-/// 目标被恢复出的原内容占用: 普通文件 / 目录 / 仓库外链接判为冲突类 -> `skip` 并退 1;
-/// 恢复出的内容本身是仓库内链接时按归属规则重新归类, 有备份 -> `restore` 并退 1.
+/// `Absent` 且有完整备份 -> `restore`: 目标为空时恢复备份, 这是 `apply` 末段建链失败
+/// 或崩溃后的收敛路径. `Absent` 且无备份 -> `Ok`, 是幂等的关键行: 它使"撤销后目标为
+/// 空的清单上再次运行 `undo`"落入"已是最新"列并退 0; 若误归为 `skip`, 第二次 `undo`
+/// 将退 1. 若上一次恢复过备份, 目标被恢复出的原内容占用: 普通文件 / 目录 / 仓库外链接
+/// 判为冲突类 -> `skip` 并退 1; 恢复出的内容本身是仓库内链接时按归属规则重新归类,
+/// 有备份 -> `restore` 并退 1.
 fn undo_token(current: Current, has_backup: bool) -> EntryOutcome {
     match current {
         Current::LinkedCorrect | Current::LinkedWrong => {
@@ -403,7 +405,13 @@ fn undo_token(current: Current, has_backup: bool) -> EntryOutcome {
         | Current::ForeignFile
         | Current::ForeignDir
         | Current::ForeignOther => EntryOutcome::Skip,
-        Current::Absent => EntryOutcome::Ok,
+        Current::Absent => {
+            if has_backup {
+                EntryOutcome::Restore
+            } else {
+                EntryOutcome::Ok
+            }
+        }
         Current::SourceMissing => EntryOutcome::Missing,
         Current::Unreadable => EntryOutcome::Fail,
     }
@@ -483,9 +491,13 @@ fn note_for_token(
         }
         EntryOutcome::Wrong => format!("指向错误 (实际指向: {})", actual_target(detail)),
         EntryOutcome::Undo => "已移除本工具创建的链接 (该条目无备份可恢复)".to_string(),
-        EntryOutcome::Restore => match backup_path {
-            Some(path) => format!("已移除链接, 并从备份恢复: {}", path.display()),
-            None => "已移除链接, 并从备份恢复".to_string(),
+        EntryOutcome::Restore => match (current, backup_path) {
+            (Current::Absent, Some(path)) => {
+                format!("目标为空, 已从备份恢复: {}", path.display())
+            }
+            (Current::Absent, None) => "目标为空, 已从备份恢复".to_string(),
+            (_, Some(path)) => format!("已移除链接, 并从备份恢复: {}", path.display()),
+            (_, None) => "已移除链接, 并从备份恢复".to_string(),
         },
         EntryOutcome::Skip => format!(
             "该路径非本工具创建, 已跳过 (不删除): {}",
@@ -685,7 +697,13 @@ mod tests {
             | Current::ForeignFile
             | Current::ForeignDir
             | Current::ForeignOther => EntryOutcome::Skip,
-            Current::Absent => EntryOutcome::Ok,
+            Current::Absent => {
+                if has_backup {
+                    EntryOutcome::Restore
+                } else {
+                    EntryOutcome::Ok
+                }
+            }
             Current::SourceMissing => EntryOutcome::Missing,
             Current::Unreadable => EntryOutcome::Fail,
         }
@@ -823,7 +841,7 @@ mod tests {
     }
 
     #[test]
-    fn absent_gets_three_different_tokens() {
+    fn absent_gets_a_token_per_command_and_backup_presence() {
         assert_eq!(
             token_for(Command::Preview, Current::Absent, Action::Create, false),
             EntryOutcome::Create
@@ -839,6 +857,11 @@ mod tests {
         assert_eq!(
             token_for(Command::Undo, Current::Absent, Action::Create, false),
             EntryOutcome::Ok
+        );
+        // 目标为空但有完整备份: 撤销恢复该备份, 不是跳过, 也不是已是最新.
+        assert_eq!(
+            token_for(Command::Undo, Current::Absent, Action::Create, true),
+            EntryOutcome::Restore
         );
     }
 
@@ -1017,6 +1040,18 @@ mod tests {
         assert!(
             restore.contains(backup),
             "restore 行缺少备份路径: {restore}"
+        );
+        let absent_restore = note_for(
+            Command::Undo,
+            Current::Absent,
+            Action::Create,
+            &e,
+            "",
+            Some(Path::new(backup)),
+        );
+        assert!(
+            absent_restore.contains("目标为空") && absent_restore.contains(backup),
+            "目标为空时的 restore 行必须区分措辞并给出备份路径: {absent_restore}"
         );
 
         // 实际指向: wrong 与 foreign (占用物为符号链接时).

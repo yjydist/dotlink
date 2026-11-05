@@ -201,20 +201,31 @@ pub(crate) fn find_latest_backup(target: &Path) -> Result<Option<PathBuf>> {
     BackupFinder::default().find_latest(target)
 }
 
-/// 把 `object` 按 `kind` 的命名空间备份到它的同目录, 返回备份的最终路径.
+/// 已发布的备份: 最终路径与复制起点处顶层对象的元数据.
+///
+/// 元数据来自 [`copy_object`] 首次对源做的 `symlink_metadata`, 因此"备份的内容"与
+/// "身份基准"同源: 调用者可以用它复核删除的对象是不是备份里保存的那一个, 而不必在
+/// 备份之前另取一次快照 (设计 D1).
+#[derive(Debug)]
+pub(crate) struct PublishedBackup {
+    pub(crate) path: PathBuf,
+    pub(crate) source_metadata: fs::Metadata,
+}
+
+/// 把 `object` 按 `kind` 的命名空间备份到它的同目录, 返回最终路径与复制起点的元数据.
 ///
 /// `object` 可以是普通文件, 目录 (递归) 或符号链接 (**复制链接本身, 不跟随**).
 /// 返回 `Ok` 意味着备份已完整落定并改名到最终名 -- 调用者此时才可以删除原对象
 /// (openspec/specs/backup-fidelity/spec.md 的"备份的发布仍以完整复制为前提"). 失败时不留下最终名.
-pub(crate) fn write_backup(object: &Path, kind: BackupKind) -> Result<PathBuf> {
+pub(crate) fn write_backup(object: &Path, kind: BackupKind) -> Result<PublishedBackup> {
     write_backup_at(object, &timestamp(), kind)
 }
 
 /// 给定时间戳的备份写入 (见 [`backup_candidates_at`]): 测试用它绕过墙钟.
-fn write_backup_at(object: &Path, stamp: &str, kind: BackupKind) -> Result<PathBuf> {
+fn write_backup_at(object: &Path, stamp: &str, kind: BackupKind) -> Result<PublishedBackup> {
     let mut candidates = backup_candidates_at(object, stamp.to_string(), kind);
     let first = candidates.next().expect("备份候选名非空");
-    let partial = copy_to_staging(object, &first, PARTIAL_SUFFIX)?;
+    let (partial, source_metadata) = copy_to_staging(object, &first, PARTIAL_SUFFIX)?;
 
     for final_path in std::iter::once(first).chain(candidates) {
         match os::rename_noreplace(&partial, &final_path) {
@@ -224,7 +235,10 @@ fn write_backup_at(object: &Path, stamp: &str, kind: BackupKind) -> Result<PathB
                 sync_parent(&final_path).map_err(|error| {
                     Error::EntryFailed(format!("{error}; 备份已发布到 {}", final_path.display()))
                 })?;
-                return Ok(final_path);
+                return Ok(PublishedBackup {
+                    path: final_path,
+                    source_metadata,
+                });
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
@@ -266,7 +280,7 @@ pub(crate) fn restore_backup(
     target: &Path,
     backup: &Path,
 ) -> std::result::Result<(), RestoreError> {
-    let partial =
+    let (partial, _) =
         copy_to_staging(backup, target, RESTORE_SUFFIX).map_err(RestoreError::NotLanded)?;
 
     os::rename_noreplace(&partial, target).map_err(|error| {
@@ -309,12 +323,12 @@ impl CopyFailure {
     }
 }
 
-fn copy_to_staging(source: &Path, base: &Path, suffix: &str) -> Result<PathBuf> {
+fn copy_to_staging(source: &Path, base: &Path, suffix: &str) -> Result<(PathBuf, fs::Metadata)> {
     let mut last = PathBuf::new();
     for serial in 1..=MAX_STAGING_ATTEMPTS {
         let partial = staging_candidate(base, serial, suffix);
         match copy_object(source, &partial) {
-            Ok(()) => return Ok(partial),
+            Ok(metadata) => return Ok((partial, metadata)),
             Err(CopyFailure::StagingNameTaken) => last = partial,
             Err(CopyFailure::Fatal(error)) => {
                 return Err(Error::EntryFailed(error.to_string()));
@@ -337,12 +351,13 @@ fn staging_candidate(base: &Path, serial: u64, suffix: &str) -> PathBuf {
     with_suffix(base, &suffix)
 }
 
-/// 排他创建副本. 只有取得目的地所有权之后的失败才允许清理它.
+/// 排他创建副本, 返回复制起点处顶层对象的元数据. 只有取得目的地所有权之后的失败才
+/// 允许清理它.
 ///
 /// 返回值区分根名冲突与其余失败: 仅当**本函数自己创建目标根名**时收到
 /// `AlreadyExists` 才是 [`CopyFailure::StagingNameTaken`]; 子项递归通过
 /// [`copy_child`] 把同类失败包装成带子项路径的致命错误, 避免整树复制被误重试.
-fn copy_object(source: &Path, dest: &Path) -> std::result::Result<(), CopyFailure> {
+fn copy_object(source: &Path, dest: &Path) -> std::result::Result<fs::Metadata, CopyFailure> {
     let metadata = fs::symlink_metadata(source)
         .map_err(|error| CopyFailure::Fatal(copy_error("读取", source, error)))?;
     let file_type = metadata.file_type();
@@ -350,7 +365,8 @@ fn copy_object(source: &Path, dest: &Path) -> std::result::Result<(), CopyFailur
         let raw = os::read_link(source)
             .map_err(|error| CopyFailure::Fatal(copy_error("读取链接", source, error)))?;
         return os::create_symlink(&raw, dest)
-            .map_err(|error| CopyFailure::from_root_create("备份链接", dest, error));
+            .map_err(|error| CopyFailure::from_root_create("备份链接", dest, error))
+            .map(|()| metadata);
     }
 
     if file_type.is_dir() {
@@ -379,7 +395,8 @@ fn copy_object(source: &Path, dest: &Path) -> std::result::Result<(), CopyFailur
             skip_unsupported(os::sync_dir(dest))
                 .map_err(|error| CopyFailure::Fatal(copy_error("同步备份目录", dest, error)))
         })();
-        return finish_copy(dest, copied);
+        finish_copy(dest, copied)?;
+        return Ok(metadata);
     }
 
     if !file_type.is_file() {
@@ -411,7 +428,8 @@ fn copy_object(source: &Path, dest: &Path) -> std::result::Result<(), CopyFailur
             skip_unsupported(os::sync_file(&output))
                 .map_err(|error| CopyFailure::Fatal(copy_error("同步备份文件", dest, error)))
         });
-    finish_copy(dest, copied)
+    finish_copy(dest, copied)?;
+    Ok(metadata)
 }
 
 /// 递归复制一个子项.
@@ -429,7 +447,7 @@ fn copy_child(source: &Path, dest: &Path) -> std::result::Result<(), CopyFailure
     #[cfg(not(test))]
     let copied = copy_object(source, dest);
 
-    copied.map_err(|failure| match failure {
+    copied.map(|_| ()).map_err(|failure| match failure {
         CopyFailure::StagingNameTaken => nested_conflict(dest),
         fatal => fatal,
     })
@@ -868,9 +886,13 @@ mod tests {
         let stamp = "20260101T000000";
 
         fs::write(&target, "first").unwrap();
-        let first = write_backup_at(&target, stamp, BackupKind::User).unwrap();
+        let first = write_backup_at(&target, stamp, BackupKind::User)
+            .unwrap()
+            .path;
         fs::write(&target, "second").unwrap();
-        let second = write_backup_at(&target, stamp, BackupKind::User).unwrap();
+        let second = write_backup_at(&target, stamp, BackupKind::User)
+            .unwrap()
+            .path;
 
         assert_eq!(suffix_of(&target, &first), stamp);
         assert_eq!(suffix_of(&target, &second), format!("{stamp}.2"));
@@ -989,7 +1011,9 @@ mod tests {
         assert_eq!(find_latest_backup(&target).unwrap(), Some(old.clone()));
 
         fs::write(&target, "current").unwrap();
-        let heal = write_backup_at(&target, "20260101T000000", BackupKind::SelfHeal).unwrap();
+        let heal = write_backup_at(&target, "20260101T000000", BackupKind::SelfHeal)
+            .unwrap()
+            .path;
 
         assert_eq!(
             heal.file_name().unwrap().to_string_lossy(),
@@ -1161,7 +1185,9 @@ mod tests {
         let occupied = dir.path().join(format!("bashrc{USER_MARKER}{stamp}"));
         os::create_symlink(Path::new("/definitely/gone"), &occupied).unwrap();
 
-        let written = write_backup_at(&target, stamp, BackupKind::User).unwrap();
+        let written = write_backup_at(&target, stamp, BackupKind::User)
+            .unwrap()
+            .path;
 
         assert_eq!(suffix_of(&target, &written), format!("{stamp}.2"));
         assert_eq!(fs::read_to_string(&written).unwrap(), "payload");
@@ -1386,7 +1412,7 @@ mod tests {
         let object = dir.path().join("bashrc");
         fs::write(&object, "original").unwrap();
 
-        let backup = write_backup(&object, BackupKind::User).unwrap();
+        let backup = write_backup(&object, BackupKind::User).unwrap().path;
 
         assert_eq!(fs::read_to_string(&backup).unwrap(), "original");
         assert!(complete_suffix_of(&suffix_of(&object, &backup)).is_some());
@@ -1401,6 +1427,43 @@ mod tests {
         );
     }
 
+    /// 身份基准来自复制起点: 返回的元数据必须描述备份里保存的那个对象.
+    ///
+    /// 有了它, `apply` 不必在备份之前另取快照, 复核基准与备份内容天然同源 (设计 D1).
+    #[test]
+    fn write_backup_returns_the_metadata_of_the_copied_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let object = dir.path().join("bashrc");
+        fs::write(&object, "original").unwrap();
+
+        let published = write_backup(&object, BackupKind::User).unwrap();
+
+        let source = fs::symlink_metadata(&object).unwrap();
+        let copied = fs::symlink_metadata(&published.path).unwrap();
+        assert_eq!(published.source_metadata.ino(), source.ino());
+        assert_eq!(published.source_metadata.dev(), source.dev());
+        assert_eq!(
+            published.source_metadata.file_type().is_file(),
+            copied.file_type().is_file()
+        );
+
+        // 符号链接备份的是链接本身, 返回的元数据也必须是链接的元数据.
+        let link = dir.path().join("link");
+        os::create_symlink(Path::new("bashrc"), &link).unwrap();
+        let published = write_backup(&link, BackupKind::User).unwrap();
+        assert!(published.source_metadata.file_type().is_symlink());
+        assert_eq!(
+            published.source_metadata.ino(),
+            fs::symlink_metadata(&link).unwrap().ino()
+        );
+        assert!(
+            fs::symlink_metadata(&published.path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
     #[test]
     fn write_backup_copies_directories_recursively() {
         let dir = tempfile::tempdir().unwrap();
@@ -1409,7 +1472,7 @@ mod tests {
         fs::write(object.join("init.lua"), "init").unwrap();
         fs::write(object.join("lua/plugins/a.lua"), "a").unwrap();
 
-        let backup = write_backup(&object, BackupKind::User).unwrap();
+        let backup = write_backup(&object, BackupKind::User).unwrap().path;
 
         assert_eq!(fs::read_to_string(backup.join("init.lua")).unwrap(), "init");
         assert_eq!(
@@ -1430,7 +1493,7 @@ mod tests {
         let object = dir.path().join("bashrc");
         os::create_symlink(Path::new("real"), &object).unwrap();
 
-        let backup = write_backup(&object, BackupKind::User).unwrap();
+        let backup = write_backup(&object, BackupKind::User).unwrap().path;
 
         let metadata = fs::symlink_metadata(&backup).unwrap();
         assert!(
@@ -1449,7 +1512,7 @@ mod tests {
         fs::create_dir_all(&object).unwrap();
         os::create_symlink(Path::new("/definitely/gone"), &object.join("dangling")).unwrap();
 
-        let backup = write_backup(&object, BackupKind::User).unwrap();
+        let backup = write_backup(&object, BackupKind::User).unwrap().path;
 
         let nested = fs::symlink_metadata(backup.join("dangling")).unwrap();
         assert!(nested.file_type().is_symlink());
@@ -1796,7 +1859,7 @@ mod tests {
         fs::write(&occupied, "keep").unwrap();
         let inode = fs::symlink_metadata(&occupied).unwrap().ino();
 
-        let staged = copy_to_staging(&source, &base, PARTIAL_SUFFIX).unwrap();
+        let (staged, _) = copy_to_staging(&source, &base, PARTIAL_SUFFIX).unwrap();
 
         assert_ne!(staged, occupied, "不得覆盖已占用的暂存名");
         assert_eq!(fs::symlink_metadata(&occupied).unwrap().ino(), inode);
@@ -2005,7 +2068,9 @@ mod tests {
         let occupied = staging_candidate(&base, 1, PARTIAL_SUFFIX);
         fs::write(&occupied, "keep").unwrap();
 
-        let backup = write_backup_at(&source, "20260101T000000", BackupKind::User).unwrap();
+        let backup = write_backup_at(&source, "20260101T000000", BackupKind::User)
+            .unwrap()
+            .path;
 
         assert_eq!(backup, base);
         assert_eq!(
@@ -2172,7 +2237,7 @@ mod tests {
                     scope.spawn(move || {
                         barrier.wait();
                         (0..4)
-                            .map(|_| write_backup(object, BackupKind::User).unwrap())
+                            .map(|_| write_backup(object, BackupKind::User).unwrap().path)
                             .collect::<Vec<_>>()
                     })
                 })
@@ -2318,7 +2383,7 @@ mod tests {
         fs::write(object.join("lua/plugins/a.lua"), "a").unwrap();
         set_known_mtime(&object, 1_600_000_000, 123_456_789);
 
-        let backup = write_backup(&object, BackupKind::User).unwrap();
+        let backup = write_backup(&object, BackupKind::User).unwrap().path;
 
         let copied = fs::metadata(&backup).unwrap();
         assert_eq!(copied.mtime(), 1_600_000_000);
@@ -2342,7 +2407,7 @@ mod tests {
         set_known_mtime(&original, 1_577_836_800, 42);
         set_user_xattr(&original, b"fidelity");
 
-        let backup = write_backup(&original, BackupKind::User).unwrap();
+        let backup = write_backup(&original, BackupKind::User).unwrap().path;
         fs::remove_file(&original).unwrap();
         restore_backup(&original, &backup).unwrap();
 

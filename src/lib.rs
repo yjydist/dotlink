@@ -287,8 +287,11 @@ fn undo(manifest: &Manifest, states: &[EntryState]) -> Vec<ReportRow> {
             // 备份查找取不到结果不等于"无备份": 目录读取失败是环境故障, 与
             // `Unreadable` 同类处置 -- 该条目记为 `fail` 且不再触碰文件系统, 底层原因
             // 随行报告; 把它吞成"无备份"会让条目落进成功列的 `undo` 并移除链接.
+            //
+            // `Absent` 也要查: 目标为空且有完整备份时 `undo` 负责恢复该备份 (例如
+            // `apply` 末段建链失败或崩溃后), 无备份才是"已是最新" (设计 D5).
             let snapshot = match state.current {
-                Current::LinkedCorrect | Current::LinkedWrong => {
+                Current::LinkedCorrect | Current::LinkedWrong | Current::Absent => {
                     backups.find_latest(&entry.target_path)
                 }
                 _ => Ok(None),
