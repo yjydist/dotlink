@@ -290,6 +290,32 @@ pub fn backups_in(dir: &Path) -> Vec<String> {
     names
 }
 
+/// 某目录下所有自愈备份文件名 (含最终名与 `.partial` 残留).
+pub fn heal_backups_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap_or_else(|error| panic!("列举 {} 失败: {error}", dir.display()))
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".dotlink-heal."))
+        .collect();
+    names.sort();
+    names
+}
+
+/// 从命令输出中取出 `.dotlink-heal.` 备份路径的词.
+///
+/// 不要求路径已存在: preview 只报告预测值, apply / undo 的输出则可在调用点断言存在.
+#[track_caller]
+pub fn heal_backup_from_output(stdout: &str) -> PathBuf {
+    for word in stdout.split_whitespace() {
+        if !word.contains(".dotlink-heal.") {
+            continue;
+        }
+        return PathBuf::from(word.trim_end_matches([',', ';', '.', ')']));
+    }
+    panic!("输出中未给出自愈备份路径: {stdout}");
+}
+
 /// 从命令输出中取出备份文件的完整路径 (FR-016 的"必现信息").
 ///
 /// 输出里的路径可能被标点 (`,;.` 与 `)`) 收尾, 因此先试原词, 再试去掉收尾标点的形态.

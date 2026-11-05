@@ -27,8 +27,37 @@ use time::{OffsetDateTime, UtcOffset};
 use crate::error::{Error, Result};
 use crate::os;
 
-/// 备份名中的固定标记: `<原名>.dotlink-backup.<时间戳>`.
-const MARKER: &str = ".dotlink-backup.";
+/// 用户备份命名空间的标记: `<原名>.dotlink-backup.<时间戳>`.
+///
+/// 只有这个命名空间参与"最新备份"查找, 因此外部占用触发的替换与撤销恢复共用它
+/// (openspec/specs/link-teardown/spec.md 的"撤销只恢复用户原始备份").
+const USER_MARKER: &str = ".dotlink-backup.";
+
+/// 自愈备份命名空间的标记: `<原名>.dotlink-heal.<时间戳>`.
+///
+/// 本工具重建自己留下的错误链接时, 旧链接按这个命名空间备份. 它不是用户内容,
+/// 因此刻意与 [`USER_MARKER`] 分开, 使撤销查找器天然看不到它.
+const SELF_HEAL_MARKER: &str = ".dotlink-heal.";
+
+/// 备份命名空间: 用户内容与工具自愈产生的旧链接分开存放.
+///
+/// 命名空间只影响名字中的标记, 不改变暂存, 复制, 发布与同步路径.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BackupKind {
+    /// 被替换的外部占用物: 普通文件, 目录或外部符号链接.
+    User,
+    /// 本工具创建但指向错误的旧链接 (重建前先备份链接本身).
+    SelfHeal,
+}
+
+impl BackupKind {
+    fn marker(self) -> &'static str {
+        match self {
+            Self::User => USER_MARKER,
+            Self::SelfHeal => SELF_HEAL_MARKER,
+        }
+    }
+}
 
 /// 未完成备份的后缀, 加在**时间戳之后**: `x.dotlink-backup.20260101T000000.partial`.
 const PARTIAL_SUFFIX: &str = ".partial";
@@ -42,6 +71,10 @@ const RESTORE_SUFFIX: &str = ".dotlink-restore.partial";
 /// 持续占用名字时无界循环, 同时保留"换一个序号重试"的既有行为.
 const MAX_STAGING_ATTEMPTS: u64 = 16;
 
+/// 撤销用的"最新备份"查找器.
+///
+/// 只扫描用户备份命名空间: 自愈备份 (`.dotlink-heal.`) 不是可恢复的用户内容, 不参与
+/// 快照, 也不会让撤销把"有备份"当作可以恢复的依据 (设计 D4).
 #[derive(Default)]
 pub(crate) struct BackupFinder {
     directories: HashMap<PathBuf, Result<DirectoryBackups>>,
@@ -71,27 +104,31 @@ impl BackupFinder {
     }
 }
 
-/// 构造 `<原名>.dotlink-backup.<YYYYMMDDThhmmss>` 形态的备份路径.
+/// 构造 `<原名>.<标记><YYYYMMDDThhmmss>` 形态的备份路径, 标记由 `kind` 决定.
 ///
 /// 若算出的名字已被占用 (用 `symlink_metadata` 检测 -- `Path::exists` 对悬空链接
 /// 返回 false, 会误判为未占用), 追加序号 `.2`, `.3` ... 直到未占用. 同一秒内对
 /// 同一路径的两次替换因此产生两个并存的备份, 而不是后者覆盖前者.
-pub fn backup_path_for(target: &Path) -> PathBuf {
-    backup_candidates(target)
+pub fn backup_path_for(target: &Path, kind: BackupKind) -> PathBuf {
+    backup_candidates(target, kind)
         .find(|path| fs::symlink_metadata(path).is_err())
         .expect("序号消歧必然终止")
 }
 
-fn backup_candidates(target: &Path) -> impl Iterator<Item = PathBuf> {
-    backup_candidates_at(target, timestamp())
+fn backup_candidates(target: &Path, kind: BackupKind) -> impl Iterator<Item = PathBuf> {
+    backup_candidates_at(target, timestamp(), kind)
 }
 
 /// 给定时间戳的候选名序列 (裸名, `.2`, `.3` ...).
 ///
 /// 时间戳是参数而不是在闭包里取当前时刻: 这样"同一秒内的两次替换产生 `.2`"可以被
 /// 确定性地测试, 不受墙钟是否跨秒的影响.
-fn backup_candidates_at(target: &Path, stamp: String) -> impl Iterator<Item = PathBuf> {
-    let mut base = backup_base(target);
+fn backup_candidates_at(
+    target: &Path,
+    stamp: String,
+    kind: BackupKind,
+) -> impl Iterator<Item = PathBuf> {
+    let mut base = backup_base(target, kind);
     base.push(stamp);
     let base = parent_dir(target).join(base);
     (1_u64..).map(move |serial| {
@@ -114,6 +151,11 @@ fn backup_candidates_at(target: &Path, stamp: String) -> impl Iterator<Item = Pa
 /// 因此复制中途中断留下的 `...<时间戳>.partial` 既不参与"取最新", 也不会被 `undo`
 /// 消费 (openspec/specs/backup-lifecycle/spec.md 的"只有完整命名的备份参与查找").
 ///
+/// **只接受用户备份命名空间**: 扫描按 [`USER_MARKER`] 切分名字, 自愈备份使用
+/// [`SELF_HEAL_MARKER`], 即使原文件名本身含 `.dotlink-backup.`, 最后一个用户标记
+/// 之后也一定包含 `.dotlink-heal.` 段, 不可能是完整后缀. 自愈备份因此不会成为
+/// "最新备份", 也不会被撤销恢复或消费.
+///
 /// 目录读取失败不是"无备份"而是**环境故障**, 原样上抛 (调用者按 `Unreadable` 的
 /// 先例报 `fail` 并给出底层原因); 只有目录不存在 (`NotFound`) 才算没有备份.
 fn scan_backups(directory: &Path) -> Result<DirectoryBackups> {
@@ -130,7 +172,7 @@ fn scan_backups(directory: &Path) -> Result<DirectoryBackups> {
         let Some(name) = name.to_str() else {
             continue;
         };
-        let Some((target, suffix)) = name.rsplit_once(MARKER) else {
+        let Some((target, suffix)) = name.rsplit_once(USER_MARKER) else {
             continue;
         };
         let Some((stamp, serial)) = complete_suffix_of(suffix) else {
@@ -159,18 +201,18 @@ pub(crate) fn find_latest_backup(target: &Path) -> Result<Option<PathBuf>> {
     BackupFinder::default().find_latest(target)
 }
 
-/// 把 `object` 备份到它的同目录, 返回备份的最终路径.
+/// 把 `object` 按 `kind` 的命名空间备份到它的同目录, 返回备份的最终路径.
 ///
 /// `object` 可以是普通文件, 目录 (递归) 或符号链接 (**复制链接本身, 不跟随**).
 /// 返回 `Ok` 意味着备份已完整落定并改名到最终名 -- 调用者此时才可以删除原对象
 /// (openspec/specs/backup-fidelity/spec.md 的"备份的发布仍以完整复制为前提"). 失败时不留下最终名.
-pub(crate) fn write_backup(object: &Path) -> Result<PathBuf> {
-    write_backup_at(object, &timestamp())
+pub(crate) fn write_backup(object: &Path, kind: BackupKind) -> Result<PathBuf> {
+    write_backup_at(object, &timestamp(), kind)
 }
 
 /// 给定时间戳的备份写入 (见 [`backup_candidates_at`]): 测试用它绕过墙钟.
-fn write_backup_at(object: &Path, stamp: &str) -> Result<PathBuf> {
-    let mut candidates = backup_candidates_at(object, stamp.to_string());
+fn write_backup_at(object: &Path, stamp: &str, kind: BackupKind) -> Result<PathBuf> {
+    let mut candidates = backup_candidates_at(object, stamp.to_string(), kind);
     let first = candidates.next().expect("备份候选名非空");
     let partial = copy_to_staging(object, &first, PARTIAL_SUFFIX)?;
 
@@ -441,13 +483,13 @@ fn copy_error(context: &str, path: &Path, error: io::Error) -> io::Error {
     )
 }
 
-/// `target` 的备份名前缀: `<原名>.dotlink-backup.`
-fn backup_base(target: &Path) -> OsString {
+/// `target` 的备份名前缀: `<原名>` 加命名空间标记.
+fn backup_base(target: &Path, kind: BackupKind) -> OsString {
     let mut base = target
         .file_name()
         .unwrap_or_else(|| OsStr::new(""))
         .to_os_string();
-    base.push(MARKER);
+    base.push(kind.marker());
     base
 }
 
@@ -704,7 +746,7 @@ mod tests {
         let prefix = format!(
             "{}{}",
             target.file_name().unwrap().to_string_lossy(),
-            MARKER
+            USER_MARKER
         );
         let name = backup.file_name().unwrap().to_string_lossy().into_owned();
         name.strip_prefix(&prefix)
@@ -717,7 +759,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("bashrc");
 
-        let backup = backup_path_for(&target);
+        let backup = backup_path_for(&target, BackupKind::User);
         assert_eq!(backup.parent(), Some(dir.path()));
 
         let suffix = suffix_of(&target, &backup);
@@ -737,7 +779,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("nvim");
 
-        let backup = backup_path_for(&target);
+        let backup = backup_path_for(&target, BackupKind::User);
         let name = backup.file_name().unwrap().to_string_lossy().into_owned();
         assert!(name.starts_with("nvim.dotlink-backup."), "实际为 {name}");
     }
@@ -749,7 +791,7 @@ mod tests {
         let target = Path::new("bashrc");
         assert_eq!(parent_dir(target), Path::new("."));
 
-        let backup = backup_path_for(target);
+        let backup = backup_path_for(target, BackupKind::User);
         assert_eq!(backup.parent(), Some(Path::new(".")));
         assert!(
             backup
@@ -778,10 +820,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("bashrc");
 
-        let first = backup_path_for(&target);
+        let first = backup_path_for(&target, BackupKind::User);
         fs::write(&first, "first").unwrap();
 
-        let second = backup_path_for(&target);
+        let second = backup_path_for(&target, BackupKind::User);
         assert_ne!(first, second, "已占用的名字不得被再次返回");
 
         // 两次调用跨过秒边界时, 第二次拿到的是新时间戳而非序号 -- 这同样满足
@@ -814,14 +856,143 @@ mod tests {
         let stamp = "20260101T000000";
 
         fs::write(&target, "first").unwrap();
-        let first = write_backup_at(&target, stamp).unwrap();
+        let first = write_backup_at(&target, stamp, BackupKind::User).unwrap();
         fs::write(&target, "second").unwrap();
-        let second = write_backup_at(&target, stamp).unwrap();
+        let second = write_backup_at(&target, stamp, BackupKind::User).unwrap();
 
         assert_eq!(suffix_of(&target, &first), stamp);
         assert_eq!(suffix_of(&target, &second), format!("{stamp}.2"));
         assert_eq!(fs::read_to_string(&first).unwrap(), "first");
         assert_eq!(fs::read_to_string(&second).unwrap(), "second");
+    }
+
+    /// 两个命名空间的裸名与同一秒内的 `.2` 消歧名都由同一个候选生成器给出.
+    #[test]
+    fn both_namespaces_generate_marked_names_and_serial_two() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("bashrc");
+        let stamp = "20260101T000000";
+
+        for (kind, marker) in [
+            (BackupKind::User, USER_MARKER),
+            (BackupKind::SelfHeal, SELF_HEAL_MARKER),
+        ] {
+            let mut candidates = backup_candidates_at(&target, stamp.to_string(), kind);
+            let first = candidates.next().expect("第一个候选名");
+            let second = candidates.next().expect("第二个候选名");
+            assert_eq!(
+                first.file_name().unwrap().to_string_lossy(),
+                format!("bashrc{marker}{stamp}")
+            );
+            assert_eq!(
+                second.file_name().unwrap().to_string_lossy(),
+                format!("bashrc{marker}{stamp}.2")
+            );
+        }
+    }
+
+    /// 自愈暂存名沿用同一命名空间标记, 并且仍带进程号与 `.partial`.
+    #[test]
+    fn self_heal_staging_names_keep_the_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let stamp = "20260101T000000";
+        let base = dir.path().join(format!("bashrc{SELF_HEAL_MARKER}{stamp}"));
+
+        let staging = staging_candidate(&base, 1, PARTIAL_SUFFIX);
+
+        assert_eq!(staging.parent(), Some(dir.path()));
+        assert_eq!(
+            staging.file_name().unwrap().to_string_lossy(),
+            format!(
+                "bashrc{SELF_HEAL_MARKER}{stamp}.{}{PARTIAL_SUFFIX}",
+                std::process::id()
+            )
+        );
+    }
+
+    /// 查找器只扫描用户命名空间: 更晚的自愈备份不参与"取最新", 只有自愈备份时
+    /// 视为没有可用备份 (backup-lifecycle 的两个 Scenario).
+    #[test]
+    fn find_latest_backup_ignores_the_self_heal_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("bashrc");
+        let user = dir
+            .path()
+            .join(format!("bashrc{USER_MARKER}20260101T000000"));
+        let heal = dir
+            .path()
+            .join(format!("bashrc{SELF_HEAL_MARKER}20990101T000000"));
+        fs::write(&user, "user").unwrap();
+        fs::write(&heal, "heal").unwrap();
+
+        assert_eq!(
+            find_latest_backup(&target).unwrap(),
+            Some(user),
+            "更晚的自愈备份不得压过用户备份"
+        );
+
+        fs::remove_file(
+            dir.path()
+                .join(format!("bashrc{USER_MARKER}20260101T000000")),
+        )
+        .unwrap();
+        assert_eq!(
+            find_latest_backup(&target).unwrap(),
+            None,
+            "只有自愈备份时必须视为没有可用备份"
+        );
+        assert_eq!(fs::read_to_string(&heal).unwrap(), "heal");
+    }
+
+    /// 原文件名本身含 `.dotlink-backup.` 时, 自愈名仍不构成用户备份的完整形态.
+    #[test]
+    fn a_self_heal_name_containing_the_user_marker_is_not_a_user_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("rc.dotlink-backup.orig");
+        let heal = dir.path().join(format!(
+            "rc.dotlink-backup.orig{SELF_HEAL_MARKER}20260101T000000"
+        ));
+        fs::write(&heal, "heal").unwrap();
+
+        assert_eq!(find_latest_backup(&target).unwrap(), None);
+        assert_eq!(
+            find_latest_backup(&dir.path().join("rc")).unwrap(),
+            None,
+            "最后一个用户标记之后必须是完整后缀, 含自愈段的名字不满足"
+        );
+    }
+
+    /// 旧版本写出的 `.dotlink-backup.` 自愈残留: 新代码不识别, 不迁移, 不删除,
+    /// 仍按既有查找规则被选中. 这是 README "已知限制" 固定的可观察行为.
+    #[test]
+    fn old_self_heal_residue_is_kept_and_still_found_as_a_user_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("bashrc");
+        let old = dir
+            .path()
+            .join(format!("bashrc{USER_MARKER}20250101T000000"));
+        let old_text = Path::new("/repo/old-source");
+        os::create_symlink(old_text, &old).unwrap();
+
+        assert_eq!(find_latest_backup(&target).unwrap(), Some(old.clone()));
+
+        fs::write(&target, "current").unwrap();
+        let heal = write_backup_at(&target, "20260101T000000", BackupKind::SelfHeal).unwrap();
+
+        assert_eq!(
+            heal.file_name().unwrap().to_string_lossy(),
+            format!("bashrc{SELF_HEAL_MARKER}20260101T000000")
+        );
+        assert!(
+            fs::symlink_metadata(&old).unwrap().file_type().is_symlink(),
+            "旧残留不得被改名或迁移"
+        );
+        assert_eq!(fs::read_link(&old).unwrap(), old_text);
+        assert_eq!(
+            find_latest_backup(&target).unwrap(),
+            Some(old),
+            "旧残留仍按用户备份查找规则被选中"
+        );
     }
 
     /// 同步失败必须使该条目失败: 不发布最终名, 不删除原对象, 也不留暂存残留.
@@ -833,7 +1004,7 @@ mod tests {
         fs::write(&target, "original").unwrap();
 
         let guard = os::fail_syncs();
-        let error = write_backup_at(&target, stamp).unwrap_err();
+        let error = write_backup_at(&target, stamp, BackupKind::User).unwrap_err();
         drop(guard);
 
         assert!(error.to_string().contains("同步备份文件"), "{error}");
@@ -860,7 +1031,7 @@ mod tests {
         fs::create_dir(&target).unwrap();
 
         let guard = os::fail_syncs();
-        let error = write_backup_at(&target, stamp).unwrap_err();
+        let error = write_backup_at(&target, stamp, BackupKind::User).unwrap_err();
         drop(guard);
 
         assert!(error.to_string().contains("同步备份目录"), "{error}");
@@ -892,7 +1063,7 @@ mod tests {
         // 只让目录同步失败: 普通文件的内容同步会先通过, 失败点因此落在 rename 之后
         // 的父目录同步上.
         let guard = os::fail_directory_syncs();
-        let error = write_backup_at(&target, stamp).unwrap_err();
+        let error = write_backup_at(&target, stamp, BackupKind::User).unwrap_err();
         drop(guard);
 
         let message = error.to_string();
@@ -950,11 +1121,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("bashrc");
 
-        let first = backup_path_for(&target);
+        let first = backup_path_for(&target, BackupKind::User);
         // 悬空链接: `Path::exists` 对它返回 false, 必须用 lstat 检测才算"已占用".
         os::create_symlink(Path::new("/definitely/gone"), &first).unwrap();
 
-        let second = backup_path_for(&target);
+        let second = backup_path_for(&target, BackupKind::User);
         assert_ne!(first, second);
         assert!(
             fs::symlink_metadata(&first)
@@ -975,10 +1146,10 @@ mod tests {
         let stamp = "20260101T000000";
         fs::write(&target, "payload").unwrap();
 
-        let occupied = dir.path().join(format!("bashrc{MARKER}{stamp}"));
+        let occupied = dir.path().join(format!("bashrc{USER_MARKER}{stamp}"));
         os::create_symlink(Path::new("/definitely/gone"), &occupied).unwrap();
 
-        let written = write_backup_at(&target, stamp).unwrap();
+        let written = write_backup_at(&target, stamp, BackupKind::User).unwrap();
 
         assert_eq!(suffix_of(&target, &written), format!("{stamp}.2"));
         assert_eq!(fs::read_to_string(&written).unwrap(), "payload");
@@ -1023,7 +1194,8 @@ mod tests {
         let stamp = "20260101T000000";
         for serial in ["", ".2", ".3", ".4", ".5", ".6", ".7", ".8", ".9", ".10"] {
             fs::write(
-                dir.path().join(format!("bashrc{MARKER}{stamp}{serial}")),
+                dir.path()
+                    .join(format!("bashrc{USER_MARKER}{stamp}{serial}")),
                 "x",
             )
             .unwrap();
@@ -1031,7 +1203,7 @@ mod tests {
 
         assert_eq!(
             find_latest_backup(&target).unwrap(),
-            Some(dir.path().join(format!("bashrc{MARKER}{stamp}.10"))),
+            Some(dir.path().join(format!("bashrc{USER_MARKER}{stamp}.10"))),
             "序号 10 是数值上的最大者, 不得被字典序更大的 .9 压过"
         );
     }
@@ -1060,11 +1232,12 @@ mod tests {
         let earlier = "20261104T151719";
         let later = "20261104T151720";
         for stamp in [earlier, later] {
-            fs::write(dir.path().join(format!("bashrc{MARKER}{stamp}")), "x").unwrap();
+            fs::write(dir.path().join(format!("bashrc{USER_MARKER}{stamp}")), "x").unwrap();
         }
         for serial in [".9", ".10"] {
             fs::write(
-                dir.path().join(format!("bashrc{MARKER}{earlier}{serial}")),
+                dir.path()
+                    .join(format!("bashrc{USER_MARKER}{earlier}{serial}")),
                 "x",
             )
             .unwrap();
@@ -1072,14 +1245,14 @@ mod tests {
 
         assert_eq!(
             find_latest_backup(&target).unwrap(),
-            Some(dir.path().join(format!("bashrc{MARKER}{later}"))),
+            Some(dir.path().join(format!("bashrc{USER_MARKER}{later}"))),
             "跨 UTC 时间戳必须取较晚者 {later}, 而不是 {earlier} 的任一序号"
         );
 
-        fs::remove_file(dir.path().join(format!("bashrc{MARKER}{later}"))).unwrap();
+        fs::remove_file(dir.path().join(format!("bashrc{USER_MARKER}{later}"))).unwrap();
         assert_eq!(
             find_latest_backup(&target).unwrap(),
-            Some(dir.path().join(format!("bashrc{MARKER}{earlier}.10"))),
+            Some(dir.path().join(format!("bashrc{USER_MARKER}{earlier}.10"))),
             "同一 UTC 时间戳内必须按序号数值取 .10, 而不是字典序更大的 .9"
         );
     }
@@ -1094,14 +1267,15 @@ mod tests {
             let target = dir.path().join("bashrc");
             for serial in order {
                 fs::write(
-                    dir.path().join(format!("bashrc{MARKER}{stamp}{serial}")),
+                    dir.path()
+                        .join(format!("bashrc{USER_MARKER}{stamp}{serial}")),
                     serial,
                 )
                 .unwrap();
             }
             assert_eq!(
                 find_latest_backup(&target).unwrap(),
-                Some(dir.path().join(format!("bashrc{MARKER}{stamp}.2"))),
+                Some(dir.path().join(format!("bashrc{USER_MARKER}{stamp}.2"))),
                 "创建顺序 {order:?} 下必须按文件名兜底取同一份, 不得依赖遍历顺序"
             );
         }
@@ -1141,8 +1315,8 @@ mod tests {
         );
         assert!(suffix.ends_with(PARTIAL_SUFFIX), "{suffix}");
 
-        let name = format!("bashrc{MARKER}20260101T000000{suffix}");
-        let after_marker = name.strip_prefix(&format!("bashrc{MARKER}")).unwrap();
+        let name = format!("bashrc{USER_MARKER}20260101T000000{suffix}");
+        let after_marker = name.strip_prefix(&format!("bashrc{USER_MARKER}")).unwrap();
         assert!(
             complete_suffix_of(after_marker).is_none(),
             "暂存名 {name} 不得被认作完整备份"
@@ -1200,7 +1374,7 @@ mod tests {
         let object = dir.path().join("bashrc");
         fs::write(&object, "original").unwrap();
 
-        let backup = write_backup(&object).unwrap();
+        let backup = write_backup(&object, BackupKind::User).unwrap();
 
         assert_eq!(fs::read_to_string(&backup).unwrap(), "original");
         assert!(complete_suffix_of(&suffix_of(&object, &backup)).is_some());
@@ -1223,7 +1397,7 @@ mod tests {
         fs::write(object.join("init.lua"), "init").unwrap();
         fs::write(object.join("lua/plugins/a.lua"), "a").unwrap();
 
-        let backup = write_backup(&object).unwrap();
+        let backup = write_backup(&object, BackupKind::User).unwrap();
 
         assert_eq!(fs::read_to_string(backup.join("init.lua")).unwrap(), "init");
         assert_eq!(
@@ -1244,7 +1418,7 @@ mod tests {
         let object = dir.path().join("bashrc");
         os::create_symlink(Path::new("real"), &object).unwrap();
 
-        let backup = write_backup(&object).unwrap();
+        let backup = write_backup(&object, BackupKind::User).unwrap();
 
         let metadata = fs::symlink_metadata(&backup).unwrap();
         assert!(
@@ -1263,7 +1437,7 @@ mod tests {
         fs::create_dir_all(&object).unwrap();
         os::create_symlink(Path::new("/definitely/gone"), &object.join("dangling")).unwrap();
 
-        let backup = write_backup(&object).unwrap();
+        let backup = write_backup(&object, BackupKind::User).unwrap();
 
         let nested = fs::symlink_metadata(backup.join("dangling")).unwrap();
         assert!(nested.file_type().is_symlink());
@@ -1291,7 +1465,7 @@ mod tests {
             return;
         }
 
-        let error = write_backup(&object).unwrap_err();
+        let error = write_backup(&object, BackupKind::User).unwrap_err();
         assert!(matches!(error, Error::EntryFailed(_)));
 
         // 原对象必须完整保留.
@@ -1304,7 +1478,7 @@ mod tests {
         assert_eq!(find_latest_backup(&object).unwrap(), None);
 
         // 磁盘上不得存在最终名的备份: 中断残留只能是 `.partial`.
-        let prefix = format!("nvim{}", MARKER);
+        let prefix = format!("nvim{}", USER_MARKER);
         let residue: Vec<String> = fs::read_dir(dir.path())
             .unwrap()
             .flatten()
@@ -1723,7 +1897,7 @@ mod tests {
         let before = fs::read_dir(dir.path()).unwrap().count();
 
         let guard = fail_metadata();
-        let error = write_backup_at(&source, "20260101T000000").unwrap_err();
+        let error = write_backup_at(&source, "20260101T000000", BackupKind::User).unwrap_err();
         assert_eq!(guard.injections(), 1, "元数据失败应立即结束复制");
         drop(guard);
 
@@ -1763,7 +1937,7 @@ mod tests {
         let occupied = staging_candidate(&base, 1, PARTIAL_SUFFIX);
         fs::write(&occupied, "keep").unwrap();
 
-        let backup = write_backup_at(&source, "20260101T000000").unwrap();
+        let backup = write_backup_at(&source, "20260101T000000", BackupKind::User).unwrap();
 
         assert_eq!(backup, base);
         assert_eq!(
@@ -1802,7 +1976,7 @@ mod tests {
         let before = fs::read_dir(dir.path()).unwrap().count();
 
         let guard = fail_nested_child_copy();
-        let error = write_backup_at(&source, "20260101T000000").unwrap_err();
+        let error = write_backup_at(&source, "20260101T000000", BackupKind::User).unwrap_err();
         assert_eq!(guard.injections(), 1, "嵌套冲突不得触发暂存名重试");
         drop(guard);
 
@@ -1930,7 +2104,7 @@ mod tests {
                     scope.spawn(move || {
                         barrier.wait();
                         (0..4)
-                            .map(|_| write_backup(object).unwrap())
+                            .map(|_| write_backup(object, BackupKind::User).unwrap())
                             .collect::<Vec<_>>()
                     })
                 })
@@ -2076,7 +2250,7 @@ mod tests {
         fs::write(object.join("lua/plugins/a.lua"), "a").unwrap();
         set_known_mtime(&object, 1_600_000_000, 123_456_789);
 
-        let backup = write_backup(&object).unwrap();
+        let backup = write_backup(&object, BackupKind::User).unwrap();
 
         let copied = fs::metadata(&backup).unwrap();
         assert_eq!(copied.mtime(), 1_600_000_000);
@@ -2100,7 +2274,7 @@ mod tests {
         set_known_mtime(&original, 1_577_836_800, 42);
         set_user_xattr(&original, b"fidelity");
 
-        let backup = write_backup(&original).unwrap();
+        let backup = write_backup(&original, BackupKind::User).unwrap();
         fs::remove_file(&original).unwrap();
         restore_backup(&original, &backup).unwrap();
 

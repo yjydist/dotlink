@@ -16,8 +16,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use support::{
-    Run, TempEnv, backup_path_from_output, entry_lines, line_for, manifest_of, physical_repo, run,
-    running_as_root, snapshot_all, target_of, token_of, unlock,
+    Run, TempEnv, backups_in, entry_lines, heal_backup_from_output, heal_backups_in, line_for,
+    manifest_of, physical_repo, run, running_as_root, snapshot_all, target_of, token_of, unlock,
 };
 
 /// 断言每一次条目行的 token 都是 `token`.
@@ -394,18 +394,19 @@ fn apply_heals_a_link_left_behind_by_a_renamed_source_under_the_default_policy()
     fs::rename(repo.join("shell/bashrc"), repo.join("shell/bashrc2")).expect("改名源文件");
     env.write_manifest(&manifest_of(&[("shell/bashrc2", "~/.bashrc", "-")]));
 
-    let run = run(&env, &["apply"]);
+    let healed = run(&env, &["apply"]);
 
-    assert_code(&run, 0);
-    let line = line_for(&run.stdout, "~/.bashrc");
+    assert_code(&healed, 0);
+    let line = line_for(&healed.stdout, "~/.bashrc");
     assert_eq!(token_of(line), "replace", "自愈行必须是 replace: {line}");
     assert!(
         line.contains("本工具的链接指向错误"),
         "自愈行必须说明这是本工具的错误链接: {line}"
     );
 
-    // 旧链接本身被备份 (链接文本仍指向旧路径), 目标改指新 source.
-    let backup = backup_path_from_output(&run.stdout);
+    // 旧链接本身被备份 (链接文本仍指向旧路径), 目标改指新 source. 自愈备份使用
+    // 独立命名空间, 不进入用户备份序列.
+    let backup = heal_backup_from_output(&healed.stdout);
     assert!(
         fs::symlink_metadata(&backup)
             .expect("备份应存在")
@@ -419,8 +420,68 @@ fn apply_heals_a_link_left_behind_by_a_renamed_source_under_the_default_policy()
         repo.join("shell/bashrc"),
         "备份应保留旧链接的原始文本"
     );
+    assert_eq!(
+        heal_backups_in(env.home()),
+        vec![backup.file_name().unwrap().to_string_lossy().into_owned()]
+    );
+    assert!(
+        backups_in(env.home()).is_empty(),
+        "自愈不得新增用户备份: {:?}",
+        backups_in(env.home())
+    );
     env.assert_symlink_to(&env.home().join(".bashrc"), &repo.join("shell/bashrc2"));
     env.assert_content(&env.home().join(".bashrc"), "managed\n");
+
+    // 再次 apply 已是最新, 仍不产生用户备份.
+    let repeated = run(&env, &["apply"]);
+    assert_code(&repeated, 0);
+    assert_all_tokens(&repeated, "ok");
+    assert!(
+        backups_in(env.home()).is_empty(),
+        "重复 apply 不得新增用户备份: {:?}",
+        backups_in(env.home())
+    );
+}
+
+/// 自愈备份无法写入时, 旧链接保留, 条目报失败, 退出码为 1.
+#[test]
+fn a_failed_self_heal_backup_keeps_the_wrong_link_and_reports_failure() {
+    let env = TempEnv::new();
+    env.write_source("shell/bashrc", "managed\n");
+    env.write_manifest(&manifest_of(&[("shell/bashrc", "~/.bashrc", "-")]));
+    assert_eq!(run(&env, &["apply"]).code, 0);
+
+    let repo = physical_repo(&env);
+    fs::rename(repo.join("shell/bashrc"), repo.join("shell/bashrc2")).expect("改名源文件");
+    env.write_manifest(&manifest_of(&[("shell/bashrc2", "~/.bashrc", "-")]));
+
+    fs::set_permissions(env.home(), fs::Permissions::from_mode(0o555)).unwrap();
+    if fs::write(env.home().join("probe"), "").is_ok() {
+        fs::remove_file(env.home().join("probe")).unwrap();
+        unlock(env.home());
+        eprintln!("以 root 运行: chmod 555 不生效, 跳过自愈备份失败断言");
+        return;
+    }
+
+    let failed = run(&env, &["apply"]);
+    unlock(env.home());
+
+    assert_code(&failed, 1);
+    let line = line_for(&failed.stdout, "~/.bashrc");
+    assert_eq!(token_of(line), "fail", "{line}");
+    assert!(
+        fs::symlink_metadata(env.home().join(".bashrc"))
+            .expect("旧链接必须保留")
+            .file_type()
+            .is_symlink(),
+        "备份失败时不得删除或改写旧链接"
+    );
+    env.assert_symlink_to(&env.home().join(".bashrc"), &repo.join("shell/bashrc"));
+    assert!(
+        heal_backups_in(env.home()).is_empty(),
+        "失败的备份不得留下最终名: {:?}",
+        heal_backups_in(env.home())
+    );
 }
 
 // ---------------------------------------------------------------------------

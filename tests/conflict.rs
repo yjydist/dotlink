@@ -11,8 +11,8 @@ use std::fs;
 use std::path::Path;
 
 use support::{
-    TempEnv, assert_token, backup_path_from_output, backups_in, line_for, manifest_of, run,
-    running_as_root, token_of, unlock,
+    TempEnv, assert_token, backup_path_from_output, backups_in, heal_backup_from_output,
+    heal_backups_in, line_for, manifest_of, run, running_as_root, token_of, unlock,
 };
 
 // ---------------------------------------------------------------------------
@@ -84,6 +84,11 @@ fn replace_and_backup_replaces_a_file_and_reports_the_backup_path() {
             .starts_with(".bashrc.dotlink-backup."),
         "备份名必须基于原文件名: {}",
         backup.display()
+    );
+    assert!(
+        heal_backups_in(env.home()).is_empty(),
+        "外部占用的备份不得使用自愈命名空间: {:?}",
+        heal_backups_in(env.home())
     );
     env.assert_content(&backup, "pre-existing\n");
 
@@ -174,7 +179,7 @@ fn replace_and_backup_copies_the_link_itself() {
     assert_token(&run, "replace");
     assert_eq!(run.code, 0);
 
-    let backup = backup_path_from_output(&run.stdout);
+    let backup = heal_backup_from_output(&run.stdout);
     assert!(
         fs::symlink_metadata(&backup)
             .unwrap()
@@ -188,6 +193,16 @@ fn replace_and_backup_copies_the_link_itself() {
         stale,
         "备份应保留链接的原始文本"
     );
+    assert!(
+        backup
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains(".dotlink-heal."),
+        "本工具错误链接的备份必须使用自愈命名空间: {}",
+        backup.display()
+    );
+    assert!(backups_in(env.home()).is_empty(), "不得新增用户备份");
     assert!(stale.is_file(), "原链接的目标不得被删除");
     env.assert_symlink_to(&target, &env.repo().join("shell/bashrc"));
 }

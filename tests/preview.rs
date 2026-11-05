@@ -12,8 +12,8 @@ use std::path::PathBuf;
 
 use predicates::str::contains;
 use support::{
-    TempEnv, backup_candidate_from_output, backups_in, entry_lines, line_for, manifest_of,
-    physical_repo, run, snapshot_all, target_of, token_of,
+    TempEnv, backup_candidate_from_output, backups_in, entry_lines, heal_backup_from_output,
+    heal_backups_in, line_for, manifest_of, physical_repo, run, snapshot_all, target_of, token_of,
 };
 
 // ---------------------------------------------------------------------------
@@ -420,7 +420,7 @@ fn preview_predicts_healing_a_renamed_source_under_the_default_policy() {
         "预览必须说明这是本工具的错误链接: {line}"
     );
 
-    let predicted = backup_candidate_from_output(line);
+    let predicted = heal_backup_from_output(line);
     assert_eq!(
         predicted.parent(),
         Some(env.home()),
@@ -433,7 +433,7 @@ fn preview_predicts_healing_a_renamed_source_under_the_default_policy() {
         .to_string_lossy()
         .into_owned();
     let predicted_stamp = predicted_name
-        .strip_prefix(".bashrc.dotlink-backup.")
+        .strip_prefix(".bashrc.dotlink-heal.")
         .unwrap_or_else(|| panic!("预测的备份名形态不对: {predicted_name}"));
     assert!(
         is_timestamp(predicted_stamp),
@@ -444,6 +444,27 @@ fn preview_predicts_healing_a_renamed_source_under_the_default_policy() {
         "preview 不得创建备份: {}",
         predicted.display()
     );
+    assert!(
+        backups_in(env.home()).is_empty(),
+        "preview 不得创建用户备份: {:?}",
+        backups_in(env.home())
+    );
+
+    // apply 实际写入的命名空间必须与预测一致 (跨秒时只有字面时间戳可以不同).
+    let applied = run(&env, &["apply"]);
+    assert_eq!(applied.code, 0, "stdout:\n{}", applied.stdout);
+    let actual = heal_backup_from_output(&applied.stdout);
+    assert!(
+        actual
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains(".dotlink-heal."),
+        "apply 实际备份必须使用与 preview 相同的自愈命名空间: {}",
+        actual.display()
+    );
+    assert_eq!(heal_backups_in(env.home()).len(), 1);
+    assert!(backups_in(env.home()).is_empty());
 }
 
 // ---------------------------------------------------------------------------

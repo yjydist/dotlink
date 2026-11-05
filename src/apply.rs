@@ -6,14 +6,29 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::backup;
-use crate::classify::{Action, EntryState};
+use crate::backup::{self, BackupKind};
+use crate::classify::{Action, Current, EntryState};
 use crate::entry::Entry;
 use crate::error::{Error, Result};
 use crate::os;
 
 /// 替换路径的暂存标签; 与撤销路径的 `dotlink-undo.partial` 区分, 便于诊断残留.
 const REPLACE_STAGING_LABEL: &str = "dotlink-replace.partial";
+
+/// `ReplaceAndBackup` 应使用的备份命名空间, 由已经完成的判定结果唯一决定.
+///
+/// `LinkedWrong` 是本工具留下的错误链接, 备份它只是重建前的安全网, 因此使用自愈
+/// 命名空间; 外部占用 (`Foreign*`) 是用户内容, 使用用户命名空间. 其他 `Current`
+/// 不会导出 `ReplaceAndBackup`, 在这里穷举是为了让新增状态必须在编译期作出选择.
+pub(crate) fn backup_kind_for(current: Current) -> BackupKind {
+    match current {
+        Current::LinkedWrong => BackupKind::SelfHeal,
+        Current::ForeignLink | Current::ForeignFile | Current::ForeignDir => BackupKind::User,
+        Current::SourceMissing | Current::Absent | Current::LinkedCorrect | Current::Unreadable => {
+            unreachable!("{current:?} 不会请求替换备份")
+        }
+    }
+}
 
 /// 执行单个条目的动作. 返回备份文件的完整路径 (若发生了备份).
 ///
@@ -26,7 +41,7 @@ pub fn apply_entry(entry: &Entry, state: &EntryState) -> Result<Option<PathBuf>>
             create_link(entry)?;
             Ok(None)
         }
-        Action::ReplaceAndBackup => replace_and_backup(entry),
+        Action::ReplaceAndBackup => replace_and_backup(entry, backup_kind_for(state.current)),
         Action::Noop | Action::ReportMissingSource | Action::ReportUnreadable => Ok(None),
         Action::RefuseConflict => Ok(None),
     }
@@ -72,7 +87,7 @@ fn create_dir_all(dir: &Path) -> Result<()> {
 /// 数据丢失. 暂存与复核把"判定"和"删除"之间的竞态收窄为一次 rename: 外部替换物
 /// 会因身份不一致被移回原路径, 不会被当作旧对象删除. 备份失败时**不删除原对象**,
 /// 条目报 `Err` 并保留原状.
-fn replace_and_backup(entry: &Entry) -> Result<Option<PathBuf>> {
+fn replace_and_backup(entry: &Entry, kind: BackupKind) -> Result<Option<PathBuf>> {
     let target = entry.target_path.as_path();
 
     let identity = ObjectIdentity::snapshot(target)
@@ -80,7 +95,7 @@ fn replace_and_backup(entry: &Entry) -> Result<Option<PathBuf>> {
 
     // 备份落定之后才允许删除原对象, 因此这之后的失败都发生在"原内容已被备份"之后:
     // 错误里带上备份路径, 用户才知道去哪儿找回它 (FR-016).
-    let backup_path = backup::write_backup(target)?;
+    let backup_path = backup::write_backup(target, kind)?;
     #[cfg(test)]
     run_after_backup_hook();
     replace_with_backup(entry, identity).map_err(|error| {
@@ -288,8 +303,12 @@ mod tests {
     }
 
     fn state(action: Action) -> EntryState {
+        state_with(Current::Absent, action)
+    }
+
+    fn state_with(current: Current, action: Action) -> EntryState {
         EntryState {
-            current: Current::Absent,
+            current,
             action,
             detail: String::new(),
         }
@@ -364,11 +383,32 @@ mod tests {
         fs::write(&target, "pre-existing").unwrap();
         let entry = entry_for(repo, "bashrc", &target);
 
-        let backup_path = apply_entry(&entry, &state(Action::ReplaceAndBackup))
-            .unwrap()
-            .expect("必须报告备份路径");
+        let backup_path = apply_entry(
+            &entry,
+            &state_with(Current::ForeignFile, Action::ReplaceAndBackup),
+        )
+        .unwrap()
+        .expect("必须报告备份路径");
 
         assert_eq!(fs::read_to_string(&backup_path).unwrap(), "pre-existing");
+        assert!(
+            backup_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains(".dotlink-backup."),
+            "外部占用的备份必须使用用户命名空间: {}",
+            backup_path.display()
+        );
+        assert!(
+            !backup_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains(".dotlink-heal."),
+            "外部占用不得写入自愈命名空间: {}",
+            backup_path.display()
+        );
         assert!(
             fs::symlink_metadata(&target)
                 .unwrap()
@@ -376,6 +416,98 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(fs::read_to_string(&target).unwrap(), "managed");
+    }
+
+    /// 本工具的错误链接在重建前使用自愈命名空间, 不占用用户备份序列.
+    #[test]
+    fn replace_and_backup_uses_the_self_heal_namespace_for_a_wrong_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        fs::write(repo.join("bashrc"), "managed").unwrap();
+        fs::create_dir_all(repo.join("home")).unwrap();
+
+        let stale = repo.join("stale");
+        let target = repo.join("home/bashrc");
+        os::create_symlink(&stale, &target).unwrap();
+        let entry = entry_for(repo, "bashrc", &target);
+
+        let backup_path = apply_entry(
+            &entry,
+            &state_with(Current::LinkedWrong, Action::ReplaceAndBackup),
+        )
+        .unwrap()
+        .expect("必须报告备份路径");
+
+        let name = backup_path.file_name().unwrap().to_string_lossy();
+        assert!(
+            name.starts_with("bashrc.dotlink-heal."),
+            "自愈备份必须使用自愈命名空间: {name}"
+        );
+        assert!(
+            fs::symlink_metadata(&backup_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "备份的必须是旧链接本身"
+        );
+        assert_eq!(fs::read_link(&backup_path).unwrap(), stale);
+        assert!(
+            fs::read_dir(repo.join("home"))
+                .unwrap()
+                .flatten()
+                .all(|item| !item
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".dotlink-backup.")),
+            "自愈不得产生用户备份"
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "managed");
+    }
+
+    /// 自愈备份无法写入时, 旧链接必须原样留在原路径, 条目失败.
+    #[test]
+    fn a_failed_self_heal_backup_keeps_the_wrong_link() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        fs::write(repo.join("bashrc"), "managed").unwrap();
+        let home = repo.join("home");
+        fs::create_dir_all(&home).unwrap();
+
+        let stale = repo.join("stale");
+        let target = home.join("bashrc");
+        os::create_symlink(&stale, &target).unwrap();
+        let entry = entry_for(repo, "bashrc", &target);
+
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o555)).unwrap();
+        if fs::write(home.join("probe"), "").is_ok() {
+            fs::remove_file(home.join("probe")).unwrap();
+            fs::set_permissions(&home, fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("以 root 运行: chmod 555 不生效, 跳过自愈备份失败断言");
+            return;
+        }
+
+        let result = apply_entry(
+            &entry,
+            &state_with(Current::LinkedWrong, Action::ReplaceAndBackup),
+        );
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::EntryFailed(_)));
+        assert_eq!(
+            fs::read_link(&target).expect("旧链接必须保留"),
+            stale,
+            "备份失败时不得删除或改写旧链接"
+        );
+        assert!(
+            fs::read_dir(&home).unwrap().flatten().all(|item| !item
+                .file_name()
+                .to_string_lossy()
+                .contains(".dotlink-heal.")),
+            "失败的备份不得留下最终名"
+        );
     }
 
     #[test]
@@ -389,9 +521,12 @@ mod tests {
 
         let target = repo.join("home/nvim");
         let entry = entry_for(repo, "nvim.lua", &target);
-        let backup_path = apply_entry(&entry, &state(Action::ReplaceAndBackup))
-            .unwrap()
-            .expect("必须报告备份路径");
+        let backup_path = apply_entry(
+            &entry,
+            &state_with(Current::ForeignDir, Action::ReplaceAndBackup),
+        )
+        .unwrap()
+        .expect("必须报告备份路径");
 
         assert_eq!(
             fs::read_to_string(backup_path.join("init.lua")).unwrap(),
@@ -423,9 +558,12 @@ mod tests {
         os::create_symlink(&elsewhere, &target).unwrap();
 
         let entry = entry_for(repo, "bashrc", &target);
-        let backup_path = apply_entry(&entry, &state(Action::ReplaceAndBackup))
-            .unwrap()
-            .expect("必须报告备份路径");
+        let backup_path = apply_entry(
+            &entry,
+            &state_with(Current::ForeignLink, Action::ReplaceAndBackup),
+        )
+        .unwrap()
+        .expect("必须报告备份路径");
 
         let metadata = fs::symlink_metadata(&backup_path).unwrap();
         assert!(
@@ -455,7 +593,11 @@ mod tests {
             fs::write(&replaced, "replacement").unwrap();
         });
 
-        let error = apply_entry(&entry, &state(Action::ReplaceAndBackup)).unwrap_err();
+        let error = apply_entry(
+            &entry,
+            &state_with(Current::ForeignFile, Action::ReplaceAndBackup),
+        )
+        .unwrap_err();
         let message = error.to_string();
 
         // 新对象被移回原路径并保留, 没有被当作旧对象删除, 也没有建立链接.
@@ -581,7 +723,11 @@ mod tests {
         }
 
         let entry = entry_for(repo, "nvim.lua", &target);
-        let error = apply_entry(&entry, &state(Action::ReplaceAndBackup)).unwrap_err();
+        let error = apply_entry(
+            &entry,
+            &state_with(Current::ForeignDir, Action::ReplaceAndBackup),
+        )
+        .unwrap_err();
         assert!(matches!(error, Error::EntryFailed(_)));
 
         // 原对象完整保留在原路径 (顺序颠倒即数据丢失, 这是唯一的回归防线).
@@ -634,7 +780,11 @@ mod tests {
         }
 
         let entry = entry_for(repo, "nvim.lua", &target);
-        let error = apply_entry(&entry, &state(Action::ReplaceAndBackup)).unwrap_err();
+        let error = apply_entry(
+            &entry,
+            &state_with(Current::ForeignDir, Action::ReplaceAndBackup),
+        )
+        .unwrap_err();
         assert!(matches!(error, Error::EntryFailed(_)));
 
         let message = error.to_string();
