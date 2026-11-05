@@ -2,9 +2,10 @@
 //! (openspec/specs/backup-lifecycle/spec.md).
 //!
 //! 备份不是需要维护的数据结构, 而是"文件系统上的命名约定": 位置固定在被覆盖路径的
-//! **同一目录**, 名称携带本地时区的秒级时间戳与消歧序号. "最新"因此可由名字直接
+//! **同一目录**, 名称携带 UTC 的秒级时间戳与消歧序号. "最新"因此可由名字直接
 //! 判定: 先比时间戳, 同一秒内再比序号的**数值** (裸名视为 0) -- 而不是整名字典序,
-//! 序号 `10` 在字典序上反而小于 `9`.
+//! 序号 `10` 在字典序上反而小于 `9`. 时间戳必须是 UTC: 定长的 15 字符形态只在同一
+//! 时间轴上才能保证字符串序即时间序.
 //!
 //! 两处不变量由本模块独自承担:
 //!
@@ -21,7 +22,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use time::OffsetDateTime;
+use time::{OffsetDateTime, UtcOffset};
 
 use crate::error::{Error, Result};
 use crate::os;
@@ -98,7 +99,8 @@ fn backup_candidates_at(target: &Path, stamp: String) -> impl Iterator<Item = Pa
 
 /// 扫描目录, 为每个原始文件名选出最新完整备份.
 ///
-/// **(时间戳, 序号) 最大者胜出**: 跨时间戳取较晚者 (时间戳定长, 字典序即时间序),
+/// **(时间戳, 序号) 最大者胜出**: 跨时间戳取较晚者 (时间戳来自 UTC 且定长 15 字符,
+/// 字符串序即时间序),
 /// 同一时间戳内按序号的**数值**比较, 裸名视为序号 0. 不按整名字典序比较 -- 同一秒
 /// 内的序号 `10` 在字典序上小于 `9`, 会取错备份 (undo 恢复出来的就不是最新的).
 ///
@@ -375,28 +377,30 @@ fn parent_dir(path: &Path) -> &Path {
     }
 }
 
-/// 本地时区的秒级时间戳 `YYYYMMDDThhmmss`.
+/// UTC 的秒级时间戳 `YYYYMMDDThhmmss`.
 ///
-/// `now_local()` 在容器等环境下会失败 (无本地时区信息), 此时退化到 UTC: 秒级精度与
-/// 同秒消歧都不依赖时区, 因此退化只影响时间戳的字面值, 不影响任何不变量.
+/// 时间戳必须是 UTC, 因为"取最新"按 15 字符时间戳做字符串比较: 同一目标的全部备份
+/// 必须共享同一时间轴, 字符串序才等于时间序. 读取本地时区会让同一目标在不同 UTC
+/// 偏移下生成的备份无法比较, `undo` 可能恢复较旧的内容; 因此这里没有本地时区分支,
+/// 也不依赖运行环境的时区数据.
 fn timestamp() -> String {
-    timestamp_at(OffsetDateTime::now_local().ok())
+    format_timestamp(OffsetDateTime::now_utc())
 }
 
-/// 时间戳的纯函数形式: `local` 为 `None` 表示本地时区不可用, 退化为 UTC.
+/// 把任意时刻归一到 UTC 后格式化为 15 字符 `YYYYMMDDThhmmss`.
 ///
-/// 拆出参数是为了让"`now_local()` 失败"这一分支可被单元测试走到: 生产路径只传
-/// `OffsetDateTime::now_local().ok()`, 格式化规则与退化分支共用同一段代码.
-fn timestamp_at(local: Option<OffsetDateTime>) -> String {
-    let now = local.unwrap_or_else(OffsetDateTime::now_utc);
+/// 拆出纯函数是为了让带偏移的固定时刻可被单元测试断言: `+08:00` 的输入必须输出
+/// UTC 化的字面值, 而不是原时刻的本地字段.
+fn format_timestamp(at: OffsetDateTime) -> String {
+    let utc = at.to_offset(UtcOffset::UTC);
     format!(
         "{:04}{:02}{:02}T{:02}{:02}{:02}",
-        now.year(),
-        u8::from(now.month()),
-        now.day(),
-        now.hour(),
-        now.minute(),
-        now.second()
+        utc.year(),
+        u8::from(utc.month()),
+        utc.day(),
+        utc.hour(),
+        utc.minute(),
+        utc.second()
     )
 }
 
@@ -438,7 +442,9 @@ fn complete_suffix_of(suffix: &str) -> Option<(&str, &str)> {
 
 /// 备份的"新旧"序: 先时间戳, 同时间戳内按序号的数值, 全同则按名字字典序兜底.
 ///
-/// 名字兜底只在 `.02` 与 `.2` 这类同值异形上走到, 使结论与目录遍历顺序无关.
+/// 时间戳来自 UTC 且定长 15 字符, 因此第一步的字符串比较即时间比较; 不解析成日期,
+/// 也不依据本地时区偏移重新解释. 名字兜底只在 `.02` 与 `.2` 这类同值异形上走到,
+/// 使结论与目录遍历顺序无关.
 fn cmp_backup_key(a: &(String, String, String), b: &(String, String, String)) -> Ordering {
     a.0.cmp(&b.0)
         .then_with(|| cmp_serial(&a.1, &b.1))
@@ -721,17 +727,26 @@ mod tests {
         assert_eq!(fs::read_to_string(&backups[0]).unwrap(), "original");
     }
 
-    /// 本地时区不可用 (`now_local()` 失败) 时退化为 UTC: 退化只影响字面值, 形态不变,
-    /// 也不使备份失败. 传入 `None` 即该分支, 无需让主机的时区真的不可用.
+    /// 时间戳以 UTC 输出: 带 `+08:00` 偏移的固定时刻必须按 UTC 字段格式化, 否则
+    /// 同一目标的备份会落在不同时间轴上, 字符串序不再等于时间序.
     #[test]
-    fn timestamp_falls_back_to_utc_without_changing_the_shape() {
-        let fixed = OffsetDateTime::from_unix_timestamp(0).unwrap();
-        assert_eq!(timestamp_at(Some(fixed)), "19700101T000000");
+    fn timestamp_formats_a_fixed_instant_in_utc() {
+        let offset = UtcOffset::from_hms(8, 0, 0).unwrap();
+        let fixed = time::Date::from_calendar_date(2026, time::Month::November, 4)
+            .unwrap()
+            .with_hms(23, 17, 19)
+            .unwrap()
+            .assume_offset(offset);
 
-        let fallback = timestamp_at(None);
-        assert!(
-            is_timestamp(&fallback),
-            "退化到 UTC 后仍必须是 15 位时间戳: {fallback}"
+        assert_eq!(
+            format_timestamp(fixed),
+            "20261104T151719",
+            "2026-11-04T23:17:19+08:00 的 UTC 形态必须是 20261104T151719"
+        );
+        assert_eq!(
+            format_timestamp(OffsetDateTime::from_unix_timestamp(0).unwrap()),
+            "19700101T000000",
+            "epoch 的 UTC 形态必须是 19700101T000000"
         );
     }
 
@@ -838,6 +853,40 @@ mod tests {
         fs::write(&later, "x").unwrap();
 
         assert_eq!(find_latest_backup(&target).unwrap(), Some(later));
+    }
+
+    /// 取最新以 UTC 时间戳的字符串序为前提: 同一目录并存两个 UTC 时间戳时取较晚者,
+    /// 同一时间戳内 `.10` 按数值大于 `.9`.
+    #[test]
+    fn find_latest_backup_orders_utc_timestamps_then_numeric_serials() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("bashrc");
+
+        let earlier = "20261104T151719";
+        let later = "20261104T151720";
+        for stamp in [earlier, later] {
+            fs::write(dir.path().join(format!("bashrc{MARKER}{stamp}")), "x").unwrap();
+        }
+        for serial in [".9", ".10"] {
+            fs::write(
+                dir.path().join(format!("bashrc{MARKER}{earlier}{serial}")),
+                "x",
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            find_latest_backup(&target).unwrap(),
+            Some(dir.path().join(format!("bashrc{MARKER}{later}"))),
+            "跨 UTC 时间戳必须取较晚者 {later}, 而不是 {earlier} 的任一序号"
+        );
+
+        fs::remove_file(dir.path().join(format!("bashrc{MARKER}{later}"))).unwrap();
+        assert_eq!(
+            find_latest_backup(&target).unwrap(),
+            Some(dir.path().join(format!("bashrc{MARKER}{earlier}.10"))),
+            "同一 UTC 时间戳内必须按序号数值取 .10, 而不是字典序更大的 .9"
+        );
     }
 
     /// 时间戳相等且序号**数值**相等时 (`.02` 与 `.2`), 以文件名字典序兜底, 使结论
