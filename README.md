@@ -286,7 +286,7 @@ Windows 上的运行时拒绝**未在任何环境验证** (`cargo check --target
 ./scripts/check.sh
 ```
 
-脚本自动定位项目根目录, 最先运行 `scripts/check-punctuation.py` 检查非 ASCII 标点 (需要 Python 3, 仅用标准库), 然后依次执行格式检查, 全套测试, Clippy, 将警告视为错误的 rustdoc 构建和 release 构建, 任一步失败即停止. 标点检查覆盖 `AGENTS.md`, `README.md`, `openspec/specs/`, `openspec/changes/`, `src/`, `tests/` 与 `scripts/` 中的自然语言与源码, 禁止 U+3000-303F, U+FF00-FFEF, U+2018-201F, U+2014, U+2026 与 U+00B7; 代码中确需这些字符时使用语言转义. 检查不修改源码; 构建产物位于 `target/`, 二进制为 `target/release/dotlink`. 脚本使用锁文件, 不安装工具链或交叉编译目标, 也不运行依赖审计: `cargo audit` 需要网络, 由每周 CI 工作流执行, 不属于本地检查或 PR 必需检查.
+脚本自动定位项目根目录, 最先运行 `scripts/check-punctuation.py` 检查非 ASCII 标点及其回归测试 `scripts/test_check_punctuation.py` (需要 Python 3, 仅用标准库), 然后依次执行格式检查, 全套测试, Clippy, 将警告视为错误的 rustdoc 构建和 release 构建, 任一步失败即停止. 标点检查覆盖 `AGENTS.md`, `README.md`, `openspec/config.yaml` (或 `config.yml`), `openspec/specs/`, `openspec/changes/`, `src/`, `tests/`, `scripts/` 与 `.github/` 中的自然语言与源码, 禁止 U+3000-303F, U+FF00-FFEF, U+2018-201F, U+2014, U+2026 与 U+00B7; 代码中确需这些字符时使用语言转义; 覆盖范围与退出码由 `scripts/test_check_punctuation.py` 在 `mktemp` 建出的临时目录中回归. 检查不修改源码; 构建产物位于 `target/`, 二进制为 `target/release/dotlink`. 脚本使用锁文件, 不安装工具链或交叉编译目标, 也不运行依赖审计: `cargo audit` 需要网络, 由每周 CI 工作流执行, 不属于本地检查或 PR 必需检查.
 
 CI 由 `.github/workflows/ci.yml` 定义, 包含三个 job: `check` 在 `ubuntu-latest` 与 `macos-latest` 上运行 `./scripts/check.sh`; `msrv` 在 `ubuntu-latest` 上运行 `cargo +1.97.0 test --locked`; `cross-check` 在 `ubuntu-latest` 上依次运行两个 `cargo check` (Linux 与 Windows GNU 目标). Windows 仅交叉编译, 不验证运行时行为. 依赖审计由 `.github/workflows/audit.yml` 每周运行并支持手动触发, 不进入 PR 必需检查.
 

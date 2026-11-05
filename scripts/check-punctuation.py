@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """检查纳入检查范围的文本中的非 ASCII 标点.
 
-扫描范围与禁止码点见 AGENTS.md 与 openspec 变更的 design D6:
+规则来源见 AGENTS.md; 下述白名单与禁止码点是扫描范围的唯一事实来源:
 
 - AGENTS.md 与 README.md;
+- openspec/config.yaml 或 openspec/config.yml (OpenSpec 项目配置, 存在哪个就检查哪个);
 - openspec/specs/**/*.md 与 openspec/changes/**/*.md;
 - src/**/*.rs 与 tests/**/*.rs;
-- scripts/**/*.sh 与 scripts/**/*.py.
+- scripts/**/*.sh 与 scripts/**/*.py;
+- .github/**/*.yml, .github/**/*.yaml 与 .github/**/*.md (CI 配置与仓库模板).
 
 仅使用标准库. 有命中或文件无法按 UTF-8 解码时退 1, 无命中退 0, 参数错误退 2.
 文件路径相对 `--root` 输出; 符号链接不跟随.
@@ -27,13 +29,19 @@ FORBIDDEN_RANGES = (
 )
 FORBIDDEN_CODEPOINTS = frozenset((0x2014, 0x2026, 0x00B7))
 
-TEXT_FILES = ("AGENTS.md", "README.md")
+TEXT_FILES = (
+    "AGENTS.md",
+    "README.md",
+    "openspec/config.yaml",
+    "openspec/config.yml",
+)
 TEXT_TREES = (
     ("openspec/specs", (".md",)),
     ("openspec/changes", (".md",)),
     ("src", (".rs",)),
     ("tests", (".rs",)),
     ("scripts", (".sh", ".py")),
+    (".github", (".yml", ".yaml", ".md")),
 )
 SKIP_DIRS = frozenset((".agents", ".git", "target"))
 
@@ -96,7 +104,10 @@ def scan(path: Path, root: Path) -> tuple[int, bool]:
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="检查 AGENTS.md, README, OpenSpec 制品, 源码与脚本中的非 ASCII 标点."
+        description=(
+            "检查 AGENTS.md, README, OpenSpec 项目配置与制品, 源码, 脚本"
+            "与 .github/ 下的 CI 配置及模板中的非 ASCII 标点."
+        )
     )
     parser.add_argument(
         "--root",
