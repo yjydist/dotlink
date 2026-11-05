@@ -59,7 +59,7 @@ impl BackupKind {
     }
 }
 
-/// 未完成备份的后缀, 加在**时间戳之后**: `x.dotlink-backup.20260101T000000.partial`.
+/// 未完成备份的后缀, 加在**时间戳与进程号之后**: `x.dotlink-backup.20260101T000000.<pid>.partial`.
 const PARTIAL_SUFFIX: &str = ".partial";
 
 /// 恢复过程中使用的临时名后缀: 目录恢复写到临时名再改名, 避免半成品.
@@ -538,7 +538,7 @@ fn timestamp() -> String {
 
 /// 把任意时刻归一到 UTC 后格式化为 15 字符 `YYYYMMDDThhmmss`.
 ///
-/// 拆出纯函数是为了让带偏移的固定时刻可被单元测试断言: `+08:00` 的输入必须输出
+/// 拆出无副作用的格式化函数是为了让带偏移的固定时刻可被单元测试断言: `+08:00` 的输入必须输出
 /// UTC 化的字面值, 而不是原时刻的本地字段.
 fn format_timestamp(at: OffsetDateTime) -> String {
     let utc = at.to_offset(UtcOffset::UTC);

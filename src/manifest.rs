@@ -53,7 +53,7 @@ pub fn load() -> Result<Manifest> {
 
 /// 解析并校验给定的清单文本.
 ///
-/// 纯函数: 只读取 `text` 与 `repo_root` (以及展开 `~` 所需的 `HOME`), 不产生任何
+/// 只读, 不写文件系统: 只读取 `text` 与 `repo_root` (以及展开 `~` 所需的 `HOME`), 不产生任何
 /// 文件系统改动. 校验规则 V-1 到 V-8 见 `openspec/specs/manifest-schema/spec.md`, 逐条对应如下:
 /// V-2 语法 (本函数前半), V-3 条目非空, V-4 两字段非空, V-5 目标路径互不重复,
 /// V-6 目标可解析为绝对路径, V-7 `on_conflict` 取值合法, V-8 只出现已定义的键.
@@ -592,7 +592,7 @@ mod tests {
     use crate::entry::OnConflict;
     use std::path::PathBuf;
 
-    /// 测试用的仓库根. `parse` 是纯函数, 不要求该路径存在.
+    /// 测试用的仓库根. `parse` 只读, 不要求该路径存在.
     fn repo() -> PathBuf {
         PathBuf::from("/repo")
     }
