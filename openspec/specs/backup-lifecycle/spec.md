@@ -20,7 +20,7 @@
 - **WHEN** 被覆盖路径是没有目录部分的裸文件名
 - **THEN** 备份落在当前目录, 不退化成相对名或空目录
 
-### Requirement: 备份名携带秒级本地时间戳
+### Requirement: 备份名携带秒级 UTC 时间戳
 
 备份名的形式 MUST 为 `<原名>.dotlink-backup.<YYYYMMDDThhmmss>`, 时间戳 MUST 取 UTC 的秒级精度, MUST NOT 受进程本地时区设置影响. 生成备份名 MUST NOT 在本地时区与 UTC 之间切换时间基准: 同一目标的全部新备份 MUST 落在同一 UTC 时间轴上. 时间戳可比较性 MUST 由该形态保证: 定长 15 字符的 UTC 时间戳, 其字典序 MUST 与时刻先后一致, 这是 "取最新" 排序的正确性前提.
 
