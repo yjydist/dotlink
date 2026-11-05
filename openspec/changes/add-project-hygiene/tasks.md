@@ -52,7 +52,7 @@
 - [x] 8.1 在 `openspec/config.yaml` 现有的 context 两条约束 (ASCII Art 只使用 ASCII 字符并优先 mermaid; 所有 artifact 使用简体中文) 之后追加技术约束: Rust 2024 edition 与 MSRV 1.97 (以 `Cargo.toml` 的 rust-version 为准), 仅 macOS 与 Linux, 无异步运行时, 无状态文件; 保留文件里的说明注释, 不删除说明性段落, 不删除既有两条约束. 验证: `openspec instructions proposal --change add-project-hygiene --json` 的 `context` 同时包含既有两条 (ASCII Art 与简体中文) 与新增五条; 人工核对 `openspec/config.yaml` 的 context 共七条且顺序为先旧后新.
 - [x] 8.2 取消 `rules` 的注释示例并写入 per-artifact 规则 (proposal, specs, design, tasks): 简体中文与仅 ASCII 标点, 与 README 及 openspec/specs 一致, Scenario 可执行, 每个 task 有验证; 明确以 AGENTS.md 为语言规则的上位来源. 验证: `openspec instructions proposal --change add-project-hygiene --json` 的 `rules` 字段包含 proposal 条款; 对 design 与 tasks 运行同一命令, `rules` 字段分别包含对应条款; `openspec validate add-project-hygiene --strict` 通过.
 - [x] 8.3 与 AGENTS.md 对照: 不新增与 AGENTS.md 冲突的标点白名单, 不复制完整标点判定表; 配置中的语言条款只是 AGENTS.md 的操作性投影. 验证: 人工逐条对照 AGENTS.md 的 "OpenSpec 规则" 与 "输出原则", 记录一致的结论; `rg -n 'AGENTS' openspec/config.yaml` 至少一处指向.
-- [ ] 8.4 组验证: 运行 `openspec validate add-project-hygiene --strict` 与 `openspec validate --all --strict`; 运行 `openspec status --change add-project-hygiene --json` 确认 specs 仍为 skipped; 人工检查 YAML 缩进与引号.
+- [x] 8.4 组验证: 运行 `openspec validate add-project-hygiene --strict` 与 `openspec validate --all --strict`; 运行 `openspec status --change add-project-hygiene --json` 确认 specs 仍为 skipped; 人工检查 YAML 缩进与引号.
 
 ## 9. 集成验证
 
