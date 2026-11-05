@@ -677,11 +677,14 @@ mod tests {
         fs::write(&target, "original").unwrap();
         let entry = entry_for(repo, "bashrc", &target);
 
-        // 备份完成后, 暂存前: 外部把目标换成了另一个文件.
+        // 备份完成后, 暂存前: 外部把目标换成了另一个文件. 先分配替换文件再原子
+        // 改名, 避免 Linux 在 remove 后复用同一 inode, 让"另一个对象"这一前提
+        // 不依赖分配器行为.
         let replaced = target.clone();
+        let replacement = repo.join("home/replacement");
+        fs::write(&replacement, "replacement").unwrap();
         after_backup_hook(move || {
-            fs::remove_file(&replaced).unwrap();
-            fs::write(&replaced, "replacement").unwrap();
+            fs::rename(&replacement, &replaced).unwrap();
         });
 
         let error = apply_entry(
@@ -794,9 +797,12 @@ mod tests {
         fs::write(&target, "original").unwrap();
         let identity = ObjectIdentity::snapshot(&target).unwrap();
 
-        // 快照之后, 暂存之前: 外部把目标换成了另一个文件.
-        fs::remove_file(&target).unwrap();
-        fs::write(&target, "replacement").unwrap();
+        // 快照之后, 暂存之前: 外部把目标换成了另一个文件. 先分配替换文件再原子
+        // 改名, 避免 Linux 在 remove 后复用同一 inode, 让"另一个对象"这一前提
+        // 不依赖分配器行为.
+        let replacement = dir.path().join("replacement");
+        fs::write(&replacement, "replacement").unwrap();
+        fs::rename(&replacement, &target).unwrap();
 
         let error = stage_and_verify(&target, identity).unwrap_err();
 
