@@ -23,7 +23,7 @@
 
 备选: 依赖 `unicode-width` 并用 `UnicodeWidthStr::width`. 否决理由: 为一个纯对齐问题新增生产依赖
 (当前只有 5 个直接依赖, 且 `render` 的模块注释已明确"不引入依赖"的选择); 该 crate 还会改写
-Ambiguous 与变体选择符的既有约定 (README 声明 Ambiguous 按 1 列), 等于在修表的同时换了语义.
+Ambiguous 与变体选择符的既有约定 (README 声明整块区间之外的 Ambiguous 按 1 列), 等于在修表的同时换了语义.
 代价是 emoji ZWJ 序列仍按码点累加, 但这本来就是已声明的近似, 不影响本次要修的可观察症状.
 
 ### D2. 保留现有 CJK 区块级区间, 只补缺失的 Wide/Fullwidth 区间

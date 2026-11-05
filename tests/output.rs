@@ -7,13 +7,17 @@ mod support;
 
 use std::process::Stdio;
 
-use support::{TempEnv, run};
+use support::{TempEnv, manifest_of, run};
 
-/// 测试侧的近似显示宽度: CJK 计 2 列, 其余计 1 列 (与报告层规则一致).
+/// 测试侧的近似显示宽度: CJK 与常见 emoji 计 2 列, 组合记号与变体选择符计 0 列.
+///
+/// 这是只覆盖用例字符的独立近似; `src/render.rs` 的完整区间表由单元测试逐码点锁定.
 fn display_width(text: &str) -> usize {
     text.chars()
         .map(|character| match u32::from(character) {
+            0x0300..=0x036F | 0xFE00..=0xFE0F => 0,
             0x2E80..=0x9FFF | 0xF900..=0xFAFF | 0xFF00..=0xFF60 => 2,
+            0x231A..=0x231B | 0x1F300..=0x1FAFF => 2,
             _ => 1,
         })
         .sum()
@@ -140,5 +144,173 @@ fn report_columns_align_for_twelve_entries_with_cjk_targets() {
     assert_eq!(
         lines[12], "12 个条目: 0 成功, 0 已是最新, 12 未处理, 0 失败",
         "汇总行必须是最后一行"
+    );
+}
+
+/// 等显示宽度的 target 说明列起点相同: 宽字符符号与 emoji 各计 2 列.
+#[test]
+fn wide_symbols_and_emoji_align_with_ascii_targets_of_equal_width() {
+    let env = TempEnv::new();
+    env.write_source("shared/rc", "x\n");
+    let entries = [
+        ("shared/rc", "~/ab", "-"),
+        ("shared/rc", "~/⌚", "-"),
+        ("shared/rc", "~/🚀", "-"),
+        ("shared/rc", "~/.配置", "-"),
+        ("shared/rc", "~/.abcd", "-"),
+    ];
+    env.write_manifest(&manifest_of(&entries));
+
+    let run = run(&env, &["preview"]);
+    assert_eq!(run.code, 1, "{}", run.stdout);
+    let lines: Vec<&str> = run.stdout.lines().collect();
+    assert_eq!(lines.len(), 6, "5 条条目加一行汇总:\n{}", run.stdout);
+    for (index, (_, target, _)) in entries.iter().copied().enumerate() {
+        assert!(
+            lines[index].contains(target),
+            "行内应原样保留 target {target}: {}",
+            lines[index]
+        );
+    }
+
+    let note_starts: Vec<usize> = lines[..5]
+        .iter()
+        .map(|line| {
+            let index = line.find("未部署").expect("note");
+            display_width(&line[..index])
+        })
+        .collect();
+    assert!(
+        note_starts.iter().all(|start| *start == note_starts[0]),
+        "等显示宽度 target 的说明列未对齐: {note_starts:?}\n{}",
+        run.stdout
+    );
+}
+
+/// 整块保留的码点 (块内未分配码点与文本呈现型 emoji) 也计 2 列, 与等宽 ASCII target 对齐.
+#[test]
+fn retained_whole_block_codepoints_align_with_ascii_targets_of_equal_width() {
+    let env = TempEnv::new();
+    env.write_source("shared/rc", "x\n");
+    let entries = [
+        ("shared/rc", "~/ab", "-"),
+        ("shared/rc", "~/\u{1F321}", "-"),
+        ("shared/rc", "~/\u{3248}", "-"),
+    ];
+    env.write_manifest(&manifest_of(&entries));
+
+    let run = run(&env, &["preview"]);
+    assert_eq!(run.code, 1, "{}", run.stdout);
+    let lines: Vec<&str> = run.stdout.lines().collect();
+    assert_eq!(lines.len(), 4, "3 条条目加一行汇总:\n{}", run.stdout);
+
+    let note_starts: Vec<usize> = lines[..3]
+        .iter()
+        .map(|line| {
+            let index = line.find("未部署").expect("note");
+            display_width(&line[..index])
+        })
+        .collect();
+    assert_eq!(
+        note_starts[0], note_starts[1],
+        "文本呈现型 emoji 应计 2 列: {note_starts:?}\n{}",
+        run.stdout
+    );
+    assert_eq!(
+        note_starts[0], note_starts[2],
+        "CJK 区块内的 Ambiguous 码点应计 2 列: {note_starts:?}\n{}",
+        run.stdout
+    );
+}
+
+/// 区段之外的 Wide 组合记号 (U+3099) 按 2 列计, 与等显示宽度的 ASCII target 对齐.
+#[test]
+fn wide_combining_mark_outside_zero_width_ranges_counts_as_two_columns() {
+    let env = TempEnv::new();
+    env.write_source("shared/rc", "x\n");
+    let entries = [
+        ("shared/rc", "~/.abc", "-"),
+        ("shared/rc", "~/.a\u{3099}", "-"),
+    ];
+    env.write_manifest(&manifest_of(&entries));
+
+    let run = run(&env, &["preview"]);
+    assert_eq!(run.code, 1, "{}", run.stdout);
+    let lines: Vec<&str> = run.stdout.lines().collect();
+    assert_eq!(lines.len(), 3, "2 条条目加一行汇总:\n{}", run.stdout);
+    assert!(
+        lines[1].contains("~/.a\u{3099}"),
+        "区段之外的组合记号应原样保留在行内: {}",
+        lines[1]
+    );
+
+    let note_starts: Vec<usize> = lines[..2]
+        .iter()
+        .map(|line| {
+            let index = line.find("未部署").expect("note");
+            display_width(&line[..index])
+        })
+        .collect();
+    assert_eq!(
+        display_width("~/.a\u{3099}"),
+        6,
+        "区段之外的 Wide 组合记号应计 2 列"
+    );
+    assert_eq!(
+        note_starts[0], note_starts[1],
+        "区段之外的 Wide 组合记号应与等显示宽度的 ASCII target 对齐: {note_starts:?}\n{}",
+        run.stdout
+    );
+}
+
+/// 组合记号不占列; 超宽 target 不截断, 只把该行的说明列右移.
+#[test]
+fn combining_marks_align_and_overwide_targets_only_shift_their_own_note() {
+    let env = TempEnv::new();
+    env.write_source("shared/rc", "x\n");
+    let long_target = format!("~/.{}", "a".repeat(25));
+    let entries = [
+        ("shared/rc", "~/.e\u{301}", "-"),
+        ("shared/rc", "~/ab", "-"),
+        ("shared/rc", long_target.as_str(), "-"),
+    ];
+    env.write_manifest(&manifest_of(&entries));
+
+    let run = run(&env, &["preview"]);
+    assert_eq!(run.code, 1, "{}", run.stdout);
+    let lines: Vec<&str> = run.stdout.lines().collect();
+    assert_eq!(lines.len(), 4, "3 条条目加一行汇总:\n{}", run.stdout);
+    assert!(
+        lines[0].contains("~/.e\u{301}"),
+        "组合记号应原样保留在行内: {}",
+        lines[0]
+    );
+    assert!(
+        lines[1].contains("~/ab"),
+        "行内应原样保留 target: {}",
+        lines[1]
+    );
+
+    let note_starts: Vec<usize> = lines[..3]
+        .iter()
+        .map(|line| {
+            let index = line.find("未部署").expect("note");
+            display_width(&line[..index])
+        })
+        .collect();
+    assert_eq!(
+        note_starts[0], note_starts[1],
+        "组合记号不得占列: {note_starts:?}\n{}",
+        run.stdout
+    );
+    assert!(
+        note_starts[2] > note_starts[0],
+        "超宽 target 应使说明列右移: {note_starts:?}\n{}",
+        run.stdout
+    );
+    assert!(
+        lines[2].contains(&long_target),
+        "超宽 target 不得被截断: {}",
+        lines[2]
     );
 }

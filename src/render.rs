@@ -32,12 +32,23 @@ const TARGET_WIDTH: usize = 20;
 
 /// 字符串在终端中的近似显示宽度.
 ///
-/// 只依赖码点区间, 不引入依赖: 组合记号与变体选择符按 0 列, East Asian Wide /
-/// Fullwidth 与常见 emoji 按 2 列, 其余按 1 列.
+/// 只依赖码点区间, 不引入依赖: 组合记号区段与变体选择符按 0 列, East Asian Wide /
+/// Fullwidth 码点与整块保留的区间按 2 列, 其余按 1 列.
 ///
-/// 近似之处: 不按字素簇分段, emoji ZWJ 序列与区域指示符按码点近似; East Asian
-/// Ambiguous 与未分配码点按 1 列; 已转义的 `\u{...}` 文本按字面字符计宽. 这些差异
-/// 只影响列对齐, 不影响文件系统操作或退出码.
+/// 宽字符区间取自 Unicode 17.0 的 `EastAsianWidth.txt` 中 `W` 与 `F` 两类. 重新生成
+/// 的方法: 用 Python 的 `unicodedata.east_asian_width` 逐码点判定, 把命中的码点压缩成
+/// 连续区间, 并为前向兼容保留若干整块区间 (见下), 升级 Unicode 版本时重跑并更新版本号.
+///
+/// 整块保留: CJK 相关区块与两个 emoji 整块 (`U+1F300-U+1F64F`, `U+1F900-U+1F9FF`)
+/// 按整块计 2 列, 块内未分配的码点与文本呈现型 emoji 同样计 2 列, 使将来分配的字符
+/// 不必升级二进制.
+///
+/// 近似之处: 不按字素簇分段, emoji ZWJ 序列与区域指示符按码点近似; 整块区间之外的
+/// East Asian Ambiguous 按 1 列; 组合记号只在 `character_width` 0 列分支列出的区段
+/// (`U+0300-U+036F`, `U+1AB0-U+1AFF`, `U+1DC0-U+1DFF`, `U+20D0-U+20FF`,
+/// `U+FE20-U+FE2F`) 内按 0 列, 区段之外的组合记号按 East Asian 宽度判定 (少数 East
+/// Asian Wide 的仍计 2 列, 例如 `U+3099`); 已转义的 `\u{...}` 文本按字面字符计宽. 这些
+/// 差异只影响列对齐, 不影响文件系统操作或退出码.
 fn display_width(text: &str) -> usize {
     text.chars().map(character_width).sum()
 }
@@ -45,7 +56,7 @@ fn display_width(text: &str) -> usize {
 fn character_width(character: char) -> usize {
     let code = u32::from(character);
     match code {
-        // 组合记号与变体选择符: 附着在前一个字符上.
+        // 常见组合记号区段与变体选择符: 附着在前一个字符上, 不占列.
         0x0300..=0x036F
         | 0x1AB0..=0x1AFF
         | 0x1DC0..=0x1DFF
@@ -54,21 +65,109 @@ fn character_width(character: char) -> usize {
         | 0xFE20..=0xFE2F => 0,
         // 已在显示层转义的零宽 / bidi 控制符: 转义后是字面文本, 但直接传入时按 0 列.
         0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x2069 | 0xFEFF => 0,
-        // East Asian Wide / Fullwidth 与常见 emoji.
+        // East Asian Wide / Fullwidth 与 emoji (Unicode 17.0 的 `W` / `F`).
+        //
+        // CJK 区块沿用整块区间 (含未分配码点), 使将来分配的字符不必升级二进制;
+        // 其余区块只列已分配的码点, 避免把相邻的窄码点也算成 2 列.
+        //
+        // Hangul Jamo 与 CJK 部首, 笔画, 假名, 汉字, 谚文, 兼容表意文字.
         0x1100..=0x115F
         | 0x2E80..=0x303E
         | 0x3041..=0x33FF
         | 0x3400..=0x4DBF
+        | 0x4DC0..=0x4DFF
         | 0x4E00..=0x9FFF
         | 0xA000..=0xA4CF
+        | 0xA960..=0xA97C
         | 0xAC00..=0xD7A3
         | 0xF900..=0xFAFF
         | 0xFE10..=0xFE19
         | 0xFE30..=0xFE6F
         | 0xFF00..=0xFF60
         | 0xFFE0..=0xFFE6
+        // 杂项符号, 装饰符号与常见 emoji (含 U+231A 起的宽字符).
+        | 0x231A..=0x231B
+        | 0x2329..=0x232A
+        | 0x23E9..=0x23EC
+        | 0x23F0
+        | 0x23F3
+        | 0x25FD..=0x25FE
+        | 0x2614..=0x2615
+        | 0x2630..=0x2637
+        | 0x2648..=0x2653
+        | 0x267F
+        | 0x268A..=0x268F
+        | 0x2693
+        | 0x26A1
+        | 0x26AA..=0x26AB
+        | 0x26BD..=0x26BE
+        | 0x26C4..=0x26C5
+        | 0x26CE
+        | 0x26D4
+        | 0x26EA
+        | 0x26F2..=0x26F3
+        | 0x26F5
+        | 0x26FA
+        | 0x26FD
+        | 0x2705
+        | 0x270A..=0x270B
+        | 0x2728
+        | 0x274C
+        | 0x274E
+        | 0x2753..=0x2755
+        | 0x2757
+        | 0x2795..=0x2797
+        | 0x27B0
+        | 0x27BF
+        | 0x2B1B..=0x2B1C
+        | 0x2B50
+        | 0x2B55
+        // 唐古特, 契丹, 女真等历史文字与竖排标点.
+        | 0x16FE0..=0x16FE4
+        | 0x16FF0..=0x16FF6
+        | 0x17000..=0x18CD5
+        | 0x18CFF..=0x18D1E
+        | 0x18D80..=0x18DF2
+        | 0x1AFF0..=0x1AFF3
+        | 0x1AFF5..=0x1AFFB
+        | 0x1AFFD..=0x1AFFE
+        | 0x1B000..=0x1B122
+        | 0x1B132
+        | 0x1B150..=0x1B152
+        | 0x1B155
+        | 0x1B164..=0x1B167
+        | 0x1B170..=0x1B2FB
+        | 0x1D300..=0x1D356
+        | 0x1D360..=0x1D376
+        // 麻将, 扑克与带圈 CJK 符号.
+        | 0x1F004
+        | 0x1F0CF
+        | 0x1F18E
+        | 0x1F191..=0x1F19A
+        | 0x1F200..=0x1F202
+        | 0x1F210..=0x1F23B
+        | 0x1F240..=0x1F248
+        | 0x1F250..=0x1F251
+        | 0x1F260..=0x1F265
+        // emoji 区块: 现有整块区间保留, 其余按已分配的宽码点补齐.
         | 0x1F300..=0x1F64F
+        | 0x1F680..=0x1F6C5
+        | 0x1F6CC
+        | 0x1F6D0..=0x1F6D2
+        | 0x1F6D5..=0x1F6D8
+        | 0x1F6DC..=0x1F6DF
+        | 0x1F6EB..=0x1F6EC
+        | 0x1F6F4..=0x1F6FC
+        | 0x1F7E0..=0x1F7EB
+        | 0x1F7F0
         | 0x1F900..=0x1F9FF
+        | 0x1FA70..=0x1FA7C
+        | 0x1FA80..=0x1FA8A
+        | 0x1FA8E..=0x1FAC6
+        | 0x1FAC8
+        | 0x1FACD..=0x1FADC
+        | 0x1FADF..=0x1FAEA
+        | 0x1FAEF..=0x1FAF8
         | 0x20000..=0x3FFFD => 2,
         _ => 1,
     }
@@ -1472,6 +1571,190 @@ mod tests {
         );
         // token 列 9 + 分隔空格 1 + target 列 20.
         assert_eq!(note_starts[0], token_starts[0] + 9 + 1 + TARGET_WIDTH);
+    }
+
+    /// Unicode 17.0 的 `EastAsianWidth.txt` 中 `W` 与 `F` 两类的完整区间, 作为
+    /// `character_width` 的独立预期.
+    ///
+    /// 用 Python 的 `unicodedata.east_asian_width` 逐码点判定并压缩成连续区间生成;
+    /// 升级 Unicode 版本时用同一方法重跑, 与实现处的区间表一起更新. 表内含 EastAsianWidth
+    /// 判为 `W` / `F` 的未分配码点 (CJK 区块内), 与实现处的前向兼容一致, 因此任何已分配
+    /// 区间的漏列都会让下面的测试失败.
+    const UNICODE_17_WIDE_RANGES: &[(u32, u32)] = &[
+        (0x1100, 0x115F),
+        (0x231A, 0x231B),
+        (0x2329, 0x232A),
+        (0x23E9, 0x23EC),
+        (0x23F0, 0x23F0),
+        (0x23F3, 0x23F3),
+        (0x25FD, 0x25FE),
+        (0x2614, 0x2615),
+        (0x2630, 0x2637),
+        (0x2648, 0x2653),
+        (0x267F, 0x267F),
+        (0x268A, 0x268F),
+        (0x2693, 0x2693),
+        (0x26A1, 0x26A1),
+        (0x26AA, 0x26AB),
+        (0x26BD, 0x26BE),
+        (0x26C4, 0x26C5),
+        (0x26CE, 0x26CE),
+        (0x26D4, 0x26D4),
+        (0x26EA, 0x26EA),
+        (0x26F2, 0x26F3),
+        (0x26F5, 0x26F5),
+        (0x26FA, 0x26FA),
+        (0x26FD, 0x26FD),
+        (0x2705, 0x2705),
+        (0x270A, 0x270B),
+        (0x2728, 0x2728),
+        (0x274C, 0x274C),
+        (0x274E, 0x274E),
+        (0x2753, 0x2755),
+        (0x2757, 0x2757),
+        (0x2795, 0x2797),
+        (0x27B0, 0x27B0),
+        (0x27BF, 0x27BF),
+        (0x2B1B, 0x2B1C),
+        (0x2B50, 0x2B50),
+        (0x2B55, 0x2B55),
+        (0x2E80, 0x2E99),
+        (0x2E9B, 0x2EF3),
+        (0x2F00, 0x2FD5),
+        (0x2FF0, 0x303E),
+        (0x3041, 0x3096),
+        (0x3099, 0x30FF),
+        (0x3105, 0x312F),
+        (0x3131, 0x318E),
+        (0x3190, 0x31E5),
+        (0x31EF, 0x321E),
+        (0x3220, 0x3247),
+        (0x3250, 0xA48C),
+        (0xA490, 0xA4C6),
+        (0xA960, 0xA97C),
+        (0xAC00, 0xD7A3),
+        (0xF900, 0xFAFF),
+        (0xFE10, 0xFE19),
+        (0xFE30, 0xFE52),
+        (0xFE54, 0xFE66),
+        (0xFE68, 0xFE6B),
+        (0xFF01, 0xFF60),
+        (0xFFE0, 0xFFE6),
+        (0x16FE0, 0x16FE4),
+        (0x16FF0, 0x16FF6),
+        (0x17000, 0x18CD5),
+        (0x18CFF, 0x18D1E),
+        (0x18D80, 0x18DF2),
+        (0x1AFF0, 0x1AFF3),
+        (0x1AFF5, 0x1AFFB),
+        (0x1AFFD, 0x1AFFE),
+        (0x1B000, 0x1B122),
+        (0x1B132, 0x1B132),
+        (0x1B150, 0x1B152),
+        (0x1B155, 0x1B155),
+        (0x1B164, 0x1B167),
+        (0x1B170, 0x1B2FB),
+        (0x1D300, 0x1D356),
+        (0x1D360, 0x1D376),
+        (0x1F004, 0x1F004),
+        (0x1F0CF, 0x1F0CF),
+        (0x1F18E, 0x1F18E),
+        (0x1F191, 0x1F19A),
+        (0x1F200, 0x1F202),
+        (0x1F210, 0x1F23B),
+        (0x1F240, 0x1F248),
+        (0x1F250, 0x1F251),
+        (0x1F260, 0x1F265),
+        (0x1F300, 0x1F320),
+        (0x1F32D, 0x1F335),
+        (0x1F337, 0x1F37C),
+        (0x1F37E, 0x1F393),
+        (0x1F3A0, 0x1F3CA),
+        (0x1F3CF, 0x1F3D3),
+        (0x1F3E0, 0x1F3F0),
+        (0x1F3F4, 0x1F3F4),
+        (0x1F3F8, 0x1F43E),
+        (0x1F440, 0x1F440),
+        (0x1F442, 0x1F4FC),
+        (0x1F4FF, 0x1F53D),
+        (0x1F54B, 0x1F54E),
+        (0x1F550, 0x1F567),
+        (0x1F57A, 0x1F57A),
+        (0x1F595, 0x1F596),
+        (0x1F5A4, 0x1F5A4),
+        (0x1F5FB, 0x1F64F),
+        (0x1F680, 0x1F6C5),
+        (0x1F6CC, 0x1F6CC),
+        (0x1F6D0, 0x1F6D2),
+        (0x1F6D5, 0x1F6D8),
+        (0x1F6DC, 0x1F6DF),
+        (0x1F6EB, 0x1F6EC),
+        (0x1F6F4, 0x1F6FC),
+        (0x1F7E0, 0x1F7EB),
+        (0x1F7F0, 0x1F7F0),
+        (0x1F90C, 0x1F93A),
+        (0x1F93C, 0x1F945),
+        (0x1F947, 0x1F9FF),
+        (0x1FA70, 0x1FA7C),
+        (0x1FA80, 0x1FA8A),
+        (0x1FA8E, 0x1FAC6),
+        (0x1FAC8, 0x1FAC8),
+        (0x1FACD, 0x1FADC),
+        (0x1FADF, 0x1FAEA),
+        (0x1FAEF, 0x1FAF8),
+        (0x20000, 0x2FFFD),
+        (0x30000, 0x3FFFD),
+    ];
+
+    /// Unicode 17.0 的每个 Wide / Fullwidth 码点都计 2 列, 防止区间表再次漏块.
+    #[test]
+    fn every_unicode_17_wide_or_fullwidth_codepoint_counts_as_two_columns() {
+        for &(start, end) in UNICODE_17_WIDE_RANGES {
+            for code in start..=end {
+                let character = char::from_u32(code).expect("区间内均为有效码点");
+                assert_eq!(character_width(character), 2, "U+{code:04X} 应计 2 列");
+            }
+        }
+    }
+
+    /// East Asian Wide / Fullwidth 码点统一按 2 列; 邻接的窄码点与组合记号不受影响.
+    #[test]
+    fn east_asian_wide_and_fullwidth_codepoints_count_as_two_columns() {
+        for code in [
+            0x231A, 0x2329, 0x2B50, 0x1F004, 0x1F680, 0x1F7E0, 0x1FAF8, 0x16FE0, 0xA960,
+        ] {
+            let character = char::from_u32(code).expect("有效码点");
+            assert_eq!(character_width(character), 2, "U+{code:04X} 应计 2 列");
+        }
+        for code in [0x2319, 0x2B1A, 0x1F6C6, 0x1F6CA] {
+            let character = char::from_u32(code).expect("有效码点");
+            assert_eq!(character_width(character), 1, "U+{code:04X} 应计 1 列");
+        }
+        assert_eq!(character_width('\u{301}'), 0, "组合记号应计 0 列");
+        assert_eq!(character_width('\u{FE0F}'), 0, "变体选择符应计 0 列");
+    }
+
+    /// 整块保留的区间按 2 列: 块内未分配的码点与文本呈现型 emoji 也计 2 列.
+    ///
+    /// 与 `UNICODE_17_WIDE_RANGES` 的差别是有意为之: 这些区块按整块保留, 使将来分配的
+    /// 字符不必升级二进制. 区段之外的组合记号则按其 East Asian 宽度判定.
+    #[test]
+    fn retained_whole_blocks_count_as_two_columns() {
+        for code in [0x1F321, 0x1F900, 0x3248, 0x3097] {
+            let character = char::from_u32(code).expect("有效码点");
+            assert_eq!(character_width(character), 2, "U+{code:04X} 应计 2 列");
+        }
+        assert_eq!(
+            character_width('\u{3099}'),
+            2,
+            "区段之外的 Wide 组合记号按宽度计 2 列"
+        );
+        assert_eq!(character_width('\u{303F}'), 1, "整块之外的窄码点计 1 列");
+        assert_eq!(
+            character_width('\u{483}'),
+            1,
+            "区段之外的组合记号按码点宽度计 1 列"
+        );
     }
 
     /// 显示宽度按 CJK 2 列计算: ASCII 与 CJK target 的说明列仍从同一列开始.
