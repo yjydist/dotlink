@@ -443,6 +443,96 @@ fn undo_ignores_a_partial_only_backup_and_still_removes_the_link() {
 }
 
 // ---------------------------------------------------------------------------
+// (b2b) 时间戳字段非法: 与 `.partial` 同属"不参与查找", 但不被删除
+// ---------------------------------------------------------------------------
+
+/// 同目录有合法备份与一个字段非法但字典序更大的名字: 必须恢复合法备份, 且从不读取
+/// 非法名字的内容 (openspec/specs/backup-lifecycle/spec.md 的"时间戳字段非法的备份
+/// 不参与查找").
+#[test]
+fn undo_ignores_a_larger_invalid_timestamp_when_a_legal_backup_exists() {
+    let env = TempEnv::new();
+    env.write_source("shell/bashrc", "managed\n");
+    env.write_manifest(&manifest_of(&[("shell/bashrc", "~/.bashrc", "-")]));
+
+    let legal = env.home().join(".bashrc.dotlink-backup.20260101T000000");
+    fs::write(&legal, "real-old\n").unwrap();
+    let bogus = env.home().join(".bashrc.dotlink-backup.99999999T999999");
+    fs::write(&bogus, "bogus\n").unwrap();
+
+    let undone = run(&env, &["undo"]);
+    assert_eq!(undone.code, 1, "恢复了备份故退 1: {}", undone.stdout);
+    let line = line_for(&undone.stdout, "~/.bashrc");
+    assert_eq!(token_of(line), "restore", "{line}");
+    assert!(
+        line.contains(&legal.display().to_string()),
+        "restore 行必须给出合法备份的完整路径: {line}"
+    );
+    env.assert_content(&env.home().join(".bashrc"), "real-old\n");
+    env.assert_content(&legal, "real-old\n");
+    // 非法名字保持原样且未被读取.
+    env.assert_content(&bogus, "bogus\n");
+    assert_eq!(
+        undone.stdout.lines().last().unwrap_or_default(),
+        "1 个条目: 1 成功, 0 已是最新, 0 未处理, 0 失败",
+        "{}",
+        undone.stdout
+    );
+}
+
+/// 只有字段非法的名字: 视为没有可用备份, 按既有语义移除链接.
+///
+/// 目标被部署链接占用时, `undo` 仍执行移除 (成功列的 `undo`, 退 1), 非法名字保持原样;
+/// 目标本来就为空时则是成功列的 `ok`, 退 0. 两种情形都不得把非法名字当成备份.
+#[test]
+fn undo_treats_invalid_timestamp_names_as_no_usable_backup() {
+    let env = TempEnv::new();
+    env.write_manifest(&manifest_of(&[("shell/bashrc", "~/.bashrc", "-")]));
+    let target = deployed(&env, "shell/bashrc", ".bashrc");
+    let bogus = env.home().join(".bashrc.dotlink-backup.20261301T000000.10");
+    fs::write(&bogus, "bogus\n").unwrap();
+
+    let undone = run(&env, &["undo"]);
+    assert_eq!(undone.code, 1, "{}", undone.stdout);
+    let line = line_for(&undone.stdout, "~/.bashrc");
+    assert_eq!(token_of(line), "undo", "{line}");
+    assert!(
+        fs::symlink_metadata(&target).is_err(),
+        "只有非法名字时必须只移除链接"
+    );
+    env.assert_content(&bogus, "bogus\n");
+    assert_eq!(
+        undone.stdout.lines().last().unwrap_or_default(),
+        "1 个条目: 1 成功, 0 已是最新, 0 未处理, 0 失败",
+        "{}",
+        undone.stdout
+    );
+
+    // 目标为空且只有非法名字: 与"无备份"同等, 归入 `ok` 且零改动.
+    let empty = TempEnv::new();
+    empty.write_source("shell/bashrc", "managed\n");
+    empty.write_manifest(&manifest_of(&[("shell/bashrc", "~/.bashrc", "-")]));
+    let only_bogus = empty.home().join(".bashrc.dotlink-backup.99999999T999999");
+    fs::write(&only_bogus, "bogus\n").unwrap();
+
+    let untouched = run(&empty, &["undo"]);
+    assert_eq!(untouched.code, 0, "{}", untouched.stdout);
+    let line = line_for(&untouched.stdout, "~/.bashrc");
+    assert_eq!(token_of(line), "ok", "{line}");
+    assert!(
+        fs::symlink_metadata(empty.home().join(".bashrc")).is_err(),
+        "非法名字不得被当成可恢复的备份"
+    );
+    empty.assert_content(&only_bogus, "bogus\n");
+    assert_eq!(
+        untouched.stdout.lines().last().unwrap_or_default(),
+        "1 个条目: 0 成功, 1 已是最新, 0 未处理, 0 失败",
+        "{}",
+        untouched.stdout
+    );
+}
+
+// ---------------------------------------------------------------------------
 // (b3) 源缺失: undo 报 missing 并计入失败列 (不因目标不存在而归为 ok)
 // ---------------------------------------------------------------------------
 

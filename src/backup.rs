@@ -22,7 +22,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use time::{OffsetDateTime, UtcOffset};
+use time::{Date, Month, OffsetDateTime, Time, UtcOffset};
 
 use crate::error::{Error, Result};
 use crate::os;
@@ -609,12 +609,45 @@ fn cmp_serial(a: &str, b: &str) -> Ordering {
 }
 
 /// `YYYYMMDDThhmmss`, 15 个字符.
+///
+/// "完整命名" 有两层含义, 二者必须同时成立:
+///
+/// - **形态**: 定长 15 字符, 前 8 位日期数字, 第 9 位分隔符 `T`, 后 6 位时间数字.
+/// - **字段**: 月在 01 至 12 之间, 日落在该月的真实天数内 (含闰年 2 月 29 日), 时在
+///   00 至 23 之间, 分与秒在 00 至 59 之间. 年份已由 4 位数字形态固定.
+///
+/// 只有合法的 UTC 日历时刻才使 "定长字符串序即时间序" 成立; 形态合法但字段非法的
+/// 名字 (例如 `20261301T000000`) 取值无意义, 不参与查找
+/// (openspec/specs/backup-lifecycle/spec.md 的"时间戳字段非法的备份不参与查找").
+/// 日历判定复用 `time` 的构造校验, 不重复实现每月天数与闰年规则.
 fn is_timestamp(text: &str) -> bool {
     let bytes = text.as_bytes();
-    bytes.len() == 15
-        && bytes[..8].iter().all(u8::is_ascii_digit)
-        && bytes[8] == b'T'
-        && bytes[9..].iter().all(u8::is_ascii_digit)
+    if bytes.len() != 15
+        || !bytes[..8].iter().all(u8::is_ascii_digit)
+        || bytes[8] != b'T'
+        || !bytes[9..].iter().all(u8::is_ascii_digit)
+    {
+        return false;
+    }
+
+    // 字节切片在形态校验之后是安全的: 15 个字节全是 ASCII 数字或 `T`.
+    let year = text[0..4].parse::<i32>().ok();
+    let month = text[4..6]
+        .parse::<u8>()
+        .ok()
+        .and_then(|month| Month::try_from(month).ok());
+    let day = text[6..8].parse::<u8>().ok();
+    let hour = text[9..11].parse::<u8>().ok();
+    let minute = text[11..13].parse::<u8>().ok();
+    let second = text[13..15].parse::<u8>().ok();
+    let (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) =
+        (year, month, day, hour, minute, second)
+    else {
+        return false;
+    };
+
+    Date::from_calendar_date(year, month, day).is_ok()
+        && Time::from_hms(hour, minute, second).is_ok()
 }
 
 /// 在同目录内给 `path` 追加一个后缀.
@@ -802,6 +835,101 @@ mod tests {
             "备份时间戳的年份看起来不对: {suffix}"
         );
         assert_eq!(suffix.len(), 15);
+    }
+
+    /// 形态与字段都合法的名字才被接受; 闰日与月末边界取该月真实天数.
+    #[test]
+    fn is_timestamp_accepts_valid_calendar_values() {
+        for text in [
+            "20260101T000000",
+            "20260228T235959",
+            "20240229T000000",
+            "20261231T235959",
+            // 年份范围以 `time` 能否构成合法日期为准: 4 位数字的上下端都被接受.
+            // 本工具生成的年份来自 `now_utc()`, 不会走到这两端, 这里只为固定住当前范围.
+            "00000101T000000",
+            "99991231T235959",
+        ] {
+            assert!(is_timestamp(text), "{text} 是合法日历时刻");
+        }
+    }
+
+    /// 形态合法但字段非法 (月, 月末, 闰日, 时分秒越界) 与形态非法都必须被拒绝.
+    #[test]
+    fn is_timestamp_rejects_invalid_fields_and_shapes() {
+        for text in [
+            // 字段非法: 13 月, 2 月 30 日, 平年闰日, 4 月 31 日, 24 时, 60 分, 60 秒.
+            "20261301T000000",
+            "20260230T000000",
+            "20230229T000000",
+            "20260431T000000",
+            "20260101T240000",
+            "20260101T236000",
+            "20260101T005960",
+            "20260101T000060",
+            // 0 月不在 01 至 12 之间.
+            "20260001T000000",
+            // 形态非法: 长度不足, 缺分隔符, 非数字, `.partial` 后缀.
+            "2026010T000000",
+            "20260101T00000",
+            "20260101-000000",
+            "20260101T00000a",
+            "20260101T000000.partial",
+        ] {
+            assert!(!is_timestamp(text), "{text} 不是完整的合法时间戳");
+        }
+    }
+
+    /// 后缀拆分: 合法时间戳仍按 `.` 拆出序号; 字段非法时无论带不带序号都没有备份.
+    #[test]
+    fn complete_suffix_of_requires_valid_fields_but_keeps_the_serial() {
+        assert_eq!(
+            complete_suffix_of("20260101T000000.10"),
+            Some(("20260101T000000", "10"))
+        );
+        assert_eq!(
+            complete_suffix_of("20240229T000000"),
+            Some(("20240229T000000", ""))
+        );
+        for suffix in [
+            "20261301T000000",
+            "20261301T000000.10",
+            "20230229T000000.2",
+            "20260101T240000",
+            "20260101T000000.partial",
+        ] {
+            assert_eq!(complete_suffix_of(suffix), None, "{suffix}");
+        }
+    }
+
+    /// 字段非法的名字不参与"取最新": 既不会被选中, 也不会盖过合法备份.
+    #[test]
+    fn find_latest_backup_ignores_names_with_invalid_timestamp_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("bashrc");
+        let valid = dir.path().join("bashrc.dotlink-backup.20260101T000000");
+        fs::write(&valid, "real").unwrap();
+        // 字典序更大, 但字段非法 (13 月与平年闰日).
+        for name in [
+            "bashrc.dotlink-backup.99999999T999999",
+            "bashrc.dotlink-backup.20261301T000000",
+            "bashrc.dotlink-backup.20230229T000000.9",
+        ] {
+            fs::write(dir.path().join(name), "bogus").unwrap();
+        }
+
+        assert_eq!(find_latest_backup(&target).unwrap(), Some(valid));
+
+        // 同目录并列合法闰日与平年闰日: 前者参与查找, 后者被忽略 (spec 的"闰日与月末").
+        let leap_target = dir.path().join("profile");
+        let leap = dir.path().join("profile.dotlink-backup.20240229T000000");
+        fs::write(&leap, "leap").unwrap();
+        fs::write(
+            dir.path().join("profile.dotlink-backup.20230229T000000"),
+            "bogus",
+        )
+        .unwrap();
+        assert_eq!(find_latest_backup(&leap_target).unwrap(), Some(leap));
     }
 
     #[test]
