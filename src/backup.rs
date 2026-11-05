@@ -385,7 +385,10 @@ fn copy_object(source: &Path, dest: &Path) -> std::result::Result<(), CopyFailur
     if !file_type.is_file() {
         return Err(CopyFailure::Fatal(io::Error::new(
             io::ErrorKind::Unsupported,
-            format!("无法复制特殊文件 {}", source.display()),
+            format!(
+                "无法复制特殊文件 {}; 请先手工移走该特殊文件再重试",
+                source.display()
+            ),
         )));
     }
     let mut input = fs::File::open(source)
@@ -737,9 +740,18 @@ fn take_metadata_failure() -> bool {
 #[cfg(all(test, unix))]
 mod tests {
 
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 
     use super::*;
+
+    /// 用系统 `mkfifo` 创建 FIFO; macOS 与 Linux 都自带该工具.
+    fn make_fifo(path: &Path) {
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("执行 mkfifo");
+        assert!(status.success(), "mkfifo 退出码非零: {status}");
+    }
 
     /// 取出备份名中 `<原名>.dotlink-backup.` 之后的部分.
     fn suffix_of(target: &Path, backup: &Path) -> String {
@@ -1860,9 +1872,14 @@ mod tests {
 
         let error = copy_to_staging(&source, &base, PARTIAL_SUFFIX).unwrap_err();
 
+        let text = error.to_string();
         assert!(
-            error.to_string().contains("socket"),
-            "说明必须指出触发失败的特殊文件: {error}"
+            text.contains(&source.join("socket").display().to_string()),
+            "说明必须给出特殊文件的完整路径: {text}"
+        );
+        assert!(
+            text.contains("请先手工移走该特殊文件再重试"),
+            "说明必须给出下一步动作: {text}"
         );
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), before);
         assert!(!base.exists(), "失败不得发布最终名");
@@ -1879,6 +1896,57 @@ mod tests {
         assert_eq!(fs::read_to_string(source.join("file")).unwrap(), "original");
         assert_eq!(fs::read_to_string(&existing_backup).unwrap(), "earlier");
         assert_eq!(fs::read_to_string(&user_file).unwrap(), "keep");
+    }
+
+    /// 目录含普通文件与 FIFO: 整体成败, 说明给出 FIFO 路径, 暂存清理且原对象不变.
+    #[test]
+    fn a_fifo_inside_a_directory_fails_the_whole_backup_with_a_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("file"), "original").unwrap();
+        let fifo = source.join("fifo");
+        make_fifo(&fifo);
+        let fifo_meta = fs::symlink_metadata(&fifo).unwrap();
+        let fifo_inode = fifo_meta.ino();
+        assert!(fifo_meta.file_type().is_fifo());
+
+        let base = dir.path().join("source.dotlink-backup.20260101T000000");
+        let before = fs::read_dir(dir.path()).unwrap().count();
+
+        let error = copy_to_staging(&source, &base, PARTIAL_SUFFIX).unwrap_err();
+
+        let text = error.to_string();
+        assert!(
+            text.contains(&fifo.display().to_string()),
+            "说明必须给出 FIFO 的完整路径: {text}"
+        );
+        assert!(
+            text.contains("请先手工移走该特殊文件再重试"),
+            "说明必须给出下一步动作: {text}"
+        );
+        assert_eq!(
+            fs::read_dir(dir.path()).unwrap().count(),
+            before,
+            "失败不得残留本次暂存对象"
+        );
+        assert!(!base.exists(), "失败不得发布最终名");
+        assert!(
+            fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(PARTIAL_SUFFIX)),
+            "暂存对象必须被清理"
+        );
+
+        // 原目录与 FIFO 保持原样: 内容不变, FIFO 仍是同一个 FIFO.
+        assert_eq!(fs::read_to_string(source.join("file")).unwrap(), "original");
+        let after = fs::symlink_metadata(&fifo).unwrap();
+        assert!(after.file_type().is_fifo(), "FIFO 必须保留");
+        assert_eq!(after.ino(), fifo_inode, "FIFO 不得被替换");
     }
 
     /// 元数据阶段失败: 不发布最终名, 只清理本次暂存, 原对象与既有备份不变.

@@ -11,13 +11,14 @@
 mod support;
 
 use std::fs;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use support::{
-    Run, TempEnv, backups_in, entry_lines, heal_backup_from_output, heal_backups_in, line_for,
-    manifest_of, physical_repo, run, running_as_root, snapshot_all, target_of, token_of, unlock,
+    Run, TempEnv, backups_in, entry_lines, file_identity, heal_backup_from_output, heal_backups_in,
+    line_for, make_fifo, make_socket, manifest_of, physical_repo, run, running_as_root,
+    snapshot_all, target_of, token_of, unlock,
 };
 
 /// 断言每一次条目行的 token 都是 `token`.
@@ -787,4 +788,111 @@ fn concurrent_apply_never_creates_a_link_to_the_wrong_place() {
         let link = env.home().join(target.trim_start_matches("~/"));
         assert_link(&env, &link, source);
     }
+}
+
+// ---------------------------------------------------------------------------
+// 特殊文件目标: conflict, 不备份, 不触碰
+// ---------------------------------------------------------------------------
+
+#[test]
+fn special_file_targets_are_conflict_and_left_untouched() {
+    let env = TempEnv::new();
+    env.write_source("shell/bashrc", "managed\n");
+    env.write_source("shell/zshrc", "managed-zsh\n");
+    env.write_manifest(&manifest_of(&[
+        ("shell/bashrc", "~/.fifo", "replace_and_backup"),
+        ("shell/zshrc", "~/.sock", "-"),
+    ]));
+
+    let fifo = env.home().join(".fifo");
+    make_fifo(&fifo);
+    let sock = env.home().join(".sock");
+    let _listener = make_socket(&sock);
+    let before = (file_identity(&fifo), file_identity(&sock));
+
+    let run = run(&env, &["apply"]);
+    assert_code(&run, 1);
+
+    let fifo_line = line_for(&run.stdout, "~/.fifo");
+    assert_eq!(
+        token_of(fifo_line),
+        "conflict",
+        "replace_and_backup 也必须拒绝特殊文件: {fifo_line}"
+    );
+    assert!(fifo_line.contains("特殊文件: FIFO"), "{fifo_line}");
+    assert!(fifo_line.contains("不会覆盖"), "{fifo_line}");
+
+    let sock_line = line_for(&run.stdout, "~/.sock");
+    assert_eq!(token_of(sock_line), "conflict", "{sock_line}");
+    assert!(sock_line.contains("特殊文件: socket"), "{sock_line}");
+
+    assert!(
+        !run.stdout.contains(".dotlink-backup."),
+        "不得为特殊文件建立备份:\n{}",
+        run.stdout
+    );
+    assert!(
+        !has_backup_file(&snapshot_all(&env)),
+        "执行目录中不得出现备份文件"
+    );
+    assert_eq!(
+        before,
+        (file_identity(&fifo), file_identity(&sock)),
+        "特殊文件必须保持同一个对象"
+    );
+    assert!(fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo());
+    assert!(fs::symlink_metadata(&sock).unwrap().file_type().is_socket());
+}
+
+// ---------------------------------------------------------------------------
+// 目录内特殊文件: 备份整体失败, 说明给出路径与重试提示
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_socket_inside_an_occupied_directory_fails_the_backup_with_a_hint() {
+    let env = TempEnv::new();
+    env.write_source("nvim/init.lua", "managed\n");
+    env.write_manifest(&manifest_of(&[(
+        "nvim",
+        "~/.config/nvim",
+        "replace_and_backup",
+    )]));
+
+    let target = env.home().join(".config/nvim");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("init.lua"), "user content\n").unwrap();
+    let socket = target.join("S.gpg-agent");
+    let _listener = make_socket(&socket);
+    let identities = (file_identity(&target), file_identity(&socket));
+
+    let run = run(&env, &["apply"]);
+    assert_code(&run, 1);
+
+    let line = line_for(&run.stdout, "~/.config/nvim");
+    assert_eq!(token_of(line), "fail", "{line}");
+    assert!(
+        line.contains(&socket.display().to_string()),
+        "fail 行必须给出 socket 的完整路径: {line}"
+    );
+    assert!(
+        line.contains("请先手工移走该特殊文件再重试"),
+        "fail 行必须给出下一步动作: {line}"
+    );
+    assert!(
+        !has_backup_file(&snapshot_all(&env)),
+        "整体失败不得发布部分备份"
+    );
+    assert_eq!(
+        identities,
+        (file_identity(&target), file_identity(&socket)),
+        "目录与 socket 必须保持同一个对象"
+    );
+    assert!(fs::symlink_metadata(&target).unwrap().is_dir());
+    assert!(
+        fs::symlink_metadata(&socket)
+            .unwrap()
+            .file_type()
+            .is_socket()
+    );
+    env.assert_content(&target.join("init.lua"), "user content\n");
 }

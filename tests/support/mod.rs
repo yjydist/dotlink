@@ -248,6 +248,29 @@ pub fn physical_repo(env: &TempEnv) -> PathBuf {
     fs::canonicalize(env.repo()).expect("解析仓库根的物理路径")
 }
 
+/// 在 `path` 上创建一个 FIFO (调用系统 `mkfifo`; macOS 与 Linux 都自带该工具).
+pub fn make_fifo(path: &Path) {
+    let status = std::process::Command::new("mkfifo")
+        .arg(path)
+        .status()
+        .expect("执行 mkfifo");
+    assert!(status.success(), "mkfifo 退出码非零: {status}");
+}
+
+/// 在 `path` 上监听 Unix socket; 返回的监听器必须存活到断言结束.
+pub fn make_socket(path: &Path) -> std::os::unix::net::UnixListener {
+    std::os::unix::net::UnixListener::bind(path).expect("绑定 Unix socket")
+}
+
+/// 对象身份 (设备号 + inode), 用于断言特殊文件没有被替换.
+pub fn file_identity(path: &Path) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = fs::symlink_metadata(path)
+        .unwrap_or_else(|error| panic!("读取 {} 失败: {error}", path.display()));
+    (meta.dev(), meta.ino())
+}
+
 /// 两个路径是否指向同一文件系统对象 (跟随末段符号链接).
 pub fn same_identity(left: &Path, right: &Path) -> bool {
     #[cfg(unix)]

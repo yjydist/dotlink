@@ -13,7 +13,8 @@ use std::path::PathBuf;
 use predicates::str::contains;
 use support::{
     TempEnv, backup_candidate_from_output, backups_in, entry_lines, heal_backup_from_output,
-    heal_backups_in, line_for, manifest_of, physical_repo, run, snapshot_all, target_of, token_of,
+    heal_backups_in, line_for, make_fifo, make_socket, manifest_of, physical_repo, run,
+    snapshot_all, target_of, token_of,
 };
 
 // ---------------------------------------------------------------------------
@@ -559,4 +560,90 @@ fn preview_escapes_control_characters_in_target_and_source() {
         run.stdout
     );
     assert_eq!(run.code, 1, "存在待办与失败; stdout:\n{}", run.stdout);
+}
+
+// ---------------------------------------------------------------------------
+// 特殊文件目标: conflict 且不承诺备份
+// ---------------------------------------------------------------------------
+
+#[test]
+fn special_file_targets_are_conflict_without_a_backup_promise() {
+    let env = TempEnv::new();
+    env.write_source("shell/bashrc", "managed\n");
+    env.write_source("shell/zshrc", "managed-zsh\n");
+    env.write_manifest(&manifest_of(&[
+        ("shell/bashrc", "~/.fifo", "replace_and_backup"),
+        ("shell/zshrc", "~/.sock", "replace_and_backup"),
+    ]));
+
+    let fifo = env.home().join(".fifo");
+    make_fifo(&fifo);
+    let sock = env.home().join(".sock");
+    let _listener = make_socket(&sock);
+    let before = snapshot_all(&env);
+
+    let run = run(&env, &["preview"]);
+    assert_eq!(
+        run.code, 1,
+        "stdout:\n{}\nstderr:\n{}",
+        run.stdout, run.stderr
+    );
+
+    for (target, kind) in [("~/.fifo", "FIFO"), ("~/.sock", "socket")] {
+        let line = line_for(&run.stdout, target);
+        assert_eq!(token_of(line), "conflict", "{line}");
+        assert!(
+            line.contains(&format!("特殊文件: {kind}")),
+            "说明必须给出精确类型: {line}"
+        );
+        assert!(
+            line.contains("不支持备份") && line.contains("不会覆盖"),
+            "说明必须写明特殊文件不会被覆盖: {line}"
+        );
+        assert!(
+            !line.contains("on_conflict"),
+            "特殊文件的结论不得依赖清单策略: {line}"
+        );
+    }
+    assert!(
+        !run.stdout.contains(".dotlink-backup."),
+        "preview 不得为特殊文件预测备份路径:\n{}",
+        run.stdout
+    );
+    assert_eq!(before, snapshot_all(&env), "preview 必须完全只读");
+}
+
+// ---------------------------------------------------------------------------
+// target 含行分隔与 bidi 控制符: 以 \u{...} 显示且仍只占一行
+// ---------------------------------------------------------------------------
+
+#[test]
+fn target_with_line_and_bidi_controls_is_escaped_on_one_line() {
+    let env = TempEnv::new();
+    env.write_source("shared/rc", "x\n");
+    env.write_manifest(
+        "[[entry]]\nsource = \"shared/rc\"\ntarget = \"~/.line\u{2028}bidi\u{202e}x\"\n",
+    );
+
+    let run = run(&env, &["preview"]);
+
+    assert_eq!(
+        run.code, 1,
+        "stdout:\n{}\nstderr:\n{}",
+        run.stdout, run.stderr
+    );
+    assert!(
+        !run.stdout.contains('\u{2028}') && !run.stdout.contains('\u{202e}'),
+        "输出不得含原始行分隔或 bidi 控制符: {:?}",
+        run.stdout
+    );
+    assert!(run.stdout.contains(r"\u{2028}"), "{:?}", run.stdout);
+    assert!(run.stdout.contains(r"\u{202e}"), "{:?}", run.stdout);
+    let lines: Vec<&str> = run.stdout.lines().collect();
+    assert_eq!(lines.len(), 2, "条目与汇总各占一行: {:?}", run.stdout);
+    assert!(
+        lines[1].starts_with("1 个条目:"),
+        "汇总行必须是最后一行: {:?}",
+        run.stdout
+    );
 }

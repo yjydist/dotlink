@@ -10,6 +10,7 @@ use std::io::Read;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use support::TempEnv;
 
@@ -30,12 +31,11 @@ fn misspelled_subcommand_exits_two() {
     let env = TempEnv::new();
     env.write_manifest("[[entry]]\nsource = \"a\"\ntarget = \"b\"\n");
 
-    env.cmd()
-        .arg("statu")
-        .assert()
-        .code(2)
-        .stdout("")
-        .stderr(contains("unrecognized subcommand"));
+    env.cmd().arg("statu").assert().code(2).stdout("").stderr(
+        contains("error:")
+            .and(contains("Usage:"))
+            .and(contains("unrecognized subcommand")),
+    );
 }
 
 #[test]
@@ -50,12 +50,11 @@ fn unknown_option_exits_two() {
         vec!["status", "--repo", "."],
         vec!["apply", "--home", "/tmp"],
     ] {
-        env.cmd()
-            .args(&args)
-            .assert()
-            .code(2)
-            .stdout("")
-            .stderr(contains("unexpected argument"));
+        env.cmd().args(&args).assert().code(2).stdout("").stderr(
+            contains("error:")
+                .and(contains("Usage:"))
+                .and(contains("unexpected argument")),
+        );
     }
 }
 
@@ -89,6 +88,19 @@ fn usage_errors_are_rejected_before_the_manifest_is_read() {
     assert!(
         !stderr.contains("清单"),
         "用法错误必须先于清单读取: {stderr}"
+    );
+
+    // 合法清单同理: `status --json` 的用法说明不读取清单, 标准错误只含 clap 用法.
+    env.write_manifest("[[entry]]\nsource = \"a\"\ntarget = \"b\"\n");
+    let observed = env.cmd().args(["status", "--json"]).assert().code(2);
+    let stderr = String::from_utf8_lossy(&observed.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("unexpected argument") && stderr.contains("Usage:"),
+        "未知选项必须是用法说明: {stderr}"
+    );
+    assert!(
+        !stderr.contains("清单"),
+        "未知选项必须先于清单读取: {stderr}"
     );
 
     // 非法清单同理: 操作性参数在解析清单之前就被拒绝.
@@ -246,9 +258,27 @@ fn assert_help_spells_out_exit_code_semantics(args: &[&str], full: bool) {
         "`{args:?}` 的帮助文本必须含退出码语义说明:\n{text}"
     );
     assert!(
-        text.contains("unrecognized subcommand"),
+        text.contains("error:") && text.contains("Usage:"),
         "`{args:?}` 的帮助文本必须给出退出码 2 两重含义的区分判据:\n{text}"
     );
+    assert!(
+        text.contains("dotlink:"),
+        "`{args:?}` 的帮助文本必须给出单行清单说明的形态:\n{text}"
+    );
+    // 缩进必须保留: `\` 续行会吞掉下一行的前导空白.
+    if full {
+        for needle in ["  if dotlink preview", "    code=$?", "  fi"] {
+            assert!(
+                text.contains(needle),
+                "`{args:?}` 的帮助文本必须保留示例缩进 {needle:?}:\n{text}"
+            );
+        }
+    } else {
+        assert!(
+            text.contains("  0  "),
+            "`{args:?}` 的帮助文本必须保留退出码条目的缩进:\n{text}"
+        );
+    }
     let needles: &[&str] = if full {
         // 子命令帮助还必须给出按退出码分支的可复制示例 (`case` + `dotlink apply`),
         // 这是"仅凭命令行输出即可判断下一步"的实质部分.

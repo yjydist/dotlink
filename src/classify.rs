@@ -18,6 +18,8 @@ pub enum Current {
     ForeignLink,
     ForeignFile,
     ForeignDir,
+    /// 目标被特殊文件占用: 既非普通文件, 非目录, 也非符号链接.
+    ForeignOther,
     Unreadable,
 }
 
@@ -81,11 +83,19 @@ fn classify_entry(entry: &Entry, repo_root: &Path) -> EntryState {
         .filter(|error| error.kind() != ErrorKind::NotFound);
     if source_error.is_some() || target_error.is_some() {
         let detail = match (source_error, target_error) {
-            (Some(source), Some(target)) => {
-                format!("源侧与目标侧读取失败: 源侧 {source}; 目标侧 {target}")
-            }
-            (Some(source), None) => format!("源侧读取失败: {source}"),
-            (None, Some(target)) => format!("目标侧读取失败: {target}"),
+            (Some(source), Some(target)) => format!(
+                "源侧与目标侧读取失败: 源侧路径 {}: {source}; 目标侧路径 {}: {target}",
+                entry.source_path.display(),
+                entry.target_path.display()
+            ),
+            (Some(source), None) => format!(
+                "源侧读取失败: 路径 {}: {source}",
+                entry.source_path.display()
+            ),
+            (None, Some(target)) => format!(
+                "目标侧读取失败: 路径 {}: {target}",
+                entry.target_path.display()
+            ),
             (None, None) => unreachable!("至少一侧硬失败才会进入本分支"),
         };
         return EntryState {
@@ -118,17 +128,14 @@ fn classify_entry(entry: &Entry, repo_root: &Path) -> EntryState {
 
     let kind = target_meta.file_type();
     if !kind.is_symlink() {
-        let occupied = if kind.is_dir() {
-            Current::ForeignDir
+        let (occupied, occupied_note) = if kind.is_dir() {
+            (Current::ForeignDir, "目标被目录占用".to_string())
+        } else if kind.is_file() {
+            (Current::ForeignFile, "目标被普通文件占用".to_string())
         } else {
-            Current::ForeignFile
+            (Current::ForeignOther, special_file_label(&kind).to_string())
         };
-        let occupied_note = if kind.is_dir() {
-            "目标被目录占用"
-        } else {
-            "目标被普通文件占用"
-        };
-        return new_state(occupied, occupied_note.to_string(), entry.on_conflict);
+        return new_state(occupied, occupied_note, entry.on_conflict);
     }
 
     // 求值语义 4: 两次 lstat 均成功, 从第 3 行起自上而下取首个命中者.
@@ -139,7 +146,10 @@ fn classify_entry(entry: &Entry, repo_root: &Path) -> EntryState {
             return EntryState {
                 current: Current::Unreadable,
                 action: Action::ReportUnreadable,
-                detail: format!("目标侧读取链接失败: {error}"),
+                detail: format!(
+                    "目标侧读取链接失败: 路径 {}: {error}",
+                    entry.target_path.display()
+                ),
             };
         }
     };
@@ -175,6 +185,31 @@ fn lstat(path: &Path) -> std::io::Result<Metadata> {
     std::fs::symlink_metadata(path)
 }
 
+/// 特殊文件的精确类型标签, 供报告说明使用.
+///
+/// 非 Unix 目标保留可编译的降级分支; 运行时由平台门禁拒绝, 不会走到这里.
+#[cfg(unix)]
+fn special_file_label(kind: &std::fs::FileType) -> &'static str {
+    use std::os::unix::fs::FileTypeExt;
+
+    if kind.is_fifo() {
+        "FIFO"
+    } else if kind.is_socket() {
+        "socket"
+    } else if kind.is_char_device() {
+        "字符设备"
+    } else if kind.is_block_device() {
+        "块设备"
+    } else {
+        "其他特殊文件"
+    }
+}
+
+#[cfg(not(unix))]
+fn special_file_label(_kind: &std::fs::FileType) -> &'static str {
+    "类型未知"
+}
+
 /// 组装判定结果. `detail` 是自由文本, 但必须携带 `openspec/specs/cli-contract/spec.md`
 /// 的"必现信息" (失败原因 / 实际指向 / 占用物类型).
 fn new_state(current: Current, detail: String, on_conflict: OnConflict) -> EntryState {
@@ -203,6 +238,9 @@ fn action_for(current: Current, on_conflict: OnConflict) -> Action {
             OnConflict::Skip => Action::RefuseConflict,
             OnConflict::ReplaceAndBackup => Action::ReplaceAndBackup,
         },
+        // 特殊文件无法复制, 不存在"先完整备份再替换"的合法路径, 因此不读取
+        // `on_conflict` (`openspec/specs/entry-classification/spec.md` 的动作映射).
+        Current::ForeignOther => Action::RefuseConflict,
     }
 }
 
@@ -298,12 +336,26 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("设置权限位");
     }
 
+    /// 用系统 `mkfifo` 创建 FIFO; macOS 与 Linux 都自带该工具.
+    fn make_fifo(path: &Path) {
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("执行 mkfifo");
+        assert!(status.success(), "mkfifo 退出码非零: {status}");
+    }
+
+    /// 在 `path` 上监听 Unix socket; 返回的监听器必须存活到断言结束.
+    fn make_socket(path: &Path) -> std::os::unix::net::UnixListener {
+        std::os::unix::net::UnixListener::bind(path).expect("绑定 Unix socket")
+    }
+
     /// 以 root 运行时权限位不生效, 依赖 `EACCES` 的断言必须跳过.
     fn permissions_are_ignored(dir: &Path) -> bool {
         fs::read_dir(dir).is_ok()
     }
 
-    // --- 八种 Current 取值 ---
+    // --- 九种 Current 取值 ---
 
     #[test]
     fn source_missing_wins_over_an_occupied_target() {
@@ -444,6 +496,29 @@ mod tests {
         let state = f.state("shell/bashrc", &target, OnConflict::ReplaceAndBackup);
         assert_eq!(state.current, Current::ForeignDir);
         assert_eq!(state.action, Action::ReplaceAndBackup);
+    }
+
+    /// FIFO 与 socket 是 `ForeignOther`, 说明给出精确类型, 且两种策略都拒绝替换.
+    #[test]
+    fn fifo_and_socket_targets_are_foreign_other() {
+        let f = Fixture::new();
+        f.write_source("shell/bashrc", "hello");
+
+        let fifo = f.home_path("shape_fifo");
+        make_fifo(&fifo);
+        for on_conflict in [OnConflict::Skip, OnConflict::ReplaceAndBackup] {
+            let state = f.state("shell/bashrc", &fifo, on_conflict);
+            assert_eq!(state.current, Current::ForeignOther, "{on_conflict:?}");
+            assert_eq!(state.action, Action::RefuseConflict, "{on_conflict:?}");
+            assert_eq!(state.detail, "FIFO", "{on_conflict:?}");
+        }
+
+        let socket = f.home_path("shape_socket");
+        let _listener = make_socket(&socket);
+        let state = f.state("shell/bashrc", &socket, OnConflict::ReplaceAndBackup);
+        assert_eq!(state.current, Current::ForeignOther);
+        assert_eq!(state.action, Action::RefuseConflict);
+        assert_eq!(state.detail, "socket");
     }
 
     #[test]
@@ -683,6 +758,16 @@ mod tests {
                 OnConflict::ReplaceAndBackup,
                 Action::ReplaceAndBackup,
             ),
+            (
+                Current::ForeignOther,
+                OnConflict::Skip,
+                Action::RefuseConflict,
+            ),
+            (
+                Current::ForeignOther,
+                OnConflict::ReplaceAndBackup,
+                Action::RefuseConflict,
+            ),
         ];
 
         for (current, on_conflict, expected) in cases {
@@ -717,7 +802,7 @@ mod tests {
     // 的 R2, 以及 `openspec/specs/link-deployment/spec.md` 与
     // `openspec/specs/link-teardown/spec.md` 中描述迁移的 Scenario):
     //
-    //   1. 互斥且穷尽   -- 8 种 `Current` 恰好命中一种; `Current` x `on_conflict`
+    //   1. 互斥且穷尽   -- 9 种 `Current` 恰好命中一种; `Current` x `on_conflict`
     //                      的每一种组合都落在动作映射表内;
     //   2. 判定顺序     -- 先判目标侧就会退化的两个反例 (相对逐格用例的正面断言,
     //                      这里补的是"目标侧为**符号链接**"的那一格, 以及
@@ -729,8 +814,8 @@ mod tests {
 
     // --- 互斥且穷尽 ---
 
-    /// 八种取值, 供穷尽性断言使用.
-    const ALL_CURRENTS: [Current; 8] = [
+    /// 九种取值, 供穷尽性断言使用.
+    const ALL_CURRENTS: [Current; 9] = [
         Current::SourceMissing,
         Current::Absent,
         Current::LinkedCorrect,
@@ -738,6 +823,7 @@ mod tests {
         Current::ForeignLink,
         Current::ForeignFile,
         Current::ForeignDir,
+        Current::ForeignOther,
         Current::Unreadable,
     ];
 
@@ -815,20 +901,20 @@ mod tests {
         );
     }
 
-    /// 八种 `Current` **恰好命中一种** (互斥且穷尽), 且以独立场景逐一取到.
+    /// 九种 `Current` **恰好命中一种** (互斥且穷尽), 且以独立场景逐一取到.
     ///
-    /// 八个场景的 `Current` 期望值在此逐条锁定, 且每次都**无条件**压入 `seen`:
-    /// 因此末尾的 `seen.len() == 8` 同时证明了覆盖与去重 -- 任何让两个场景塌缩到
-    /// 同一取值的实现 (例如 `Unreadable` 吸收 `NotFound`, 或两条归属分支合并) 都会
-    /// 使长度小于 8.
+    /// 九个场景的 `Current` 期望值在此逐条锁定, 且每次都**无条件**压入 `seen`:
+    /// 因此末尾的 `seen.len() == 9` 同时证明了覆盖与去重 -- 任何让两个场景塌缩到
+    /// 同一取值的实现 (例如 `Unreadable` 吸收 `NotFound`, 两条归属分支合并, 或把
+    /// 特殊文件并入 `ForeignFile`) 都会使长度小于 9.
     ///
     /// `Unreadable` 用**不依赖权限位**的方式构造: 目标路径穿过一个普通文件
     /// (`<home>/occupier/rc`), `lstat` 因此返回 `NotADirectory` -- 它是 `NotFound`
     /// **之外**的错误, 因此在 root 下也确定生效. 这与逐格用例用 chmod `000` 构造的
     /// `EACCES` 是不同的触发路径, 且断言不再需要"权限位生效"这一前提.
     #[test]
-    fn the_eight_current_values_are_pairwise_distinct() {
-        assert_eq!(ALL_CURRENTS.len(), 8, "3.1 的取值集合不得增删");
+    fn the_nine_current_values_are_pairwise_distinct() {
+        assert_eq!(ALL_CURRENTS.len(), 9, "3.1 的取值集合不得增删");
 
         let f = Fixture::new();
         let source = f.write_source("shell/bashrc", "hello");
@@ -849,9 +935,11 @@ mod tests {
         fs::write(&plain, "user own content").expect("写入占用物");
         let directory = f.home_path("shape_dir");
         fs::create_dir_all(&directory).expect("创建占用目录");
+        let special = f.home_path("shape_special");
+        make_fifo(&special);
 
         // 场景按 (source 相对路径, 目标路径, 期望 Current) 列举, 一次一个取值.
-        let cases: [(&str, PathBuf, Current); 8] = [
+        let cases: [(&str, PathBuf, Current); 9] = [
             (
                 "gone/rc",
                 f.home_path("shape_missing_source"),
@@ -863,6 +951,7 @@ mod tests {
             ("shell/bashrc", foreign, Current::ForeignLink),
             ("shell/bashrc", plain, Current::ForeignFile),
             ("shell/bashrc", directory, Current::ForeignDir),
+            ("shell/bashrc", special, Current::ForeignOther),
             (
                 "shell/bashrc",
                 os::normalize(&occupier.join("rc")),
@@ -892,7 +981,7 @@ mod tests {
         assert_eq!(
             seen.len(),
             ALL_CURRENTS.len(),
-            "八个场景必须恰好命中八个互不相同的取值: {seen:?}"
+            "九个场景必须恰好命中九个互不相同的取值: {seen:?}"
         );
     }
 
@@ -907,10 +996,12 @@ mod tests {
     ///   必须给出**同一个**动作, 且该动作不得是冲突类的两个之一;
     /// - `LinkedWrong` 同样与 `on_conflict` 无关 (本工具的错误链接), 固定为
     ///   `ReplaceAndBackup`;
+    /// - `ForeignOther` 与 `on_conflict` 无关, 两种策略都固定 `RefuseConflict`
+    ///   (特殊文件无法备份);
     /// - 其余三种外部占用: 两个 `on_conflict` 必须给出**恰好一对**冲突动作.
     #[test]
     fn every_current_lands_inside_the_action_table() {
-        assert_eq!(ALL_CURRENTS.len(), 8, "3.2 表的左侧必须恰有 8 种 Current");
+        assert_eq!(ALL_CURRENTS.len(), 9, "3.2 表的左侧必须恰有 9 种 Current");
 
         for current in ALL_CURRENTS {
             let skip = action_for(current, OnConflict::Skip);
@@ -941,6 +1032,18 @@ mod tests {
                         replace,
                         Action::ReplaceAndBackup,
                         "3.2 表: {current:?} + replace_and_backup 必须是 ReplaceAndBackup"
+                    );
+                }
+                Current::ForeignOther => {
+                    assert_eq!(
+                        skip,
+                        Action::RefuseConflict,
+                        "3.2 表: {current:?} + skip 必须是 RefuseConflict"
+                    );
+                    assert_eq!(
+                        replace,
+                        Action::RefuseConflict,
+                        "3.2 表: {current:?} + replace_and_backup 必须是 RefuseConflict"
                     );
                 }
                 Current::ForeignLink | Current::ForeignFile | Current::ForeignDir => {
@@ -988,7 +1091,7 @@ mod tests {
         assert_eq!(
             reachable.len(),
             6,
-            "8 种 Current x 2 种 on_conflict 只能导出 3.2 表的六种动作: {reachable:?}"
+            "9 种 Current x 2 种 on_conflict 只能导出 3.2 表的六种动作: {reachable:?}"
         );
     }
 

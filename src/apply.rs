@@ -24,7 +24,11 @@ pub(crate) fn backup_kind_for(current: Current) -> BackupKind {
     match current {
         Current::LinkedWrong => BackupKind::SelfHeal,
         Current::ForeignLink | Current::ForeignFile | Current::ForeignDir => BackupKind::User,
-        Current::SourceMissing | Current::Absent | Current::LinkedCorrect | Current::Unreadable => {
+        Current::ForeignOther
+        | Current::SourceMissing
+        | Current::Absent
+        | Current::LinkedCorrect
+        | Current::Unreadable => {
             unreachable!("{current:?} 不会请求替换备份")
         }
     }

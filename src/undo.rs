@@ -51,7 +51,10 @@ pub fn undo_entry(
         },
         // 非本工具创建的内容: 绝不删除
         // (`openspec/specs/link-teardown/spec.md` 的"只移除本工具创建的链接").
-        Current::ForeignLink | Current::ForeignFile | Current::ForeignDir => Ok(()),
+        Current::ForeignLink
+        | Current::ForeignFile
+        | Current::ForeignDir
+        | Current::ForeignOther => Ok(()),
         // 该路径本就没有本工具创建的链接 (含撤销后目标为空的第二次运行).
         Current::Absent => Ok(()),
         // 源缺失是终态; `Unreadable` 是环境故障. 二者都无文件系统改动.

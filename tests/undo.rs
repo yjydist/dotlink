@@ -13,8 +13,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use support::{
-    TempEnv, assert_token, backup_path_from_output, backups_in, heal_backup_from_output,
-    heal_backups_in, line_for, manifest_of, physical_repo, run, running_as_root, token_of, unlock,
+    TempEnv, assert_token, backup_path_from_output, backups_in, file_identity,
+    heal_backup_from_output, heal_backups_in, line_for, make_fifo, make_socket, manifest_of,
+    physical_repo, run, running_as_root, snapshot_all, token_of, unlock,
 };
 
 /// 已部署的环境: 源在仓库中, 目标是指向源的链接.
@@ -1066,4 +1067,48 @@ fn undo_escapes_control_characters_in_the_restored_backup_path() {
         "恢复说明必须显示转义后的备份路径: {line}"
     );
     env.assert_content(&target, "original\n");
+}
+
+// ---------------------------------------------------------------------------
+// 特殊文件目标: skip, 不触碰
+// ---------------------------------------------------------------------------
+
+#[test]
+fn undo_skips_special_file_targets() {
+    let env = TempEnv::new();
+    env.write_source("shell/bashrc", "managed\n");
+    env.write_source("shell/zshrc", "managed-zsh\n");
+    env.write_manifest(&manifest_of(&[
+        ("shell/bashrc", "~/.fifo", "replace_and_backup"),
+        ("shell/zshrc", "~/.sock", "-"),
+    ]));
+
+    let fifo = env.home().join(".fifo");
+    make_fifo(&fifo);
+    let sock = env.home().join(".sock");
+    let _listener = make_socket(&sock);
+    let before = snapshot_all(&env);
+    let identities = (file_identity(&fifo), file_identity(&sock));
+
+    let run = run(&env, &["undo"]);
+    assert_eq!(
+        run.code, 1,
+        "skip 属于未处理; stdout:\n{}\nstderr:\n{}",
+        run.stdout, run.stderr
+    );
+
+    let fifo_line = line_for(&run.stdout, "~/.fifo");
+    assert_eq!(token_of(fifo_line), "skip", "{fifo_line}");
+    assert!(fifo_line.contains("特殊文件: FIFO"), "{fifo_line}");
+    let sock_line = line_for(&run.stdout, "~/.sock");
+    assert_eq!(token_of(sock_line), "skip", "{sock_line}");
+    assert!(sock_line.contains("特殊文件: socket"), "{sock_line}");
+
+    assert_eq!(before, snapshot_all(&env), "undo 不得触碰特殊文件");
+    assert_eq!(
+        identities,
+        (file_identity(&fifo), file_identity(&sock)),
+        "特殊文件必须保持同一个对象"
+    );
+    assert!(!run.stdout.contains(".dotlink-backup."), "{}", run.stdout);
 }

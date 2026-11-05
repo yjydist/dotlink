@@ -11,8 +11,9 @@ use std::fs;
 use std::path::Path;
 
 use support::{
-    TempEnv, assert_token, backup_path_from_output, backups_in, heal_backup_from_output,
-    heal_backups_in, line_for, manifest_of, run, running_as_root, token_of, unlock,
+    TempEnv, assert_token, backup_path_from_output, backups_in, file_identity,
+    heal_backup_from_output, heal_backups_in, line_for, make_socket, manifest_of, run,
+    running_as_root, snapshot_all, token_of, unlock,
 };
 
 // ---------------------------------------------------------------------------
@@ -554,4 +555,61 @@ fn a_failed_replacement_reports_the_backup_path_and_stages_the_original() {
         target.display()
     );
     env.assert_content(&staged.join("locked/secret"), "secret\n");
+}
+
+// ---------------------------------------------------------------------------
+// 目录内特殊文件: preview 不递归预检, apply 安全失败
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_directory_containing_a_socket_is_not_prechecked_by_preview_but_fails_apply() {
+    let env = TempEnv::new();
+    env.write_source("nvim/init.lua", "managed\n");
+    env.write_manifest(&manifest_of(&[(
+        "nvim",
+        "~/.config/nvim",
+        "replace_and_backup",
+    )]));
+
+    let target = env.home().join(".config/nvim");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("init.lua"), "user content\n").unwrap();
+    let socket = target.join("S.gpg-agent");
+    let _listener = make_socket(&socket);
+    let before = snapshot_all(&env);
+    let identities = (file_identity(&target), file_identity(&socket));
+
+    // preview 只对目标做一次 lstat, 不遍历目录内容: 仍预测 replace 与备份路径.
+    let preview = run(&env, &["preview"]);
+    assert_eq!(preview.code, 1, "{}", preview.stdout);
+    let line = line_for(&preview.stdout, "~/.config/nvim");
+    assert_eq!(token_of(line), "replace", "{line}");
+    assert!(
+        line.contains(".dotlink-backup."),
+        "preview 仍预测备份路径: {line}"
+    );
+    assert_eq!(before, snapshot_all(&env), "preview 必须完全只读");
+
+    let apply = run(&env, &["apply"]);
+    assert_eq!(apply.code, 1, "{}", apply.stdout);
+    let line = line_for(&apply.stdout, "~/.config/nvim");
+    assert_eq!(token_of(line), "fail", "{line}");
+    assert!(
+        line.contains(&socket.display().to_string()),
+        "fail 行必须给出 socket 的完整路径: {line}"
+    );
+    assert!(
+        line.contains("请先手工移走该特殊文件再重试"),
+        "fail 行必须给出下一步动作: {line}"
+    );
+    assert_eq!(
+        before,
+        snapshot_all(&env),
+        "整体失败不得发布备份, 目录与 socket 必须保持原样"
+    );
+    assert_eq!(
+        identities,
+        (file_identity(&target), file_identity(&socket)),
+        "目录与 socket 必须保持同一个对象"
+    );
 }

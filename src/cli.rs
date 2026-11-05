@@ -1,10 +1,9 @@
 //! 命令行接口: 四个子命令, 无参数, 仅 `-h/--help` 与 `-V/--version`.
 //!
 //! 帮助文本必须自带退出码语义 (见 `openspec/specs/cli-contract/spec.md` 的"`--help`
-//! 文本自带退出码语义"): `clap` 只生成命令与参数, 若不在 `about` / `long_about` 里
-//! 写明 "只读命令在有待办时也退 1" 与 "退出码 2 的两重含义",
-//! 用户就无法仅凭命令行输出决定下一步. `about` 供 `-h`, `long_about` 供
-//! `--help`, 二者都写, 因为两处短帮助是最容易先被看到的地方.
+//! 文本自带退出码语义"): `clap` 只生成命令与参数, 若不在 `long_about` 里写明退出码
+//! 语义, 用户就无法仅凭 `--help` 决定下一步. `about` 只供 `-h` 显示短描述;
+//! 退出码语义只承诺在 `--help` (规格也只要求 `--help`), 不在 `-h` 中重复.
 
 use clap::{Parser, Subcommand};
 
@@ -22,21 +21,23 @@ pub enum Command {
 /// 退出码语义是**同一套**, 若为每条命令各写一份措辞就会出现第二个来源.
 macro_rules! long_about {
     ($head:literal) => {
+        // 每行独立成字面量: 用 `\` 续行会剥掉下一行的前导空白, 使示例失去缩进.
         concat!(
             $head,
-            "\n\
-\n\
-退出 1 可能表示有待办, 也可能包含跳过或失败. set -e 脚本应保留输出并按退出码分支\n\
-(见 README); undo 会直接执行撤销, 不要为了检查结果而重复调用:\n\
-\n\
-  if dotlink preview; then echo '无需部署'; else\n\
-    code=$?; case \"$code\" in 1) dotlink apply ;; *) exit \"$code\" ;; esac\n\
-  fi\n\
-\n\
-退出码 0 当且仅当本命令的目标已达成**且**没有遗留待办; 有待办时 (含只读命令) 退 1.\n\
-退出码 2 有两重含义: '清单校验失败' 或 '子命令缺失/拼错', 前者报 'dotlink: 无法\n\
-读取清单 ./dotlink.toml: ...' 之类的单行说明, 后者是 clap 的用法说明 (含\n\
-'unrecognized subcommand'), 二者靠标准错误的内容区分. 退出码 3 表示平台不受支持."
+            "\n",
+            "\n",
+            "退出 1 可能表示有待办, 也可能包含跳过或失败. set -e 脚本应保留输出并按退出码分支\n",
+            "(见 README); undo 会直接执行撤销, 不要为了检查结果而重复调用:\n",
+            "\n",
+            "  if dotlink preview; then echo '无需部署'; else\n",
+            "    code=$?; case \"$code\" in 1) dotlink apply ;; *) exit \"$code\" ;; esac\n",
+            "  fi\n",
+            "\n",
+            "退出码 0 当且仅当本命令的目标已达成**且**没有遗留待办; 有待办时 (含只读命令) 退 1.\n",
+            "退出码 2 有两重含义: '清单校验失败' 或 '调用方式错误 (子命令缺失, 拼错或未知选项)',\n",
+            "前者报单行的 'dotlink: ...' 说明, 后者是同时含 'error:' 与 'Usage:' 的 clap 用法说明\n",
+            "(具体错误短语可以是 'unrecognized subcommand' 或 'unexpected argument'),\n",
+            "二者靠标准错误的内容区分. 退出码 3 表示平台不受支持."
         )
     };
 }
@@ -46,19 +47,22 @@ macro_rules! long_about {
     name = "dotlink",
     version,
     about = "声明式 dotfile 软链接管理",
-    long_about = "声明式 dotfile 软链接管理\n\
-\n\
-命令必须在存放 dotlink.toml 的那个目录中运行; 不向上搜索父目录.\n\
-\n\
-退出码 (四条命令共用):\n\
-  0  该命令的目标已完全达成, 且无遗留待办\n\
-  1  存在未达成目标的条目, 或有被跳过/被拒绝/失败/源缺失的条目\n\
-  2  清单校验失败, 或调用方式错误 (子命令缺失或拼错), 二者均未做任何改动\n\
-  3  平台不受支持 (仅支持 macOS 与 Linux)\n\
-\n\
-退出码 2 的两重含义靠标准错误的内容区分: 清单校验失败报 'dotlink: 无法读取\n\
-清单 ./dotlink.toml: ...' 之类的单行说明; 调用方式错误由 clap 给出用法说明\n\
-(含 'unrecognized subcommand'). 各子命令的 --help 有同样的说明.",
+    long_about = concat!(
+        "声明式 dotfile 软链接管理\n",
+        "\n",
+        "命令必须在存放 dotlink.toml 的那个目录中运行; 不向上搜索父目录.\n",
+        "\n",
+        "退出码 (四条命令共用):\n",
+        "  0  该命令的目标已完全达成, 且无遗留待办\n",
+        "  1  存在未达成目标的条目, 或有被跳过/被拒绝/失败/源缺失的条目\n",
+        "  2  清单校验失败, 或调用方式错误 (子命令缺失, 拼错或未知选项), 二者均未做任何改动\n",
+        "  3  平台不受支持 (仅支持 macOS 与 Linux)\n",
+        "\n",
+        "退出码 2 的两重含义靠标准错误的内容区分: 清单校验失败报单行的 'dotlink: ...'\n",
+        "说明; 调用方式错误由 clap 给出同时含 'error:' 与 'Usage:' 的用法说明\n",
+        "(具体错误短语可以是 'unrecognized subcommand' 或 'unexpected argument').\n",
+        "各子命令的 --help 有同样的说明.",
+    ),
     disable_help_subcommand = true
 )]
 struct Cli {
