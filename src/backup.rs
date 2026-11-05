@@ -36,6 +36,12 @@ const PARTIAL_SUFFIX: &str = ".partial";
 /// 恢复过程中使用的临时名后缀: 目录恢复写到临时名再改名, 避免半成品.
 const RESTORE_SUFFIX: &str = ".dotlink-restore.partial";
 
+/// 暂存根名被占用时最多尝试的候选名数量.
+///
+/// 只有暂存根的排他创建失败才消耗一次尝试; 正常路径第一次即成功. 上限防止外部进程
+/// 持续占用名字时无界循环, 同时保留"换一个序号重试"的既有行为.
+const MAX_STAGING_ATTEMPTS: u64 = 16;
+
 #[derive(Default)]
 pub(crate) struct BackupFinder {
     directories: HashMap<PathBuf, Result<DirectoryBackups>>,
@@ -235,31 +241,74 @@ pub(crate) fn restore_backup(
     })
 }
 
-fn copy_to_staging(source: &Path, base: &Path, suffix: &str) -> Result<PathBuf> {
-    for serial in 1_u64.. {
-        let suffix = if serial == 1 {
-            unique_staging_suffix(suffix)
+/// 取得暂存根名失败的两类原因.
+///
+/// 只有 [`Self::StagingNameTaken`] 可以换名重试: 它只由本次调用**排他创建自己的
+/// 目标根名**时产生. 一旦暂存根已取得, 填充期间的任何错误 (包括子项创建时的
+/// `AlreadyExists`) 都是 [`Self::Fatal`], 必须直接成为条目失败.
+#[derive(Debug)]
+enum CopyFailure {
+    StagingNameTaken,
+    Fatal(io::Error),
+}
+
+impl CopyFailure {
+    /// 把根创建错误归类: 仅 `AlreadyExists` 表示暂存根名已被占用.
+    fn from_root_create(context: &str, dest: &Path, error: io::Error) -> Self {
+        if error.kind() == io::ErrorKind::AlreadyExists {
+            Self::StagingNameTaken
         } else {
-            format!(".{}.{serial}{suffix}", std::process::id())
-        };
-        let partial = with_suffix(base, &suffix);
-        match copy_object(source, &partial) {
-            Ok(()) => return Ok(partial),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(Error::EntryFailed(error.to_string())),
+            Self::Fatal(copy_error(context, dest, error))
         }
     }
-    unreachable!("序号消歧必然终止")
+
+    fn fatal(error: io::Error) -> Self {
+        Self::Fatal(error)
+    }
+}
+
+fn copy_to_staging(source: &Path, base: &Path, suffix: &str) -> Result<PathBuf> {
+    let mut last = PathBuf::new();
+    for serial in 1..=MAX_STAGING_ATTEMPTS {
+        let partial = staging_candidate(base, serial, suffix);
+        match copy_object(source, &partial) {
+            Ok(()) => return Ok(partial),
+            Err(CopyFailure::StagingNameTaken) => last = partial,
+            Err(CopyFailure::Fatal(error)) => {
+                return Err(Error::EntryFailed(error.to_string()));
+            }
+        }
+    }
+    Err(Error::EntryFailed(format!(
+        "暂存名 {} 连续 {MAX_STAGING_ATTEMPTS} 次尝试均被占用, 已尝试 {MAX_STAGING_ATTEMPTS} 次",
+        last.display()
+    )))
+}
+
+/// 第 `serial` 个暂存候选名: 首次带进程号, 之后在 `.partial` 前追加序号.
+fn staging_candidate(base: &Path, serial: u64, suffix: &str) -> PathBuf {
+    let suffix = if serial == 1 {
+        unique_staging_suffix(suffix)
+    } else {
+        format!(".{}.{serial}{suffix}", std::process::id())
+    };
+    with_suffix(base, &suffix)
 }
 
 /// 排他创建副本. 只有取得目的地所有权之后的失败才允许清理它.
-fn copy_object(source: &Path, dest: &Path) -> io::Result<()> {
-    let metadata =
-        fs::symlink_metadata(source).map_err(|error| copy_error("读取", source, error))?;
+///
+/// 返回值区分根名冲突与其余失败: 仅当**本函数自己创建目标根名**时收到
+/// `AlreadyExists` 才是 [`CopyFailure::StagingNameTaken`]; 子项递归通过
+/// [`copy_child`] 把同类失败包装成带子项路径的致命错误, 避免整树复制被误重试.
+fn copy_object(source: &Path, dest: &Path) -> std::result::Result<(), CopyFailure> {
+    let metadata = fs::symlink_metadata(source)
+        .map_err(|error| CopyFailure::Fatal(copy_error("读取", source, error)))?;
     let file_type = metadata.file_type();
     if file_type.is_symlink() {
-        let raw = os::read_link(source).map_err(|error| copy_error("读取链接", source, error))?;
-        return os::create_symlink(&raw, dest).map_err(|error| copy_error("备份链接", dest, error));
+        let raw = os::read_link(source)
+            .map_err(|error| CopyFailure::Fatal(copy_error("读取链接", source, error)))?;
+        return os::create_symlink(&raw, dest)
+            .map_err(|error| CopyFailure::from_root_create("备份链接", dest, error));
     }
 
     if file_type.is_dir() {
@@ -272,31 +321,33 @@ fn copy_object(source: &Path, dest: &Path) -> io::Result<()> {
         }
         builder
             .create(dest)
-            .map_err(|error| copy_error("创建备份目录", dest, error))?;
+            .map_err(|error| CopyFailure::from_root_create("创建备份目录", dest, error))?;
         let copied = (|| {
-            for entry in
-                fs::read_dir(source).map_err(|error| copy_error("读取目录", source, error))?
+            for entry in fs::read_dir(source)
+                .map_err(|error| CopyFailure::Fatal(copy_error("读取目录", source, error)))?
             {
-                let entry = entry.map_err(|error| copy_error("读取目录项", source, error))?;
-                copy_object(&entry.path(), &dest.join(entry.file_name()))?;
+                let entry = entry
+                    .map_err(|error| CopyFailure::Fatal(copy_error("读取目录项", source, error)))?;
+                copy_child(&entry.path(), &dest.join(entry.file_name()))?;
             }
             // 子项复制完成后再应用元数据: 创建子项会改变目录 mtime, 只读权限也会
             // 阻止后续子项写入.
-            apply_metadata(source, dest, &metadata)?;
+            apply_metadata(source, dest, &metadata).map_err(CopyFailure::fatal)?;
             // 全部子项与目录自身都同步完成后, 复制产物才算落盘 (设计 D4).
             skip_unsupported(os::sync_dir(dest))
-                .map_err(|error| copy_error("同步备份目录", dest, error))
+                .map_err(|error| CopyFailure::Fatal(copy_error("同步备份目录", dest, error)))
         })();
         return finish_copy(dest, copied);
     }
 
     if !file_type.is_file() {
-        return Err(io::Error::new(
+        return Err(CopyFailure::Fatal(io::Error::new(
             io::ErrorKind::Unsupported,
             format!("无法复制特殊文件 {}", source.display()),
-        ));
+        )));
     }
-    let mut input = fs::File::open(source).map_err(|error| copy_error("读取", source, error))?;
+    let mut input = fs::File::open(source)
+        .map_err(|error| CopyFailure::Fatal(copy_error("读取", source, error)))?;
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -306,16 +357,44 @@ fn copy_object(source: &Path, dest: &Path) -> io::Result<()> {
     }
     let mut output = options
         .open(dest)
-        .map_err(|error| copy_error("创建备份文件", dest, error))?;
+        .map_err(|error| CopyFailure::from_root_create("创建备份文件", dest, error))?;
     let copied = io::copy(&mut input, &mut output)
-        .map_err(|error| copy_error("复制", source, error))
-        .and_then(|_| apply_metadata(source, dest, &metadata))
+        .map_err(|error| CopyFailure::Fatal(copy_error("复制", source, error)))
+        .and_then(|_| apply_metadata(source, dest, &metadata).map_err(CopyFailure::fatal))
         .and_then(|()| {
             // 数据与元数据在 rename 到最终名前同步到稳定存储 (设计 D4).
             skip_unsupported(os::sync_file(&output))
-                .map_err(|error| copy_error("同步备份文件", dest, error))
+                .map_err(|error| CopyFailure::Fatal(copy_error("同步备份文件", dest, error)))
         });
     finish_copy(dest, copied)
+}
+
+/// 递归复制一个子项.
+///
+/// 子项的"目标名已被占用"不再具有重试意义: 暂存根已经取得, 换名只会从头复制整棵
+/// 树并再次撞上同一个冲突. 因此把 [`CopyFailure::StagingNameTaken`] 包装成带子项
+/// 路径的致命错误 (openspec/specs/backup-lifecycle/spec.md 的"嵌套复制冲突不换名重试").
+fn copy_child(source: &Path, dest: &Path) -> std::result::Result<(), CopyFailure> {
+    #[cfg(test)]
+    let copied = if take_nested_copy_failure() {
+        Err(CopyFailure::StagingNameTaken)
+    } else {
+        copy_object(source, dest)
+    };
+    #[cfg(not(test))]
+    let copied = copy_object(source, dest);
+
+    copied.map_err(|failure| match failure {
+        CopyFailure::StagingNameTaken => nested_conflict(dest),
+        fatal => fatal,
+    })
+}
+
+fn nested_conflict(dest: &Path) -> CopyFailure {
+    CopyFailure::Fatal(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("创建备份对象 {} 失败: 目标名已被占用", dest.display()),
+    ))
 }
 
 /// 给普通文件或目录应用保真元数据, 顺序固定为**扩展属性 -> 权限位 -> mtime**.
@@ -325,6 +404,10 @@ fn copy_object(source: &Path, dest: &Path) -> io::Result<()> {
 /// 覆盖前面所有写入 (目录还包括子项创建). 平台不支持某类元数据时返回 `Unsupported`,
 /// 视为该平台的降级, 不使备份失败.
 fn apply_metadata(source: &Path, dest: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+    #[cfg(test)]
+    if take_metadata_failure() {
+        return Err(io::Error::other("模拟应用备份元数据失败"));
+    }
     skip_unsupported(os::copy_xattrs(source, dest))
         .map_err(|error| copy_error("设置备份扩展属性", dest, error))?;
     fs::set_permissions(dest, metadata.permissions())
@@ -341,7 +424,10 @@ fn skip_unsupported(result: io::Result<()>) -> io::Result<()> {
     }
 }
 
-fn finish_copy(dest: &Path, result: io::Result<()>) -> io::Result<()> {
+fn finish_copy(
+    dest: &Path,
+    result: std::result::Result<(), CopyFailure>,
+) -> std::result::Result<(), CopyFailure> {
     if result.is_err() {
         remove_any(dest);
     }
@@ -495,6 +581,115 @@ fn sync_parent(path: &Path) -> Result<()> {
 /// 统一的条目级错误措辞 (含底层 io 错误).
 fn failed(context: &str, path: &Path, error: &io::Error) -> Error {
     Error::EntryFailed(format!("{context} {} 失败: {error}", path.display()))
+}
+
+// 测试接缝: 让子项复制返回模拟的 `AlreadyExists` 分类 (`StagingNameTaken`).
+//
+// 真实的嵌套冲突无法在可移植的测试里稳定构造; 线程局部状态避免并行测试互相影响.
+// 注入只发生在 `copy_child` (子项递归入口), 不覆盖暂存根的排他创建; 返回的
+// `StagingNameTaken` 会经过 `copy_child` 的 `Fatal` 包装.
+#[cfg(test)]
+thread_local! {
+    static FAIL_NESTED_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static NESTED_COPY_FAILURES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// 在当前线程启用子项冲突注入, 直到返回的守卫被丢弃.
+#[cfg(test)]
+fn fail_nested_child_copy() -> NestedCopyFailureGuard {
+    let previous_active = FAIL_NESTED_COPY.with(|slot| slot.replace(true));
+    let previous_count = NESTED_COPY_FAILURES.with(|slot| slot.replace(0));
+    NestedCopyFailureGuard {
+        previous_active,
+        previous_count,
+    }
+}
+
+#[cfg(test)]
+struct NestedCopyFailureGuard {
+    previous_active: bool,
+    previous_count: u32,
+}
+
+#[cfg(test)]
+impl NestedCopyFailureGuard {
+    /// 已注入次数; 若实现仍把嵌套冲突当作暂存名冲突重试, 该值会随重试增长.
+    fn injections(&self) -> u32 {
+        NESTED_COPY_FAILURES.with(std::cell::Cell::get)
+    }
+}
+
+#[cfg(test)]
+impl Drop for NestedCopyFailureGuard {
+    fn drop(&mut self) {
+        FAIL_NESTED_COPY.with(|slot| slot.set(self.previous_active));
+        NESTED_COPY_FAILURES.with(|slot| slot.set(self.previous_count));
+    }
+}
+
+/// 测试注入点: 命中当前注入时记一次数, 让子项复制返回
+/// [`CopyFailure::StagingNameTaken`], 由 [`copy_child`] 包装成带路径的 `Fatal`.
+#[cfg(test)]
+fn take_nested_copy_failure() -> bool {
+    if !FAIL_NESTED_COPY.with(std::cell::Cell::get) {
+        return false;
+    }
+    NESTED_COPY_FAILURES.with(|slot| slot.set(slot.get() + 1));
+    true
+}
+
+// 测试接缝: 让元数据应用阶段返回模拟的元数据写入失败.
+//
+// 真实的扩展属性 / 权限 / mtime 失败无法在可移植的测试里稳定构造; 线程局部状态
+// 避免并行测试互相影响. 注入命中后由调用点包装成 `CopyFailure::Fatal`, 因此不会
+// 触发暂存名换名重试.
+#[cfg(test)]
+thread_local! {
+    static FAIL_METADATA: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static METADATA_FAILURES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// 在当前线程启用元数据失败注入, 直到返回的守卫被丢弃.
+#[cfg(test)]
+fn fail_metadata() -> MetadataFailureGuard {
+    let previous_active = FAIL_METADATA.with(|slot| slot.replace(true));
+    let previous_count = METADATA_FAILURES.with(|slot| slot.replace(0));
+    MetadataFailureGuard {
+        previous_active,
+        previous_count,
+    }
+}
+
+#[cfg(test)]
+struct MetadataFailureGuard {
+    previous_active: bool,
+    previous_count: u32,
+}
+
+#[cfg(test)]
+impl MetadataFailureGuard {
+    /// 已注入次数; 元数据失败应立即结束复制, 因此用例断言恰为 1.
+    fn injections(&self) -> u32 {
+        METADATA_FAILURES.with(std::cell::Cell::get)
+    }
+}
+
+#[cfg(test)]
+impl Drop for MetadataFailureGuard {
+    fn drop(&mut self) {
+        FAIL_METADATA.with(|slot| slot.set(self.previous_active));
+        METADATA_FAILURES.with(|slot| slot.set(self.previous_count));
+    }
+}
+
+/// 测试注入点: 命中当前注入时记一次数, 让 `apply_metadata` 返回错误.
+#[cfg(test)]
+fn take_metadata_failure() -> bool {
+    if !FAIL_METADATA.with(std::cell::Cell::get) {
+        return false;
+    }
+    METADATA_FAILURES.with(|slot| slot.set(slot.get() + 1));
+    true
 }
 
 #[cfg(all(test, unix))]
@@ -1425,6 +1620,269 @@ mod tests {
             staged.to_string_lossy().ends_with(".2.partial"),
             "应在 .partial 之前追加递增序号: {}",
             staged.display()
+        );
+    }
+
+    /// 暂存根名冲突的尝试有界: 占满 16 个候选后失败, 不创建第 17 个.
+    #[test]
+    fn staging_name_retries_are_bounded() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        fs::write(&source, "original").unwrap();
+        let base = dir.path().join("bashrc.dotlink-backup.20260101T000000");
+        let occupants: Vec<_> = (1..=MAX_STAGING_ATTEMPTS)
+            .map(|serial| {
+                let path = staging_candidate(&base, serial, PARTIAL_SUFFIX);
+                let content = format!("occupied-{serial}");
+                fs::write(&path, &content).unwrap();
+                let inode = fs::symlink_metadata(&path).unwrap().ino();
+                (path, content, inode)
+            })
+            .collect();
+        let before = fs::read_dir(dir.path()).unwrap().count();
+
+        let error = copy_to_staging(&source, &base, PARTIAL_SUFFIX).unwrap_err();
+
+        let text = error.to_string();
+        assert!(
+            text.contains(&MAX_STAGING_ATTEMPTS.to_string()),
+            "超限说明必须给出尝试次数: {text}"
+        );
+        assert!(
+            text.contains(
+                &staging_candidate(&base, MAX_STAGING_ATTEMPTS, PARTIAL_SUFFIX)
+                    .display()
+                    .to_string()
+            ),
+            "超限说明必须给出最后一个候选名: {text}"
+        );
+        assert_eq!(
+            fs::read_dir(dir.path()).unwrap().count(),
+            before,
+            "不得创建第 17 个候选"
+        );
+        for (path, content, inode) in &occupants {
+            assert_eq!(fs::symlink_metadata(path).unwrap().ino(), *inode);
+            assert_eq!(fs::read_to_string(path).unwrap(), *content);
+        }
+    }
+
+    /// 暂存根已取得后填充失败: 只清理本次暂存根, 不产生最终名.
+    #[test]
+    fn a_fill_failure_cleans_only_the_staging_root_from_this_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("file"), "original").unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(source.join("socket")).unwrap();
+        let base = dir.path().join("bashrc.dotlink-backup.20260101T000000");
+        let existing_backup = dir.path().join("bashrc.dotlink-backup.20250101T000000");
+        fs::write(&existing_backup, "earlier").unwrap();
+        let user_file = dir.path().join("user-file");
+        fs::write(&user_file, "keep").unwrap();
+        let before = fs::read_dir(dir.path()).unwrap().count();
+
+        let error = copy_to_staging(&source, &base, PARTIAL_SUFFIX).unwrap_err();
+
+        assert!(
+            error.to_string().contains("socket"),
+            "说明必须指出触发失败的特殊文件: {error}"
+        );
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), before);
+        assert!(!base.exists(), "失败不得发布最终名");
+        assert!(
+            fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(PARTIAL_SUFFIX)),
+            "失败不得残留本次暂存对象"
+        );
+        assert_eq!(fs::read_to_string(source.join("file")).unwrap(), "original");
+        assert_eq!(fs::read_to_string(&existing_backup).unwrap(), "earlier");
+        assert_eq!(fs::read_to_string(&user_file).unwrap(), "keep");
+    }
+
+    /// 元数据阶段失败: 不发布最终名, 只清理本次暂存, 原对象与既有备份不变.
+    #[test]
+    fn a_metadata_failure_publishes_no_backup_and_keeps_the_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("child"), "original").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o750)).unwrap();
+        let base = dir.path().join("source.dotlink-backup.20260101T000000");
+        let existing_backup = dir.path().join("bashrc.dotlink-backup.20250101T000000");
+        fs::write(&existing_backup, "earlier").unwrap();
+        let user_file = dir.path().join("user-file");
+        fs::write(&user_file, "keep").unwrap();
+        let before = fs::read_dir(dir.path()).unwrap().count();
+
+        let guard = fail_metadata();
+        let error = write_backup_at(&source, "20260101T000000").unwrap_err();
+        assert_eq!(guard.injections(), 1, "元数据失败应立即结束复制");
+        drop(guard);
+
+        assert!(matches!(error, Error::EntryFailed(_)));
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), before);
+        assert!(!base.exists(), "失败不得发布最终名");
+        assert!(
+            fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(PARTIAL_SUFFIX)),
+            "失败不得残留本次暂存对象"
+        );
+        assert_eq!(
+            fs::read_to_string(source.join("child")).unwrap(),
+            "original"
+        );
+        assert_eq!(
+            fs::metadata(&source).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+        assert_eq!(fs::read_to_string(&existing_backup).unwrap(), "earlier");
+        assert_eq!(fs::read_to_string(&user_file).unwrap(), "keep");
+    }
+
+    /// 首个暂存候选被占用时仍能换名并成功发布, 不残留 `.partial`.
+    #[test]
+    fn backup_staging_retry_publishes_without_partial_residue() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("child"), "original").unwrap();
+        let base = dir.path().join("source.dotlink-backup.20260101T000000");
+        let occupied = staging_candidate(&base, 1, PARTIAL_SUFFIX);
+        fs::write(&occupied, "keep").unwrap();
+
+        let backup = write_backup_at(&source, "20260101T000000").unwrap();
+
+        assert_eq!(backup, base);
+        assert_eq!(
+            fs::read_to_string(backup.join("child")).unwrap(),
+            "original"
+        );
+        assert_eq!(fs::read_to_string(&occupied).unwrap(), "keep");
+        let residues: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(PARTIAL_SUFFIX))
+            .collect();
+        assert_eq!(
+            residues,
+            vec![occupied.file_name().unwrap().to_string_lossy().into_owned()],
+            "成功发布后除既有占用物外不得残留暂存对象"
+        );
+    }
+
+    /// 嵌套复制冲突只尝试一次: 不换暂存名, 清理本次产物, 原对象与既有备份不变.
+    #[test]
+    fn nested_copy_conflicts_fail_the_entry_without_renaming() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("child"), "original").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o750)).unwrap();
+        let base = dir.path().join("source.dotlink-backup.20260101T000000");
+        let existing_backup = dir.path().join("bashrc.dotlink-backup.20250101T000000");
+        fs::write(&existing_backup, "earlier").unwrap();
+        let user_file = dir.path().join("user-file");
+        fs::write(&user_file, "keep").unwrap();
+        let before = fs::read_dir(dir.path()).unwrap().count();
+
+        let guard = fail_nested_child_copy();
+        let error = write_backup_at(&source, "20260101T000000").unwrap_err();
+        assert_eq!(guard.injections(), 1, "嵌套冲突不得触发暂存名重试");
+        drop(guard);
+
+        let text = error.to_string();
+        assert!(text.contains("child"), "说明必须指出失败子项: {text}");
+        assert!(
+            !text.contains("暂存名被占用"),
+            "不得把嵌套冲突说成暂存名被占用: {text}"
+        );
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), before);
+        assert!(!base.exists(), "失败不得发布最终名");
+        assert!(
+            fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(PARTIAL_SUFFIX)),
+            "失败不得残留本次暂存对象"
+        );
+        assert_eq!(
+            fs::read_to_string(source.join("child")).unwrap(),
+            "original"
+        );
+        assert_eq!(
+            fs::metadata(&source).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+        assert_eq!(fs::read_to_string(&existing_backup).unwrap(), "earlier");
+        assert_eq!(fs::read_to_string(&user_file).unwrap(), "keep");
+    }
+
+    /// 恢复路径复用相同的暂存上限与失败语义.
+    #[test]
+    fn restore_staging_retries_are_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup = dir.path().join("bashrc.dotlink-backup.20260101T000000");
+        fs::write(&backup, "original").unwrap();
+        let target = dir.path().join("bashrc");
+        for serial in 1..=MAX_STAGING_ATTEMPTS {
+            let occupied = staging_candidate(&target, serial, RESTORE_SUFFIX);
+            fs::write(&occupied, "keep").unwrap();
+        }
+        let before = fs::read_dir(dir.path()).unwrap().count();
+
+        let error = restore_backup(&target, &backup).unwrap_err();
+
+        assert!(matches!(error, RestoreError::NotLanded(_)));
+        let text = error.to_string();
+        assert!(text.contains(&MAX_STAGING_ATTEMPTS.to_string()), "{text}");
+        assert!(!target.exists(), "恢复失败不得创建目标");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), before);
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "original");
+    }
+
+    /// 恢复的嵌套复制冲突同样只尝试一次, 目标不落地, 备份不变.
+    #[test]
+    fn a_nested_conflict_during_restore_does_not_retry_or_leave_a_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup = dir.path().join("backup");
+        fs::create_dir(&backup).unwrap();
+        fs::write(backup.join("child"), "original").unwrap();
+        let target = dir.path().join("rc");
+        let before = fs::read_dir(dir.path()).unwrap().count();
+
+        let guard = fail_nested_child_copy();
+        let error = restore_backup(&target, &backup).unwrap_err();
+        assert_eq!(guard.injections(), 1, "嵌套冲突不得触发暂存名重试");
+        drop(guard);
+
+        assert!(matches!(error, RestoreError::NotLanded(_)));
+        let text = error.to_string();
+        assert!(text.contains("child"), "说明必须指出失败子项: {text}");
+        assert!(!text.contains("暂存名被占用"), "{text}");
+        assert!(!target.exists(), "恢复失败不得创建目标");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), before);
+        assert_eq!(
+            fs::read_to_string(backup.join("child")).unwrap(),
+            "original"
         );
     }
 

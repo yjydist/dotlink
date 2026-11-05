@@ -77,8 +77,8 @@
 
 在 `src/backup.rs` 的 `#[cfg(test)]` 区域增加线程局部注入, 形态与 `src/os/mod.rs:172-211` 一致:
 
-- `thread_local!` 保存一个 `Cell<u32>`, 记录已注入次数, 0 表示未启用.
-- 守卫函数 `fail_nested_child_copy()` 启用注入并返回守卫; `Drop` 恢复前值, 避免并行测试互相影响.
+- `thread_local!` 分别保存启用标志 (`Cell<bool>`) 与注入计数 (`Cell<u32>`); 计数从 0 开始, 启用标志为假时表示未启用.
+- 守卫函数 `fail_nested_child_copy()` 启用注入并返回守卫; `Drop` 恢复启用标志与计数, 避免并行测试互相影响.
 - 注入点放在子项递归的入口 (即 `copy_to_staging` 之下的非根复制), 每次子项创建都返回 `AlreadyExists` 并把计数加 1, 直到守卫被丢弃. 测试在错误返回后读取计数并断言恰为 1: 若实现仍把嵌套冲突当作根名冲突重试, 计数会随轮次增长 (或在无界实现下直接挂死), 断言会稳定失败. 注入点不在暂存根创建处, 因此不会被 `copy_to_staging` 误判为根名冲突.
 
 测试一 (嵌套冲突快速收敛): 目标目录含至少一个子项, 启用注入后调用 `write_backup_at`.
@@ -88,6 +88,8 @@
 断言: 返回 `Err` 且说明含"16"; 目录项数量不增加 (没有第 17 个候选); 16 个占用文件的内容与 inode 不变; 原对象未被读取破坏.
 
 测试三 (正常路径回归): 现有 `write_backup_copies_files_and_leaves_no_partial`, `backup_staging_chooses_another_name_without_touching_occupants`, `restore_chooses_another_staging_name_without_following_or_merging_occupants` 等继续通过; 新增用例只占用 1 个候选, 断言仍能换到 `.2.partial` 并成功发布.
+
+另有一个仅测试用的元数据失败接缝 `fail_metadata()`: 在 `apply_metadata` 入口注入错误, 用于覆盖 `backup-fidelity` 的"元数据阶段失败" Scenario; 注入同样使用线程局部的启用标志与计数, 断言恰为 1.
 
 ### D5. 正常路径的用户可见行为不变
 
