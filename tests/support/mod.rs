@@ -248,6 +248,36 @@ pub fn physical_repo(env: &TempEnv) -> PathBuf {
     fs::canonicalize(env.repo()).expect("解析仓库根的物理路径")
 }
 
+/// 两个路径是否指向同一文件系统对象 (跟随末段符号链接).
+pub fn same_identity(left: &Path, right: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        match (fs::metadata(left), fs::metadata(right)) {
+            (Ok(left), Ok(right)) => left.dev() == right.dev() && left.ino() == right.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (left, right);
+        false
+    }
+}
+
+/// 当前卷是否大小写不敏感: 仅大小写不同的两个路径能取到同一身份.
+///
+/// 用身份判等而不是读内容: 大小写敏感卷上大写路径不存在; 允许两个名字并存的文件
+/// 系统上也必须比较身份才能区分"同一对象"与"两个不同对象".
+pub fn case_insensitive_volume() -> bool {
+    let dir = tempfile::tempdir().expect("创建大小写探测目录");
+    let lower = dir.path().join("dotlink-case-probe");
+    let upper = dir.path().join("DOTLINK-CASE-PROBE");
+    fs::write(&lower, "probe").expect("写入大小写探测文件");
+    same_identity(&lower, &upper)
+}
+
 /// 某目录下所有备份文件名 (含最终名与 `.partial` 残留).
 pub fn backups_in(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = fs::read_dir(dir)

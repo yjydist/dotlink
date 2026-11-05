@@ -47,6 +47,63 @@ mod stub {
 #[cfg(not(unix))]
 pub use stub::{create_symlink, read_link};
 
+/// 文件系统身份: 同一对 `(设备号, inode)` 即同一对象.
+///
+/// 只用于判等 (清单校验的别名识别), 不参与读写或排序. 取不到身份时调用方一律退回
+/// 路径字符串比较, 因此身份判等只增加拒绝条件, 不改变原本的接受语义.
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+/// 按 lstat 语义取"落点对象"的身份: 不跟随末段符号链接.
+///
+/// 部署目标的末段就是会被替换或备份的那个对象. 若跟随链接, 已正确部署的链接会与
+/// 它指向的源得到同一身份, 使 V-5 与 V-10 把合法清单误判为重复或自指.
+#[cfg(unix)]
+pub(crate) fn target_identity(path: &Path) -> std::io::Result<FileIdentity> {
+    Ok(identity_of(&std::fs::symlink_metadata(path)?))
+}
+
+/// 按跟随语义取"基准对象"的身份: 末段符号链接解析到最终对象.
+///
+/// V-9 的基准点 (文件系统根, 主目录, 仓库根, 清单文件) 使用这一语义: `HOME` 与
+/// 清单文件本身都可能是符号链接, 同一对象的两种写法都必须命中.
+#[cfg(unix)]
+pub(crate) fn basis_identity(path: &Path) -> std::io::Result<FileIdentity> {
+    Ok(identity_of(&std::fs::metadata(path)?))
+}
+
+#[cfg(unix)]
+fn identity_of(metadata: &std::fs::Metadata) -> FileIdentity {
+    use std::os::unix::fs::MetadataExt;
+
+    FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn target_identity(_path: &Path) -> std::io::Result<FileIdentity> {
+    Err(unsupported_identity())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn basis_identity(_path: &Path) -> std::io::Result<FileIdentity> {
+    Err(unsupported_identity())
+}
+
+#[cfg(not(unix))]
+fn unsupported_identity() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "当前平台不支持文件系统身份判等",
+    )
+}
+
 mod metadata;
 
 pub(crate) use metadata::{copy_xattrs, set_mtime};
@@ -717,5 +774,54 @@ mod tests {
         let dir = tempfile::tempdir().expect("创建临时目录");
 
         sync_dir(dir.path()).expect("目录必须可以同步");
+    }
+
+    #[test]
+    fn target_identity_is_lstat_while_basis_identity_follows_symlinks() {
+        let (_dir, root) = physical_tempdir();
+        let file = root.join("file");
+        std::fs::write(&file, "payload").expect("写入文件");
+        let hard = root.join("hard");
+        std::fs::hard_link(&file, &hard).expect("建立硬链接");
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&file, &link).expect("建立符号链接");
+
+        let file_identity = target_identity(&file).expect("文件身份");
+        assert_eq!(
+            file_identity,
+            target_identity(&hard).expect("硬链接身份"),
+            "硬链接指向同一对象, 两种语义都必须判等"
+        );
+        assert_eq!(
+            basis_identity(&link).expect("跟随后的身份"),
+            file_identity,
+            "跟随语义必须落到链接的最终对象"
+        );
+        assert_ne!(
+            target_identity(&link).expect("链接自身身份"),
+            file_identity,
+            "lstat 语义不得跟随末段"
+        );
+    }
+
+    #[test]
+    fn identity_probes_fail_when_the_path_does_not_exist() {
+        let (_dir, root) = physical_tempdir();
+        let missing = root.join("missing");
+        assert!(target_identity(&missing).is_err(), "不存在的路径没有身份");
+        assert!(basis_identity(&missing).is_err(), "不存在的路径没有身份");
+
+        // 悬空链接: lstat 仍能取到链接自身, 跟随语义则失败. 调用方据此回退字符串
+        // 比较, 不把"身份不可用"变成新的拒绝条件.
+        let dangling = root.join("dangling");
+        std::os::unix::fs::symlink(root.join("gone"), &dangling).expect("建立悬空链接");
+        assert!(
+            target_identity(&dangling).is_ok(),
+            "悬空链接本身是存在的对象"
+        );
+        assert!(
+            basis_identity(&dangling).is_err(),
+            "悬空链接的最终对象不存在"
+        );
     }
 }
