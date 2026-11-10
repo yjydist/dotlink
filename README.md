@@ -1,7 +1,5 @@
 # dotlink
 
-[![CI](https://github.com/yjydist/dotlink/actions/workflows/ci.yml/badge.svg)](https://github.com/yjydist/dotlink/actions/workflows/ci.yml)
-
 声明式 dotfile 软链接管理: 用一份 `dotlink.toml` 描述"哪个源文件应该出现在哪个目标路径", 由 dotlink 负责建立软链接, 并在需要覆盖已有内容时先备份.
 
 无配置面, 无状态文件, 无交互提示. 重复执行不会产生累积副作用: `apply` 第二次运行为全部条目报 `ok` 且不改动文件系统, `undo` 在撤销后目标为空且同目录没有完整备份可恢复的清单上同样为 `ok` 并退 0. 若目标为空但同目录有完整备份, `undo` 恢复该备份, token 为 `restore` 并退 1; 恢复不消费备份. 若上一次恢复了备份, 目标被恢复出的原内容占用: 恢复出普通文件, 目录或仓库外链接时, 第二次 `undo` 报 `skip` 且不改动文件系统; 恢复出的内容本身是指向仓库内的链接时, 按归属规则再次报 `restore` (目标与备份内容保持不变, 退出码 1).
@@ -288,9 +286,9 @@ Windows 上的运行时拒绝**未在任何环境验证** (`cargo check --target
 ./scripts/check.sh
 ```
 
-脚本自动定位项目根目录, 最先运行 `scripts/check-punctuation.py` 检查非 ASCII 标点及其回归测试 `scripts/test_check_punctuation.py` (需要 Python 3, 仅用标准库), 然后依次执行格式检查, 全套测试, Clippy, 将警告视为错误的 rustdoc 构建和 release 构建, 任一步失败即停止. 标点检查覆盖 `AGENTS.md`, `README.md`, `openspec/config.yaml` (或 `config.yml`), `openspec/specs/`, `openspec/changes/`, `src/`, `tests/`, `scripts/` 与 `.github/` 中的自然语言与源码, 禁止 U+3000-303F, U+FF00-FFEF, U+2018-201F, U+2014, U+2026 与 U+00B7; 代码中确需这些字符时使用语言转义; 覆盖范围与退出码由 `scripts/test_check_punctuation.py` 在 `mktemp` 建出的临时目录中回归. 检查不修改源码; 构建产物位于 `target/`, 二进制为 `target/release/dotlink`. 脚本使用锁文件, 不安装工具链或交叉编译目标, 也不运行依赖审计: `cargo audit` 需要网络, 由每周 CI 工作流执行, 不属于本地检查或 PR 必需检查.
+脚本自动定位项目根目录, 最先运行 `scripts/check-punctuation.py` 检查非 ASCII 标点及其回归测试 `scripts/test_check_punctuation.py` (需要 Python 3, 仅用标准库), 然后依次执行格式检查, 全套测试, Clippy, 将警告视为错误的 rustdoc 构建和 release 构建, 任一步失败即停止. 标点检查覆盖 `AGENTS.md`, `README.md`, `openspec/config.yaml` (或 `config.yml`), `openspec/specs/`, `openspec/changes/`, `src/`, `tests/`, `scripts/` 与 `.github/` 中的自然语言与源码, 禁止 U+3000-303F, U+FF00-FFEF, U+2018-201F, U+2014, U+2026 与 U+00B7; 代码中确需这些字符时使用语言转义; 覆盖范围与退出码由 `scripts/test_check_punctuation.py` 在 `mktemp` 建出的临时目录中回归. 检查不修改源码; 构建产物位于 `target/`, 二进制为 `target/release/dotlink`. 脚本使用锁文件, 不安装工具链或交叉编译目标, 也不运行依赖审计: `cargo audit` 需要网络, 不属于本地检查或提交前置.
 
-CI 由 `.github/workflows/ci.yml` 定义, 包含三个 job: `check` 在 `ubuntu-latest` 与 `macos-latest` 上运行 `./scripts/check.sh`; `msrv` 在 `ubuntu-latest` 上运行 `cargo +1.97.0 test --locked`; `cross-check` 在 `ubuntu-latest` 上依次运行两个 `cargo check` (Linux 与 Windows GNU 目标). Windows 仅交叉编译, 不验证运行时行为. 依赖审计由 `.github/workflows/audit.yml` 每周运行并支持手动触发, 不进入 PR 必需检查.
+仓库不配置托管 CI, `./scripts/check.sh` 是唯一必需门禁: 推送前运行它即可, 检查项就是上一段列出的那些. 最低 Rust 版本与跨平台编译不在脚本内, 按紧随其后的既有命令块手工执行; 依赖审计同样不在脚本内, 需要时先安装 `cargo-audit` (例如 `cargo install cargo-audit`), 再按需运行 `cargo audit`. 删除托管 CI 后, Linux 上的自动执行与依赖公告监控改为维护者按需手工完成: 发布前在 Linux 机器或容器中运行 `cargo test --locked` (或在其中运行 `./scripts/check.sh`), 升级依赖或发布前运行 `cargo audit`.
 
 按需验证最低 Rust 版本及跨平台编译 (需事先通过 `rustup` 安装对应工具链和目标):
 
