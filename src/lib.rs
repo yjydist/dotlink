@@ -213,22 +213,26 @@ fn preview(manifest: &Manifest, states: &[EntryState]) -> Vec<ReportRow> {
 /// 条件 2 使退出码为 1. "哪些动作有副作用"由 `apply::apply_entry` 一处决定, 本层不
 /// 重复该知识.
 fn apply(manifest: &Manifest, states: &[EntryState]) -> Vec<ReportRow> {
+    // 归属复核的仓库根基准: 与 `classify` / `undo` 同源, 每运行只算一次 (设计 D2).
+    let repo_root = os::normalize(&manifest.repo_root);
     manifest
         .entries
         .iter()
         .zip(states)
-        .map(|(entry, state)| match apply::apply_entry(entry, state) {
-            Ok(backup) => render::row_from_state(
-                Command::Apply,
-                entry,
-                state.current,
-                state.action,
-                &state.detail,
-                backup.is_some(),
-                backup.as_deref(),
-            ),
-            Err(error) => render::fail_row(entry, &error.to_string()),
-        })
+        .map(
+            |(entry, state)| match apply::apply_entry(entry, state, &repo_root) {
+                Ok(backup) => render::row_from_state(
+                    Command::Apply,
+                    entry,
+                    state.current,
+                    state.action,
+                    &state.detail,
+                    backup.is_some(),
+                    backup.as_deref(),
+                ),
+                Err(error) => render::fail_row(entry, &error.to_string()),
+            },
+        )
         .collect()
 }
 

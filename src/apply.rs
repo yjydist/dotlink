@@ -36,16 +36,21 @@ pub(crate) fn backup_kind_for(current: Current) -> BackupKind {
 
 /// 执行单个条目的动作. 返回备份文件的完整路径 (若发生了备份).
 ///
+/// `repo_root` 必须已经过 [`os::normalize`], 由调用方在循环外算一次; 自愈路径用它
+/// 复核目标的链接归属 (设计 D2).
+///
 /// `Ok(None)` 表示该条目未涉及备份: 或本就不需要动作 (`Noop` / `ReportMissingSource`
 /// / `ReportUnreadable` / `RefuseConflict`), 或动作是纯粹的链接创建.
 /// `Err` 表示该条目失败 (FR-014: 由调用者决定不中断其余条目).
-pub fn apply_entry(entry: &Entry, state: &EntryState) -> Result<Option<PathBuf>> {
+pub fn apply_entry(entry: &Entry, state: &EntryState, repo_root: &Path) -> Result<Option<PathBuf>> {
     match state.action {
         Action::Create => {
             create_link(entry)?;
             Ok(None)
         }
-        Action::ReplaceAndBackup => replace_and_backup(entry, backup_kind_for(state.current)),
+        Action::ReplaceAndBackup => {
+            replace_and_backup(entry, backup_kind_for(state.current), repo_root)
+        }
         Action::Noop | Action::ReportMissingSource | Action::ReportUnreadable => Ok(None),
         Action::RefuseConflict => Ok(None),
     }
@@ -102,11 +107,23 @@ fn create_dir_all(dir: &Path) -> Result<()> {
 /// 数据丢失. 暂存与复核把"判定"和"删除"之间的竞态收窄为一次 rename: 外部替换物
 /// 会因身份不一致被移回原路径, 不会被当作旧对象删除. 备份失败时**不删除原对象**,
 /// 条目报 `Err` 并保留原状.
-fn replace_and_backup(entry: &Entry, kind: BackupKind) -> Result<Option<PathBuf>> {
+///
+/// 自愈路径在备份之前还要复核目标仍归属于本工具 (openspec/specs/link-deployment/spec.md
+/// 的"自愈备份前复核目标仍是本工具链接"): 自愈命名空间不被 `undo` 扫描, 若目标在
+/// 判定之后变成用户内容, 备份它等于把用户内容移出可恢复范围.
+fn replace_and_backup(
+    entry: &Entry,
+    kind: BackupKind,
+    repo_root: &Path,
+) -> Result<Option<PathBuf>> {
     let target = entry.target_path.as_path();
 
     #[cfg(test)]
     run_before_backup_hook();
+
+    if kind == BackupKind::SelfHeal {
+        verify_self_heal_target(target, repo_root)?;
+    }
 
     // 备份落定之后才允许删除原对象, 因此这之后的失败都发生在"原内容已被备份"之后:
     // 错误里带上备份路径, 用户才知道去哪儿找回它 (FR-016).
@@ -126,6 +143,38 @@ fn replace_and_backup(entry: &Entry, kind: BackupKind) -> Result<Option<PathBuf>
     })?;
 
     Ok(Some(published.path))
+}
+
+/// 自愈备份前的归属复核: 目标必须仍是符号链接, 且解析后的目标落在仓库根内.
+///
+/// 使用与 `classify` / `undo` 相同的 [`os::link_destination`] 与已规范化的仓库根,
+/// 不引入第二套路径语义 (设计 D1 / D2). 复核失败时该条目不动文件系统.
+fn verify_self_heal_target(target: &Path, repo_root: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(target)
+        .map_err(|error| stale_self_heal_target(target, &format!("无法复核目标: {error}")))?;
+    if !metadata.file_type().is_symlink() {
+        return Err(stale_self_heal_target(target, "目标已不再是符号链接"));
+    }
+
+    let link_text = os::read_link(target).map_err(|error| {
+        stale_self_heal_target(target, &format!("无法读取目标链接文本: {error}"))
+    })?;
+    let destination = os::link_destination(target, &link_text);
+    if !os::is_inside_repo(&destination, repo_root) {
+        return Err(stale_self_heal_target(
+            target,
+            &format!("链接目标 {} 落在仓库外", destination.display()),
+        ));
+    }
+    Ok(())
+}
+
+/// 自愈判定已失效的条目级错误: 保留目标, 不备份, 提示重新运行 (设计 D1).
+fn stale_self_heal_target(target: &Path, reason: &str) -> Error {
+    Error::EntryFailed(format!(
+        "拒绝自愈备份 {}: 判定之后目标已被替换为非本工具链接或内容 ({reason}); 请重新运行以基于当前状态判定",
+        target.display()
+    ))
 }
 
 /// 备份完成后的替换: 暂存并复核身份, 复核通过才删除暂存对象, 最后建立链接.
@@ -321,8 +370,9 @@ fn run_after_backup_hook() {
 
 // 测试接缝: 备份开始之前运行一次注入的动作.
 //
-// 用于覆盖"备份前目标被替换": 备份复制的就是替换后的对象, 身份基准随之改变,
-// 复核应当通过 (设计 D1 / D2).
+// 用于覆盖"备份前目标被替换": 外部占用 (User) 路径上, 备份复制的就是替换后的
+// 对象, 身份基准随之改变, 复核应当通过; 自愈 (SelfHeal) 路径上, 替换会使备份前的
+// 归属复核失败, 用于断言目标原样保留 (设计 D1 / D2 / D3).
 #[cfg(test)]
 thread_local! {
     static BEFORE_BACKUP: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
@@ -414,7 +464,10 @@ mod tests {
         let target = repo.join("home/.config/nvim/init.lua");
         let entry = entry_for(repo, "nvim.lua", &target);
 
-        assert_eq!(apply_entry(&entry, &state(Action::Create)).unwrap(), None);
+        assert_eq!(
+            apply_entry(&entry, &state(Action::Create), &os::normalize(repo)).unwrap(),
+            None
+        );
 
         assert!(
             fs::symlink_metadata(&target)
@@ -435,7 +488,7 @@ mod tests {
 
         let target = repo.join("home/.bashrc");
         let entry = entry_for(repo, "bashrc", &target);
-        apply_entry(&entry, &state(Action::Create)).unwrap();
+        apply_entry(&entry, &state(Action::Create), &os::normalize(repo)).unwrap();
 
         assert_eq!(fs::read_to_string(&target).unwrap(), "source");
     }
@@ -454,7 +507,10 @@ mod tests {
             Action::ReportUnreadable,
             Action::RefuseConflict,
         ] {
-            assert_eq!(apply_entry(&entry, &state(action)).unwrap(), None);
+            assert_eq!(
+                apply_entry(&entry, &state(action), &os::normalize(repo)).unwrap(),
+                None
+            );
         }
 
         assert!(
@@ -477,6 +533,7 @@ mod tests {
         let backup_path = apply_entry(
             &entry,
             &state_with(Current::ForeignFile, Action::ReplaceAndBackup),
+            &os::normalize(repo),
         )
         .unwrap()
         .expect("必须报告备份路径");
@@ -525,6 +582,7 @@ mod tests {
         let backup_path = apply_entry(
             &entry,
             &state_with(Current::LinkedWrong, Action::ReplaceAndBackup),
+            &os::normalize(repo),
         )
         .unwrap()
         .expect("必须报告备份路径");
@@ -582,6 +640,7 @@ mod tests {
         let result = apply_entry(
             &entry,
             &state_with(Current::LinkedWrong, Action::ReplaceAndBackup),
+            &os::normalize(repo),
         );
         fs::set_permissions(&home, fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -601,6 +660,163 @@ mod tests {
         );
     }
 
+    /// 判定之后目标被换成普通文件: 自愈备份前复核失败, 文件内容与 inode 原样保留.
+    #[test]
+    fn a_self_heal_target_replaced_by_a_file_fails_before_backup() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        fs::write(repo.join("bashrc"), "managed").unwrap();
+        fs::create_dir_all(repo.join("home")).unwrap();
+
+        let stale = repo.join("stale");
+        let target = repo.join("home/bashrc");
+        os::create_symlink(&stale, &target).unwrap();
+        let entry = entry_for(repo, "bashrc", &target);
+
+        // 记录 hook 写入的普通文件 inode; 复核失败后必须仍是同一个对象.
+        let inode = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = std::rc::Rc::clone(&inode);
+        let replaced = target.clone();
+        before_backup_hook(move || {
+            fs::remove_file(&replaced).unwrap();
+            fs::write(&replaced, "intruder").unwrap();
+            seen.set(fs::symlink_metadata(&replaced).unwrap().ino());
+        });
+
+        let error = apply_entry(
+            &entry,
+            &state_with(Current::LinkedWrong, Action::ReplaceAndBackup),
+            &os::normalize(repo),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+
+        assert!(
+            message.contains("判定之后目标已被替换为非本工具链接或内容"),
+            "{message}"
+        );
+        assert!(message.contains(&target.display().to_string()), "{message}");
+        let metadata = fs::symlink_metadata(&target).unwrap();
+        assert!(metadata.is_file(), "目标必须仍是普通文件");
+        assert_eq!(metadata.ino(), inode.get(), "不得替换或重建目标对象");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "intruder");
+        assert!(
+            fs::read_dir(repo.join("home"))
+                .unwrap()
+                .flatten()
+                .all(|item| !item
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".dotlink-heal.")),
+            "复核失败不得产生自愈备份"
+        );
+    }
+
+    /// 判定之后目标被换成仓库外链接: 复核失败, 链接文本原样保留, 不产生自愈备份.
+    #[test]
+    fn a_self_heal_target_replaced_by_an_outside_link_fails_before_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        fs::write(repo.join("bashrc"), "managed").unwrap();
+        fs::create_dir_all(repo.join("home")).unwrap();
+
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("elsewhere");
+        fs::write(&outside_file, "outside").unwrap();
+
+        let stale = repo.join("stale");
+        let target = repo.join("home/bashrc");
+        os::create_symlink(&stale, &target).unwrap();
+        let entry = entry_for(repo, "bashrc", &target);
+
+        let replaced = target.clone();
+        let outside_link = outside_file.clone();
+        before_backup_hook(move || {
+            fs::remove_file(&replaced).unwrap();
+            os::create_symlink(&outside_link, &replaced).unwrap();
+        });
+
+        let error = apply_entry(
+            &entry,
+            &state_with(Current::LinkedWrong, Action::ReplaceAndBackup),
+            &os::normalize(repo),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+
+        assert!(
+            message.contains("判定之后目标已被替换为非本工具链接或内容"),
+            "{message}"
+        );
+        assert!(message.contains(&target.display().to_string()), "{message}");
+        assert_eq!(
+            fs::read_link(&target).expect("链接必须保留"),
+            outside_file,
+            "复核失败不得删除或改写链接"
+        );
+        assert!(
+            fs::read_dir(repo.join("home"))
+                .unwrap()
+                .flatten()
+                .all(|item| !item
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".dotlink-heal.")),
+            "复核失败不得产生自愈备份"
+        );
+    }
+
+    /// 判定之后目标被删除: 复核无法完成, 说明仍指出判定已失效并提示重新运行.
+    #[test]
+    fn a_self_heal_target_removed_before_backup_fails_with_the_stale_target_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        fs::write(repo.join("bashrc"), "managed").unwrap();
+        fs::create_dir_all(repo.join("home")).unwrap();
+
+        let stale = repo.join("stale");
+        let target = repo.join("home/bashrc");
+        os::create_symlink(&stale, &target).unwrap();
+        let entry = entry_for(repo, "bashrc", &target);
+
+        let removed = target.clone();
+        before_backup_hook(move || {
+            fs::remove_file(&removed).unwrap();
+        });
+
+        let error = apply_entry(
+            &entry,
+            &state_with(Current::LinkedWrong, Action::ReplaceAndBackup),
+            &os::normalize(repo),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+
+        assert!(
+            message.contains("判定之后目标已被替换为非本工具链接或内容"),
+            "{message}"
+        );
+        assert!(message.contains("无法复核目标"), "{message}");
+        assert!(message.contains("请重新运行"), "{message}");
+        assert!(message.contains(&target.display().to_string()), "{message}");
+        assert!(
+            fs::symlink_metadata(&target).is_err(),
+            "复核失败不得重建目标"
+        );
+        assert!(
+            fs::read_dir(repo.join("home"))
+                .unwrap()
+                .flatten()
+                .all(|item| !item
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".dotlink-heal.")),
+            "复核失败不得产生自愈备份"
+        );
+    }
+
     #[test]
     fn replace_and_backup_handles_a_directory_recursively() {
         let dir = tempfile::tempdir().unwrap();
@@ -615,6 +831,7 @@ mod tests {
         let backup_path = apply_entry(
             &entry,
             &state_with(Current::ForeignDir, Action::ReplaceAndBackup),
+            &os::normalize(repo),
         )
         .unwrap()
         .expect("必须报告备份路径");
@@ -652,6 +869,7 @@ mod tests {
         let backup_path = apply_entry(
             &entry,
             &state_with(Current::ForeignLink, Action::ReplaceAndBackup),
+            &os::normalize(repo),
         )
         .unwrap()
         .expect("必须报告备份路径");
@@ -690,6 +908,7 @@ mod tests {
         let error = apply_entry(
             &entry,
             &state_with(Current::ForeignFile, Action::ReplaceAndBackup),
+            &os::normalize(repo),
         )
         .unwrap_err();
         let message = error.to_string();
@@ -758,6 +977,7 @@ mod tests {
         let backup_path = apply_entry(
             &entry,
             &state_with(Current::ForeignFile, Action::ReplaceAndBackup),
+            &os::normalize(repo),
         )
         .unwrap()
         .expect("替换成功时仍必须报告备份路径");
@@ -905,6 +1125,7 @@ mod tests {
         let error = apply_entry(
             &entry,
             &state_with(Current::ForeignDir, Action::ReplaceAndBackup),
+            &os::normalize(repo),
         )
         .unwrap_err();
         assert!(matches!(error, Error::EntryFailed(_)));
@@ -962,6 +1183,7 @@ mod tests {
         let error = apply_entry(
             &entry,
             &state_with(Current::ForeignDir, Action::ReplaceAndBackup),
+            &os::normalize(repo),
         )
         .unwrap_err();
         assert!(matches!(error, Error::EntryFailed(_)));
@@ -1046,6 +1268,7 @@ mod tests {
         let error = apply_entry(
             &entry,
             &state_with(Current::ForeignFile, Action::ReplaceAndBackup),
+            &os::normalize(repo),
         )
         .unwrap_err();
         let message = error.to_string();
@@ -1088,6 +1311,7 @@ mod tests {
         let error = apply_entry(
             &entry,
             &state_with(Current::ForeignFile, Action::ReplaceAndBackup),
+            &os::normalize(repo),
         )
         .unwrap_err();
         let message = error.to_string();
@@ -1123,6 +1347,7 @@ mod tests {
         let error = apply_entry(
             &entry,
             &state_with(Current::ForeignDir, Action::ReplaceAndBackup),
+            &os::normalize(repo),
         )
         .unwrap_err();
         let message = error.to_string();

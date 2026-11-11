@@ -24,7 +24,6 @@
 
 ## Impact
 
-- `src/apply.rs`: `replace_and_backup` 前的复核; `apply_entry` 参数.
+- `src/apply.rs`: `replace_and_backup` 前的复核, `apply_entry` 参数与竞态单元测试 (直接调用 `apply_entry`).
 - `src/lib.rs`: 把已规范化的仓库根传给 apply.
-- `tests/apply.rs`: 新竞态用例.
 - `README.md`: 已知限制补充该窗口已收窄但仍非事务.
