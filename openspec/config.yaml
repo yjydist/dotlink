@@ -34,6 +34,7 @@ rules:
     - 每个任务写明验证命令或可观察结果.
     - 每组包含该组的验证任务.
     - 与 README.md 及 openspec/specs/ 的现有行为一致, 不安排与规格冲突的改动.
+skillsScope: project
 
 # Per-operation guidance (optional)
 # Add advisory guidance for how apply and archive work should be conducted.
