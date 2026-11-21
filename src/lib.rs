@@ -37,7 +37,7 @@ pub use cli::Command;
 pub use error::{EntryOutcome, exit_code_for};
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::classify::{Action, Current, EntryState};
 use crate::entry::Entry;
@@ -91,18 +91,22 @@ fn run_on(supported: bool) -> i32 {
         }
     };
 
-    // 4. 判定**只做一次**: 四条命令消费的是同一个 `Vec<EntryState>`.
-    let states = classify::classify(&manifest);
+    // 4. 仓库根在本次运行内只规范化一次, 供判定 (含归属复核), apply 与 undo 共用.
+    //    `normalize` 只读且幂等; 三个消费者因此看到同一个形态, 不会各自重复解析.
+    let repo_root = os::normalize(&manifest.repo_root);
 
-    // 5. 分发到四条命令之一; 每一步同时产出报告行.
+    // 5. 判定**只做一次**: 四条命令消费的是同一个 `Vec<EntryState>`.
+    let states = classify::classify(&manifest, &repo_root);
+
+    // 6. 分发到四条命令之一; 每一步同时产出报告行.
     let rows = match command {
         Command::Preview => preview(&manifest, &states),
-        Command::Apply => apply(&manifest, &states),
+        Command::Apply => apply(&manifest, &states, &repo_root),
         Command::Status => status(&manifest, &states),
-        Command::Undo => undo(&manifest, &states),
+        Command::Undo => undo(&manifest, &states, &repo_root),
     };
 
-    // 6. 渲染与退出码. 逐条结果侧的 0 / 1 全部由 `exit_code_for` 给出. 先算退出码
+    // 7. 渲染与退出码. 逐条结果侧的 0 / 1 全部由 `exit_code_for` 给出. 先算退出码
     //    再写出: 报告写不出去 (含管道提前关闭) 不参与结局, 返回值与写出是否成功无关.
     let code = exit_code_of(command, &rows);
     write_report(&rows, &mut std::io::stdout(), &mut std::io::stderr());
@@ -168,8 +172,9 @@ fn platform_supported() -> bool {
 /// 报告行是逐条结果的**唯一**载体, 因此"输出说成功而退出码说失败"在结构上不可能:
 /// 两个条件 (`openspec/specs/cli-contract/spec.md` 的"退出码的两条件判据") 都只看这一份 token 序列.
 fn exit_code_of(command: Command, rows: &[ReportRow]) -> i32 {
-    let outcomes: Vec<EntryOutcome> = rows.iter().map(|row| row.token).collect();
-    exit_code_for(command, &outcomes)
+    // 迭代器入口与公开的 slice 版本共用同一组谓词; 直接从报告行取 token, 不先收集
+    // `Vec<EntryOutcome>`.
+    error::exit_code_for_iter(command, rows.iter().map(|row| row.token))
 }
 
 /// `preview`: 渲染 `Current` 与 `Action`, 不执行任何动作.
@@ -177,6 +182,9 @@ fn exit_code_of(command: Command, rows: &[ReportRow]) -> i32 {
 /// 本路径不产生任何文件系统写操作 (含创建父目录, 见
 /// `openspec/specs/link-deployment/spec.md` 的 FR-006): `render` 只读判定结果,
 /// 这里额外的 `backup_path_for` 也只做占用检测.
+///
+/// 预测失败时该行 MUST 报告 `fail` 并给出底层原因, 不展示无法发布的预测路径
+/// (设计 D5): 无法确认候选名空闲时, 承诺一个路径只会让 preview 与 apply 结论不一致.
 fn preview(manifest: &Manifest, states: &[EntryState]) -> Vec<ReportRow> {
     manifest
         .entries
@@ -187,22 +195,19 @@ fn preview(manifest: &Manifest, states: &[EntryState]) -> Vec<ReportRow> {
             // 因此给出按当前实况算出的那个名字 -- 与随后 apply 的写入结果同源:
             // 命名空间由同一个 `backup_kind_for` 选择, 命名规则由 `backup_path_for`
             // 共用, 跨秒时只有字面时间戳可以不同 (设计 D3).
-            let predicted = match state.action {
-                Action::ReplaceAndBackup => Some(backup::backup_path_for(
+            let predicted = if state.action == Action::ReplaceAndBackup {
+                match backup::backup_path_for(
                     &entry.target_path,
                     apply::backup_kind_for(state.current),
-                )),
-                _ => None,
+                ) {
+                    Ok(path) => Some(path),
+                    // 无法确认候选名空闲: 该行如实报告失败 (设计 D5).
+                    Err(error) => return render::fail_row(entry, &error.to_string()),
+                }
+            } else {
+                None
             };
-            render::row_from_state(
-                Command::Preview,
-                entry,
-                state.current,
-                state.action,
-                &state.detail,
-                false,
-                predicted.as_deref(),
-            )
+            render::row_from_state(Command::Preview, entry, state, false, predicted.as_deref())
         })
         .collect()
 }
@@ -212,21 +217,17 @@ fn preview(manifest: &Manifest, states: &[EntryState]) -> Vec<ReportRow> {
 /// 单条目失败**不中断**其余条目 (FR-014): 失败只把该行改写为 `fail` 并附带原因, 由
 /// 条件 2 使退出码为 1. "哪些动作有副作用"由 `apply::apply_entry` 一处决定, 本层不
 /// 重复该知识.
-fn apply(manifest: &Manifest, states: &[EntryState]) -> Vec<ReportRow> {
-    // 归属复核的仓库根基准: 与 `classify` / `undo` 同源, 每运行只算一次 (设计 D2).
-    let repo_root = os::normalize(&manifest.repo_root);
+fn apply(manifest: &Manifest, states: &[EntryState], repo_root: &Path) -> Vec<ReportRow> {
     manifest
         .entries
         .iter()
         .zip(states)
         .map(
-            |(entry, state)| match apply::apply_entry(entry, state, &repo_root) {
+            |(entry, state)| match apply::apply_entry(entry, state, repo_root) {
                 Ok(backup) => render::row_from_state(
                     Command::Apply,
                     entry,
-                    state.current,
-                    state.action,
-                    &state.detail,
+                    state,
                     backup.is_some(),
                     backup.as_deref(),
                 ),
@@ -245,17 +246,7 @@ fn status(manifest: &Manifest, states: &[EntryState]) -> Vec<ReportRow> {
         .entries
         .iter()
         .zip(states)
-        .map(|(entry, state)| {
-            render::row_from_state(
-                Command::Status,
-                entry,
-                state.current,
-                state.action,
-                &state.detail,
-                false,
-                None,
-            )
-        })
+        .map(|(entry, state)| render::row_from_state(Command::Status, entry, state, false, None))
         .collect()
 }
 
@@ -279,7 +270,7 @@ struct UndoItem<'a> {
 /// 若在动手后求值将恒为 0, 于是"刚部署好则退 1"与"撤销后该谓词为真"无法同时成立.
 /// 因此这里先由判定结果取一份快照 (逐条 token + 备份), 再执行移除; 快照同时就是报告
 /// 与退出码的输入 -- 二者同源, 不需要第二份逻辑.
-fn undo(manifest: &Manifest, states: &[EntryState]) -> Vec<ReportRow> {
+fn undo(manifest: &Manifest, states: &[EntryState], repo_root: &Path) -> Vec<ReportRow> {
     // 撤销只查用户备份命名空间: `BackupFinder` 不扫描 `.dotlink-heal.`, 因此自愈
     // 备份既不会让 token 变成 `restore`, 也不会被恢复或消费 (设计 D4).
     let mut backups = backup::BackupFinder::default();
@@ -317,9 +308,6 @@ fn undo(manifest: &Manifest, states: &[EntryState]) -> Vec<ReportRow> {
         })
         .collect();
 
-    // 归属复核的仓库根基准: 与 `classify` 同源, 每运行只算一次.
-    let repo_root = os::normalize(&manifest.repo_root);
-
     // 快照已定, 现在才动手. "哪些 `Current` 允许移除"由 `undo::undo_entry` 一处决定
     // (`Foreign*` / `Absent` / `SourceMissing` / `Unreadable` 下它不触碰任何路径);
     // 快照同时就是恢复动作的输入, 因此报告中写的备份路径与实际恢复的必然是同一个.
@@ -330,7 +318,7 @@ fn undo(manifest: &Manifest, states: &[EntryState]) -> Vec<ReportRow> {
             continue;
         }
         let (entry, state) = (item.entry, item.state);
-        if let Err(error) = undo::undo_entry(entry, state, item.backup.as_deref(), &repo_root) {
+        if let Err(error) = undo::undo_entry(entry, state, item.backup.as_deref(), repo_root) {
             item.failure = Some(error.to_string());
         }
     }
@@ -341,9 +329,7 @@ fn undo(manifest: &Manifest, states: &[EntryState]) -> Vec<ReportRow> {
             None => render::row_from_state(
                 Command::Undo,
                 item.entry,
-                item.state.current,
-                item.state.action,
-                &item.state.detail,
+                item.state,
                 item.backup.is_some(),
                 item.backup.as_deref(),
             ),
@@ -521,5 +507,48 @@ mod tests {
         let mut stderr = BrokenPipeWriter { fail_flush: false };
 
         write_report(&rows, &mut stdout, &mut stderr);
+    }
+
+    /// 预测备份名失败时, preview 该行报告 `fail` 并给出原因, 不展示预测路径.
+    ///
+    /// 清单校验 (V-12 / V-13) 之后, 用 CLI 已无法构造候选名的 EACCES / ENAMETOOLONG,
+    /// 因此这里用线程局部注入直接锁定 `preview` 的 `Err -> fail_row` 分支.
+    #[test]
+    fn preview_reports_fail_without_a_predicted_path_when_the_backup_name_check_fails() {
+        use crate::entry::OnConflict;
+
+        let entry = crate::entry::Entry {
+            source: "shell/bashrc".to_string(),
+            target: "~/.bashrc".to_string(),
+            on_conflict: OnConflict::ReplaceAndBackup,
+            source_path: PathBuf::from("/repo/shell/bashrc"),
+            target_path: PathBuf::from("/home/u/.bashrc"),
+        };
+        let manifest = Manifest {
+            repo_root: PathBuf::from("/repo"),
+            entries: vec![entry],
+        };
+        let states = vec![EntryState {
+            current: Current::ForeignFile,
+            action: Action::ReplaceAndBackup,
+            detail: String::new(),
+        }];
+
+        let guard = backup::fail_backup_path_once();
+        let rows = preview(&manifest, &states);
+        drop(guard);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].token, EntryOutcome::Fail);
+        assert!(
+            rows[0].note.contains("模拟预测备份名失败"),
+            "失败说明必须给出底层原因: {}",
+            rows[0].note
+        );
+        assert!(
+            !rows[0].note.contains(".dotlink-backup."),
+            "预测失败时不得展示预测路径: {}",
+            rows[0].note
+        );
     }
 }

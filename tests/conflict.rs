@@ -8,12 +8,13 @@
 mod support;
 
 use std::fs;
+use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 
 use support::{
     TempEnv, assert_token, backup_path_from_output, backups_in, file_identity,
     heal_backup_from_output, heal_backups_in, line_for, make_socket, manifest_of, run,
-    running_as_root, snapshot_all, token_of, unlock,
+    run_with_umask, running_as_root, snapshot_all, token_of, unlock,
 };
 
 // ---------------------------------------------------------------------------
@@ -303,6 +304,44 @@ fn replace_and_backup_copies_a_directory_recursively_without_partial_residue() {
 }
 
 // ---------------------------------------------------------------------------
+// 受限 umask: 目录备份的暂存根立即收紧到 0700, 不受进程 umask 影响
+// ---------------------------------------------------------------------------
+
+/// `mkdir` 仍会应用进程 umask. 若暂存目录不立即恢复 owner rwx, `0200` (剥离 owner
+/// 写) 与 `0777` (清空全部权限位) 都会使后续子项创建失败. 两种 umask 下目录 replace
+/// 都必须完整成功.
+#[test]
+fn directory_replace_succeeds_under_a_restrictive_umask() {
+    for mask in ["0200", "0777"] {
+        let env = TempEnv::new();
+        env.write_source("nvim/init.lua", "managed\n");
+        env.write_manifest(&manifest_of(&[(
+            "nvim/init.lua",
+            "~/.config/nvim",
+            "replace_and_backup",
+        )]));
+
+        let target = env.home().join(".config/nvim");
+        fs::create_dir_all(target.join("lua")).unwrap();
+        fs::write(target.join("init.lua"), "old\n").unwrap();
+        fs::write(target.join("lua/a.lua"), "old-a\n").unwrap();
+
+        let run = run_with_umask(&env, mask, &["apply"]);
+
+        assert_eq!(
+            run.code, 0,
+            "umask {mask} 下目录 replace 必须成功:\nstdout:\n{}\nstderr:\n{}",
+            run.stdout, run.stderr
+        );
+        assert_token(&run, "replace");
+        let backup = backup_path_from_output(&run.stdout);
+        env.assert_content(&backup.join("init.lua"), "old\n");
+        env.assert_content(&backup.join("lua/a.lua"), "old-a\n");
+        env.assert_symlink_to(&target, &env.repo().join("nvim/init.lua"));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // (g) 冲突跳过的条目不影响其余条目 (FR-014)
 // ---------------------------------------------------------------------------
 
@@ -576,10 +615,10 @@ fn a_directory_containing_a_socket_is_not_prechecked_by_preview_but_fails_apply(
     fs::write(target.join("init.lua"), "user content\n").unwrap();
     let socket = target.join("S.gpg-agent");
     let _listener = make_socket(&socket);
-    let before = snapshot_all(&env);
     let identities = (file_identity(&target), file_identity(&socket));
 
     // preview 只对目标做一次 lstat, 不遍历目录内容: 仍预测 replace 与备份路径.
+    let before_preview = snapshot_all(&env);
     let preview = run(&env, &["preview"]);
     assert_eq!(preview.code, 1, "{}", preview.stdout);
     let line = line_for(&preview.stdout, "~/.config/nvim");
@@ -588,8 +627,14 @@ fn a_directory_containing_a_socket_is_not_prechecked_by_preview_but_fails_apply(
         line.contains(".dotlink-backup."),
         "preview 仍预测备份路径: {line}"
     );
-    assert_eq!(before, snapshot_all(&env), "preview 必须完全只读");
+    assert_eq!(before_preview, snapshot_all(&env), "preview 必须完全只读");
 
+    // apply 会先建备份暂存根再失败清理, 父目录的 mtime 因此可能改变; 这里逐命令
+    // 比较路径集合, 并要求内容与对象身份保持原样.
+    let paths_before_apply: Vec<_> = snapshot_all(&env)
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect();
     let apply = run(&env, &["apply"]);
     assert_eq!(apply.code, 1, "{}", apply.stdout);
     let line = line_for(&apply.stdout, "~/.config/nvim");
@@ -602,14 +647,30 @@ fn a_directory_containing_a_socket_is_not_prechecked_by_preview_but_fails_apply(
         line.contains("请先手工移走该特殊文件再重试"),
         "fail 行必须给出下一步动作: {line}"
     );
+
+    let after_apply = snapshot_all(&env);
+    let paths_after_apply: Vec<_> = after_apply.iter().map(|(path, _)| path.clone()).collect();
     assert_eq!(
-        before,
-        snapshot_all(&env),
-        "整体失败不得发布备份, 目录与 socket 必须保持原样"
+        paths_after_apply, paths_before_apply,
+        "整体失败不得发布备份或留下暂存残留: {after_apply:?}"
+    );
+    assert!(
+        after_apply
+            .iter()
+            .all(|(path, _)| !path.to_string_lossy().contains(".dotlink-backup.")),
+        "整体失败不得发布部分备份: {after_apply:?}"
     );
     assert_eq!(
         identities,
         (file_identity(&target), file_identity(&socket)),
         "目录与 socket 必须保持同一个对象"
     );
+    assert!(fs::symlink_metadata(&target).unwrap().is_dir());
+    assert!(
+        fs::symlink_metadata(&socket)
+            .unwrap()
+            .file_type()
+            .is_socket()
+    );
+    env.assert_content(&target.join("init.lua"), "user content\n");
 }

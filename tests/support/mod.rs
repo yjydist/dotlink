@@ -43,6 +43,24 @@ impl TempEnv {
         &self.repo
     }
 
+    /// 创建仓库与 HOME 互不包含的夹具: 同一临时根下的 `repo` 与 `homebase/user`.
+    ///
+    /// 默认布局 (`new`) 中仓库是 HOME 的祖先, V-9 的仓库祖先检查会先命中祖先落点;
+    /// 需要单独验证主目录祖先判定 (V-9c) 的用例使用本构造.
+    pub fn with_home_outside_repo() -> Self {
+        let dir = tempfile::tempdir().expect("创建临时目录");
+        let root = fs::canonicalize(dir.path()).expect("解析临时目录的物理路径");
+        let repo = root.join("repo");
+        let home = root.join("homebase/user");
+        fs::create_dir_all(&repo).expect("创建仓库根");
+        fs::create_dir_all(&home).expect("创建临时 HOME");
+        Self {
+            _dir: dir,
+            repo,
+            home,
+        }
+    }
+
     /// 临时主目录.
     pub fn home(&self) -> &Path {
         &self.home
@@ -119,9 +137,11 @@ impl TempEnv {
         names
     }
 
-    /// 递归快照: 每个条目的路径 + (文件内容 | 链接文本), 用于断言"零改动".
+    /// 递归快照: 每个条目的路径 + lstat 元数据 (+ 文件内容 | 链接文本).
     ///
-    /// 只覆盖 `root` 之下的路径, 不包含 `root` 自身.
+    /// 元数据含对象类型, mode, 设备号与 inode, 以及 mtime (秒 + 纳秒); 不记录 atime,
+    /// 因为读取内容或列举目录本身就会改变它. 这样 chmod, 对象替换与 touch 都能被
+    /// "零改动"断言发现. 只覆盖 `root` 之下的路径, 不包含 `root` 自身.
     pub fn snapshot(&self, root: &Path) -> Vec<(PathBuf, String)> {
         let mut rows = Vec::new();
         collect(root, &mut rows);
@@ -147,6 +167,30 @@ pub struct Run {
 pub fn run(env: &TempEnv, args: &[&str]) -> Run {
     let assert = env.cmd().args(args).assert();
     let output = assert.get_output();
+    Run {
+        code: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+/// 在指定的进程 `umask` 下运行 `dotlink <args...>`.
+///
+/// `std::process::Command` 没有 umask 接口, 而 `pre_exec` 需要 `unsafe` (本 crate
+/// 禁止). 这里用 `sh -c` 在 exec 前设置 umask, 其余环境与 [`run`] 一致.
+pub fn run_with_umask(env: &TempEnv, mask: &str, args: &[&str]) -> Run {
+    let binary = assert_cmd::cargo::cargo_bin("dotlink");
+    let mut command = std::process::Command::new("sh");
+    command
+        .arg("-c")
+        .arg(format!("umask {mask}; exec \"$0\" \"$@\""))
+        .arg(binary)
+        .args(args)
+        .current_dir(env.repo())
+        .env("HOME", env.home())
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("USERPROFILE");
+    let output = command.output().expect("运行 dotlink (umask)");
     Run {
         code: output.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -225,7 +269,7 @@ pub fn assert_token(run: &Run, token: &str) {
     );
 }
 
-/// 仓库 + HOME 的递归快照 (路径 + 文件内容 / 链接文本), 用于断言"零改动".
+/// 仓库 + HOME 的递归快照 (路径 + lstat 元数据 / 文件内容 / 链接文本), 用于断言"零改动".
 ///
 /// HOME 位于仓库之内 (夹具如此), 两份递归会重叠出重复项; 这里排序后按路径去重,
 /// 使"前后比对"不受重复影响.
@@ -377,20 +421,21 @@ pub fn backup_candidate_from_output(stdout: &str) -> PathBuf {
 }
 
 /// 以 root 运行时权限位无效 (chmod 000 不阻止读取), 依赖 `EACCES` 的断言必须跳过.
+///
+/// 每次调用使用独立的临时目录 (`tempfile::tempdir()`), 并行调用不会互相干扰;
+/// 探测结束后恢复权限位, 保证临时目录能被清理.
 pub fn running_as_root() -> bool {
-    let probe = std::env::temp_dir().join(format!("dotlink-root-probe-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&probe);
-    if fs::create_dir_all(&probe).is_err() {
+    let Ok(dir) = tempfile::tempdir() else {
         return false;
-    }
-    let locked = probe.join("locked");
-    let outcome = fs::create_dir_all(&locked)
+    };
+    let locked = dir.path().join("locked");
+    let outcome = fs::create_dir(&locked)
         .and_then(|()| {
             fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o000))
         })
         .and_then(|()| fs::read_dir(&locked).map(|_| ()));
     let as_root = outcome.is_ok();
-    let _ = fs::remove_dir_all(&probe);
+    let _ = fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o700));
     as_root
 }
 
@@ -423,26 +468,67 @@ fn collect(path: &Path, rows: &mut Vec<(PathBuf, String)>) {
     let Ok(meta) = fs::symlink_metadata(path) else {
         return;
     };
+    let described = describe_metadata(&meta);
 
     if meta.file_type().is_symlink() {
         let raw = fs::read_link(path).expect("读取链接文本");
-        rows.push((path.to_path_buf(), format!("link -> {}", raw.display())));
+        rows.push((
+            path.to_path_buf(),
+            format!("link -> {} [{described}]", raw.display()),
+        ));
         return;
     }
 
     if meta.is_file() {
         let content = fs::read_to_string(path).unwrap_or_else(|_| "<binary>".to_string());
-        rows.push((path.to_path_buf(), content));
+        rows.push((path.to_path_buf(), format!("file [{described}] {content}")));
         return;
     }
 
-    rows.push((path.to_path_buf(), "dir".to_string()));
+    rows.push((path.to_path_buf(), described));
+    if !meta.is_dir() {
+        return;
+    }
     let Ok(entries) = fs::read_dir(path) else {
         return;
     };
     for entry in entries.flatten() {
         collect(&entry.path(), rows);
     }
+}
+
+/// 用一行文本描述 lstat 元数据: 类型, mode, 设备号, inode 与 mtime.
+///
+/// mtime 写成固定宽度的秒 + 纳秒, 使快照比较不依赖格式化差异; atime 刻意不记录.
+fn describe_metadata(meta: &fs::Metadata) -> String {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let file_type = meta.file_type();
+    let kind = if file_type.is_symlink() {
+        "symlink"
+    } else if file_type.is_dir() {
+        "dir"
+    } else if file_type.is_file() {
+        "file"
+    } else if file_type.is_fifo() {
+        "fifo"
+    } else if file_type.is_socket() {
+        "socket"
+    } else if file_type.is_block_device() {
+        "block-device"
+    } else if file_type.is_char_device() {
+        "char-device"
+    } else {
+        "other"
+    };
+    format!(
+        "type={kind} mode={:o} dev={} ino={} mtime={}.{:09}",
+        meta.mode(),
+        meta.dev(),
+        meta.ino(),
+        meta.mtime(),
+        meta.mtime_nsec()
+    )
 }
 
 /// 词法解析: 以 `base` 为基准把相对路径变为绝对路径, 并消除 `.` 与 `..`.

@@ -60,7 +60,10 @@ fn run_without_home(env: &TempEnv, args: &[&str]) -> Run {
 /// 用例同样退化成"清单不存在". 这两条是该用例沦为假阳性的两道防线.
 fn run_in_deleted_cwd(env: &TempEnv, args: &[&str]) -> Run {
     let binary = assert_cmd::cargo::cargo_bin("dotlink");
-    let gone = env.repo().join("gone-cwd");
+    // 临时 cwd 必须落在仓库与 HOME 之外: `mkdir` / `rmdir` 会改变父目录的 mtime,
+    // 放在仓库内会让"命令零改动"的快照把夹具自身的动作算成命令的改动.
+    let scratch = tempfile::tempdir().expect("创建 cwd 临时目录");
+    let gone = scratch.path().join("gone-cwd");
 
     let mut script =
         String::from("mkdir -p \"$1\" && cd \"$1\" && rmdir \"$1\" && unset PWD && exec \"$2\"");
@@ -92,15 +95,17 @@ fn observe(output: std::process::Output) -> Run {
 }
 
 /// 一条清单违规的完整断言: 四条命令都退 2, 标准输出为空, 标准错误指出 `needle`,
-/// 且整个过程**零改动**.
+/// 且每条命令各自**零改动**.
 ///
 /// `needle` 对应 `src/manifest.rs` 中该条规则的说明措辞 (V-1 到 V-10 的规则各有一
 /// 组措辞), 因此断言锁定的不是自由文本的措辞, 而是"哪一条规则被触发".
+///
+/// 前后快照放在循环内: 共享一份总快照只能证明四条命令的净效果为零, 后一条命令
+/// 可能抵消前一条命令的写入.
 #[track_caller]
 fn assert_all_commands_reject(env: &TempEnv, needle: &str) {
-    let before = snapshot_all(env);
-
     for command in COMMANDS {
+        let before = snapshot_all(env);
         let run = run(env, &[command]);
         assert_eq!(
             run.code, 2,
@@ -121,13 +126,12 @@ fn assert_all_commands_reject(env: &TempEnv, needle: &str) {
             "`{command}` 落的不是 clap 的用法错误路径: {}",
             run.stderr
         );
+        assert_eq!(
+            before,
+            snapshot_all(env),
+            "FR-013: 清单校验失败必须在任何文件系统改动之前完成 (`{command}` 零改动)"
+        );
     }
-
-    assert_eq!(
-        before,
-        snapshot_all(env),
-        "FR-013: 清单校验失败必须在任何文件系统改动之前完成 (零改动)"
-    );
 }
 
 /// 夹具: 一份合法清单所需的源文件, 使"零改动"具有判别力 (若命令真的跑起来, 它会
@@ -690,9 +694,9 @@ fn v9_the_manifest_file_itself_is_rejected() {
         env.write_manifest(&format!(
             "[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"{written}\"\n"
         ));
-        let before = snapshot_all(&env);
 
         for command in COMMANDS {
+            let before = snapshot_all(&env);
             let run = run(&env, &[command]);
             assert_eq!(
                 run.code, 2,
@@ -705,10 +709,45 @@ fn v9_the_manifest_file_itself_is_rejected() {
                 "V-9 必须指出清单文件自身与条目下标 (`{command}`): {}",
                 run.stderr
             );
+            assert_eq!(before, snapshot_all(&env), "零改动 ({written}, {command})");
         }
-
-        assert_eq!(before, snapshot_all(&env), "零改动 ({written})");
     }
+}
+
+#[test]
+fn v9_a_symlinked_manifest_protects_its_resolved_target() {
+    let env = env_with_source();
+    // `dotlink.toml` 本身是符号链接: 受保护的是它解析后的真实清单文件. 若只比较
+    // 书写形态, 以真实文件为落点的条目会漏过 V-9, 一次 replace_and_backup 就会
+    // 把唯一配置源备份并替换掉.
+    let actual = env.repo().join("actual-manifest.toml");
+    let body = format!(
+        "[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"{}\"\n",
+        actual.display()
+    );
+    fs::write(&actual, &body).expect("写入真实清单文件");
+    std::os::unix::fs::symlink(&actual, env.repo().join("dotlink.toml")).expect("建立清单符号链接");
+
+    assert_all_commands_reject(&env, "清单文件自身");
+
+    let run = run(&env, &["preview"]);
+    assert!(
+        run.stderr.contains("entry[0]") && run.stderr.contains("actual-manifest.toml"),
+        "V-9 必须指出条目下标与解析后的清单路径: {}",
+        run.stderr
+    );
+    assert!(
+        fs::symlink_metadata(env.repo().join("dotlink.toml"))
+            .expect("清单链接必须保留")
+            .file_type()
+            .is_symlink(),
+        "拒绝不得改写清单符号链接"
+    );
+    assert_eq!(
+        fs::read_to_string(&actual).expect("真实清单必须保留"),
+        body,
+        "拒绝不得改写真实清单文件"
+    );
 }
 
 #[test]
@@ -796,9 +835,9 @@ fn v9_a_symlinked_home_is_rejected_through_its_physical_form() {
         env.write_manifest(&format!(
             "[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"{written}\"\n"
         ));
-        let before = snapshot_all(&env);
 
         for command in COMMANDS {
+            let before = snapshot_all(&env);
             let run = observe(
                 env.cmd()
                     .env("HOME", &alias)
@@ -817,9 +856,8 @@ fn v9_a_symlinked_home_is_rejected_through_its_physical_form() {
                 "V-9 必须指出主目录落点与条目下标 (`{command}`): {}",
                 run.stderr
             );
+            assert_eq!(before, snapshot_all(&env), "零改动 ({written}, {command})");
         }
-
-        assert_eq!(before, snapshot_all(&env), "零改动 ({written})");
     }
 }
 
@@ -846,6 +884,124 @@ fn v9_a_symlinked_home_still_allows_targets_below_it() {
     env.assert_symlink_to(
         &env.home().join(".bashrc"),
         &env.repo().join("shell/bashrc"),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// V-9c: 主目录的祖先也是受保护落点, 且 `~` 简写不得经 `..` 离开主目录
+// ---------------------------------------------------------------------------
+
+/// `~/..` 等形式要求仓库与 HOME 互不包含: 默认夹具的仓库是 HOME 的祖先, 会让仓库
+/// 祖先检查先命中, 测不到主目录祖先判定.
+fn split_env_with_source() -> TempEnv {
+    let env = TempEnv::with_home_outside_repo();
+    env.write_source("shell/bashrc", "managed\n");
+    env
+}
+
+#[test]
+fn v9c_home_ancestor_targets_reject_all_commands_before_any_change() {
+    let env = split_env_with_source();
+    let absolute_parent = env
+        .home()
+        .parent()
+        .expect("HOME 必须有父目录")
+        .display()
+        .to_string();
+    let cases = [
+        ("~/..".to_string(), "主目录的祖先"),
+        ("~//../x".to_string(), "主目录及其之下"),
+        (absolute_parent, "主目录的祖先"),
+    ];
+
+    for (written, needle) in &cases {
+        env.write_manifest(&format!(
+            "[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"{written}\"\n"
+        ));
+
+        assert_all_commands_reject(&env, needle);
+
+        let run = run(&env, &["preview"]);
+        assert!(
+            run.stderr.contains("entry[0]") && run.stderr.contains(&format!("`{written}`")),
+            "V-9c 必须指出条目下标与书写形态 {written}: {}",
+            run.stderr
+        );
+    }
+}
+
+#[test]
+fn v9c_legal_targets_and_missing_home_still_work() {
+    let env = split_env_with_source();
+    // `~/sub` 与仓库外的合法绝对路径仍成功.
+    let outside = tempfile::tempdir().expect("创建仓库外目录");
+    let outside = fs::canonicalize(outside.path()).expect("仓库外目录的物理路径");
+    env.write_manifest(&format!(
+        "[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"~/sub/bashrc\"\n\n\
+         [[entry]]\nsource = \"shell/bashrc\"\ntarget = \"{}/abs/bashrc\"\n",
+        outside.display()
+    ));
+
+    let run = run(&env, &["apply"]);
+    assert_eq!(
+        run.code, 0,
+        "合法落点不得被 V-9c 误伤:\nstdout:\n{}\nstderr:\n{}",
+        run.stdout, run.stderr
+    );
+    env.assert_symlink_to(
+        &env.home().join("sub/bashrc"),
+        &env.repo().join("shell/bashrc"),
+    );
+    env.assert_symlink_to(
+        &outside.join("abs/bashrc"),
+        &env.repo().join("shell/bashrc"),
+    );
+
+    // HOME 缺失时绝对 target 不被误拒.
+    let env = split_env_with_source();
+    let target = env.repo().join("linked/bashrc");
+    env.write_manifest(&format!(
+        "[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"{}\"\n",
+        target.display()
+    ));
+    let run = run_without_home(&env, &["apply"]);
+    assert_eq!(
+        run.code, 0,
+        "HOME 缺失不影响绝对 target:\nstdout:\n{}\nstderr:\n{}",
+        run.stdout, run.stderr
+    );
+    env.assert_symlink_to(&target, &env.repo().join("shell/bashrc"));
+}
+
+#[test]
+fn v9c_case_alias_of_a_home_ancestor_is_rejected() {
+    if !case_insensitive_volume() {
+        println!(
+            "跳过 v9c_case_alias_of_a_home_ancestor_is_rejected: 当前卷大小写敏感, 无法构造大小写别名"
+        );
+        return;
+    }
+
+    let env = split_env_with_source();
+    let parent = env.home().parent().expect("HOME 必须有父目录");
+    let written = parent.display().to_string().to_uppercase();
+    if written == parent.display().to_string() {
+        println!("跳过 v9c_case_alias_of_a_home_ancestor_is_rejected: 路径不含可改变大小写的字符");
+        return;
+    }
+
+    env.write_manifest(&format!(
+        "[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"{written}\"\n"
+    ));
+
+    // 字符串比较不命中 (大小写不同), 只有文件系统身份能识别出同一个祖先.
+    assert_all_commands_reject(&env, "主目录的祖先");
+
+    let run = run(&env, &["preview"]);
+    assert!(
+        run.stderr.contains("entry[0]") && run.stderr.contains(&format!("`{written}`")),
+        "V-9c 必须指出条目下标与书写形态 {written}: {}",
+        run.stderr
     );
 }
 
@@ -1016,6 +1172,135 @@ fn v11_alias_directory_nesting_is_rejected_before_writes() {
 }
 
 #[test]
+fn v11_a_symlinked_parent_target_with_a_nested_child_rejects_all_commands() {
+    let env = env_with_source();
+    env.make_source_dir("nvim");
+    let referent = env.repo().join("data/nvim");
+    fs::create_dir_all(&referent).expect("创建 referent 目录");
+    let parent = env.home().join(".config");
+    std::os::unix::fs::symlink(env.repo().join("data"), &parent).expect("建立父目标链接");
+
+    // 第一个目标是符号链接; 第二个目标的祖先经它解析到 referent, 词法形态看起来
+    // 不嵌套, 只有比较形态能发现.
+    env.write_manifest(
+        "[[entry]]\nsource = \"nvim\"\ntarget = \"~/.config\"\n\n\
+         [[entry]]\nsource = \"shell/bashrc\"\ntarget = \"~/.config/nvim/init.lua\"\n",
+    );
+
+    assert_all_commands_reject(&env, "路径重叠");
+
+    let run = run(&env, &["preview"]);
+    assert!(
+        run.stderr.contains("entry[0]") && run.stderr.contains("entry[1]"),
+        "V-11 必须指出相关条目: {}",
+        run.stderr
+    );
+    assert!(
+        fs::symlink_metadata(&parent)
+            .expect("父目标必须保持原样")
+            .file_type()
+            .is_symlink(),
+        "拒绝不得改动符号链接父目标"
+    );
+    assert!(
+        fs::symlink_metadata(referent.join("init.lua")).is_err(),
+        "拒绝必须发生在建链之前"
+    );
+    assert!(backups_in(env.home()).is_empty(), "拒绝不得写备份");
+}
+
+#[test]
+fn v10_a_source_symlink_pointing_at_the_target_rejects_before_writing() {
+    let env = env_with_source();
+    let target = env.home().join(".forwarded");
+    std::os::unix::fs::symlink(&target, env.repo().join("link")).expect("建立源符号链接");
+    env.write_manifest("[[entry]]\nsource = \"link\"\ntarget = \"~/.forwarded\"\n");
+    let manifest_before = fs::read_to_string(env.repo().join("dotlink.toml")).expect("读取清单");
+
+    assert_all_commands_reject(&env, "自指");
+
+    let run = run(&env, &["apply"]);
+    assert!(
+        run.stderr.contains("符号链接解析目标"),
+        "V-10 说明必须指出源符号链接的解析目标: {}",
+        run.stderr
+    );
+    assert!(
+        fs::symlink_metadata(&target).is_err(),
+        "拒绝必须发生在建链之前: {}",
+        target.display()
+    );
+    assert_eq!(
+        fs::read_to_string(env.repo().join("dotlink.toml")).expect("读取清单"),
+        manifest_before,
+        "被拒绝的清单文件必须保持不变"
+    );
+}
+
+#[test]
+fn a_single_target_below_a_symlinked_parent_is_accepted_and_remains_ok() {
+    let env = env_with_source();
+    let referent = env.home().join("config-data");
+    fs::create_dir_all(&referent).expect("创建 referent 目录");
+    let parent = env.home().join(".config");
+    std::os::unix::fs::symlink(&referent, &parent).expect("建立父目录链接");
+    env.write_manifest(
+        "[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"~/.config/nvim/init.lua\"\n",
+    );
+
+    let apply = run(&env, &["apply"]);
+    assert_eq!(
+        apply.code, 0,
+        "单一目标位于符号链接父目录下必须被接受并部署:\nstdout:\n{}\nstderr:\n{}",
+        apply.stdout, apply.stderr
+    );
+    env.assert_symlink_to(
+        &referent.join("nvim/init.lua"),
+        &env.repo().join("shell/bashrc"),
+    );
+
+    let status = run(&env, &["status"]);
+    assert_eq!(
+        status.code, 0,
+        "部署后 status 必须报告一致:\nstdout:\n{}\nstderr:\n{}",
+        status.stdout, status.stderr
+    );
+    assert_eq!(
+        token_of(line_for(&status.stdout, "~/.config/nvim/init.lua")),
+        "ok",
+        "{}",
+        status.stdout
+    );
+}
+
+#[test]
+fn v5_a_symlink_target_whose_referent_is_another_entries_target_is_rejected() {
+    let env = env_with_source();
+    env.write_source("other", "other\n");
+    let referent = env.repo().join("shared-target");
+    fs::write(&referent, "occupied\n").expect("创建另一条目的目标");
+    let alias = env.home().join(".alias");
+    std::os::unix::fs::symlink(&referent, &alias).expect("建立目标别名链接");
+
+    env.write_manifest(&format!(
+        "[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"~/.alias\"\n\n\
+         [[entry]]\nsource = \"other\"\ntarget = \"{}\"\n",
+        referent.display()
+    ));
+
+    assert_all_commands_reject(&env, "目标路径");
+
+    let run = run(&env, &["preview"]);
+    assert!(
+        run.stderr.contains("entry[0]")
+            && run.stderr.contains("entry[1]")
+            && run.stderr.contains("符号链接目标与它解析后的对象"),
+        "V-5 必须指出两个条目与命中的比较形态: {}",
+        run.stderr
+    );
+}
+
+#[test]
 fn v9_a_firmlink_alias_of_home_is_rejected() {
     if !cfg!(target_os = "macos") {
         println!("跳过 v9_a_firmlink_alias_of_home_is_rejected: firmlink 仅存在于 macOS");
@@ -1049,6 +1334,201 @@ fn v9_a_firmlink_alias_of_home_is_rejected() {
 }
 
 // ---------------------------------------------------------------------------
+// V-12: 目标 basename 的字节预算 (按 UTF-8 字节, 不是字符数)
+// ---------------------------------------------------------------------------
+
+/// 当前文件系统是否接受给定字节数的单段名; 更小的 NAME_MAX 上跳过依赖它的用例.
+fn supports_basename_len(dir: &Path, bytes: usize) -> bool {
+    let probe = dir.join("p".repeat(bytes));
+    match fs::write(&probe, "") {
+        Ok(()) => {
+            let _ = fs::remove_file(&probe);
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidFilename => false,
+        Err(error) => panic!("创建单段名探针失败: {error}"),
+    }
+}
+
+#[test]
+fn v12_a_two_hundred_byte_basename_is_accepted_and_deployed() {
+    let env = env_with_source();
+    let name = "a".repeat(200);
+    if !supports_basename_len(env.home(), name.len()) {
+        println!(
+            "跳过 v12_a_two_hundred_byte_basename_is_accepted_and_deployed: 当前文件系统的 NAME_MAX 小于 200 字节"
+        );
+        return;
+    }
+
+    env.write_manifest(&format!(
+        "[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"~/{name}\"\n"
+    ));
+
+    let run = run(&env, &["apply"]);
+    assert_eq!(
+        run.code, 0,
+        "200 字节 basename 必须被接受并成功部署;\nstdout:\n{}\nstderr:\n{}",
+        run.stdout, run.stderr
+    );
+    assert_eq!(
+        token_of(line_for(&run.stdout, &name)),
+        "create",
+        "{}",
+        run.stdout
+    );
+    env.assert_symlink_to(&env.home().join(&name), &env.repo().join("shell/bashrc"));
+}
+
+#[test]
+fn v12_a_two_hundred_one_byte_basename_is_rejected_before_any_change() {
+    let env = env_with_source();
+    let name = "a".repeat(201);
+    env.write_manifest(&format!(
+        "[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"~/{name}\"\n"
+    ));
+
+    assert_all_commands_reject(&env, "末段 basename");
+
+    let run = run(&env, &["preview"]);
+    for needle in ["entry[0]", "201", "200", name.as_str()] {
+        assert!(
+            run.stderr.contains(needle),
+            "V-12 说明必须包含 {needle:?}: {}",
+            run.stderr
+        );
+    }
+}
+
+#[test]
+fn v12_multibyte_basenames_are_counted_in_utf8_bytes() {
+    let env = env_with_source();
+    // 67 个 3 字节字符共 201 字节, 显示宽度只有 134 列.
+    let name = "日".repeat(67);
+    assert_eq!(name.len(), 201);
+    env.write_manifest(&format!(
+        "[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"~/{name}\"\n"
+    ));
+
+    assert_all_commands_reject(&env, "末段 basename");
+
+    let run = run(&env, &["preview"]);
+    assert!(
+        run.stderr.contains("201") && run.stderr.contains("200"),
+        "V-12 必须按字节给出实际值与上限: {}",
+        run.stderr
+    );
+    assert!(
+        !run.stderr.contains("67 字节"),
+        "不得按字符数报告: {}",
+        run.stderr
+    );
+}
+
+#[test]
+fn v12_a_target_that_would_only_be_created_is_still_rejected() {
+    let env = env_with_source();
+    let name = "a".repeat(201);
+    // 目标尚不存在: apply 本次只会创建链接, 不涉及备份.
+    assert!(fs::symlink_metadata(env.home().join(&name)).is_err());
+    env.write_manifest(&format!(
+        "[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"~/{name}\"\n"
+    ));
+
+    let run = run(&env, &["apply"]);
+    assert_eq!(
+        run.code, 2,
+        "只创建链接的条目仍须在清单层拒绝;\nstdout:\n{}\nstderr:\n{}",
+        run.stdout, run.stderr
+    );
+    assert_eq!(run.stdout, "", "校验失败不得产生任何标准输出");
+    assert!(
+        run.stderr.contains("末段 basename"),
+        "说明必须指出 basename 预算: {}",
+        run.stderr
+    );
+    assert!(
+        fs::symlink_metadata(env.home().join(&name)).is_err(),
+        "拒绝必须发生在建链之前"
+    );
+    assert!(backups_in(env.home()).is_empty(), "不得写备份");
+}
+
+// ---------------------------------------------------------------------------
+// V-13: 目标完整路径预算 (平台 PATH_MAX 减去生成后缀预留)
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+const PLATFORM_PATH_MAX_BYTES: usize = 4096;
+#[cfg(target_os = "macos")]
+const PLATFORM_PATH_MAX_BYTES: usize = 1024;
+// 其他平台只为可编译而给出保守值; 端到端测试只在 Linux 与 macOS 运行.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const PLATFORM_PATH_MAX_BYTES: usize = 1024;
+
+/// 生成名最长后缀的预留字节数; 与 `entry::MAX_GENERATED_SUFFIX_RESERVE_BYTES` 同步.
+const SUFFIX_RESERVE_BYTES: usize = 55;
+
+/// 在 `base` 下构造总字节数恰为 `total` 的绝对路径, 每段不超过 100 字节.
+fn path_under(base: &Path, total: usize) -> String {
+    let mut path = base.display().to_string();
+    assert!(total > path.len() + 1, "目标长度必须给末段留出空间");
+    let mut remaining = total - path.len();
+    while remaining > 0 {
+        let mut len = (remaining - 1).min(100);
+        if remaining - len - 1 == 1 {
+            len -= 1;
+        }
+        assert!(len >= 1, "剩余字节不足以追加一段");
+        path.push('/');
+        path.push_str(&"a".repeat(len));
+        remaining -= len + 1;
+    }
+    assert_eq!(path.len(), total);
+    path
+}
+
+#[test]
+fn v13_an_over_budget_target_rejects_all_commands_before_any_change() {
+    let env = env_with_source();
+    let budget = PLATFORM_PATH_MAX_BYTES - SUFFIX_RESERVE_BYTES;
+    let target = path_under(env.home(), budget + 1);
+    env.write_manifest(&format!(
+        "[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"{target}\"\n"
+    ));
+
+    assert_all_commands_reject(&env, "完整路径");
+
+    let run = run(&env, &["preview"]);
+    for needle in [
+        "entry[0]".to_string(),
+        "完整路径".to_string(),
+        (budget + 1).to_string(),
+        budget.to_string(),
+    ] {
+        assert!(
+            run.stderr.contains(&needle),
+            "V-13 说明必须包含 {needle:?}: {}",
+            run.stderr
+        );
+    }
+
+    // 目标, 其父目录与备份目录都必须保持原样.
+    let target = Path::new(&target);
+    assert!(
+        fs::symlink_metadata(target).is_err(),
+        "拒绝必须发生在建链之前: {}",
+        target.display()
+    );
+    assert!(
+        fs::symlink_metadata(target.parent().unwrap()).is_err(),
+        "拒绝不得创建目标的父目录: {}",
+        target.parent().unwrap().display()
+    );
+    assert!(backups_in(env.home()).is_empty(), "不得写备份");
+}
+
+// ---------------------------------------------------------------------------
 // 补充 1: FR-015 不向上搜索父目录
 // ---------------------------------------------------------------------------
 
@@ -1061,9 +1541,8 @@ fn the_manifest_is_not_searched_in_parent_directories() {
     let nested = env.repo().join("sub/deeper");
     fs::create_dir_all(&nested).expect("创建子目录");
 
-    let before = snapshot_all(&env);
-
     for command in COMMANDS {
+        let before = snapshot_all(&env);
         let run = run_in(&env, &nested, &[command]);
         assert_eq!(
             run.code, 2,
@@ -1076,9 +1555,8 @@ fn the_manifest_is_not_searched_in_parent_directories() {
             "说明必须可区分于 `当前工作目录不可用`: {}",
             run.stderr
         );
+        assert_eq!(before, snapshot_all(&env), "零改动 (`{command}`)");
     }
-
-    assert_eq!(before, snapshot_all(&env), "零改动");
 }
 
 // ---------------------------------------------------------------------------
@@ -1090,9 +1568,8 @@ fn an_unavailable_cwd_is_rejected_and_distinguished_from_a_missing_manifest() {
     let env = env_with_source();
     env.write_manifest("[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"~/.bashrc\"\n");
 
-    let before = snapshot_all(&env);
-
     for command in COMMANDS {
+        let before = snapshot_all(&env);
         let run = run_in_deleted_cwd(&env, &[command]);
         assert_eq!(
             run.code, 2,
@@ -1122,9 +1599,8 @@ fn an_unavailable_cwd_is_rejected_and_distinguished_from_a_missing_manifest() {
             "子进程必须真的跑到了 dotlink: {}",
             run.stderr
         );
+        assert_eq!(before, snapshot_all(&env), "零改动 (`{command}`)");
     }
-
-    assert_eq!(before, snapshot_all(&env), "零改动");
 }
 
 // ---------------------------------------------------------------------------
@@ -1137,9 +1613,8 @@ fn home_is_unresolvable_without_the_home_variable() {
     // 绝对路径的目标不需要 HOME, 因此该清单只在 `~` 上依赖主目录.
     env.write_manifest("[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"~/.bashrc\"\n");
 
-    let before = snapshot_all(&env);
-
     for command in COMMANDS {
+        let before = snapshot_all(&env);
         let run = run_without_home(&env, &[command]);
         assert_eq!(
             run.code, 2,
@@ -1157,18 +1632,17 @@ fn home_is_unresolvable_without_the_home_variable() {
             "说明必须指出 HOME 未设置或为空: {}",
             run.stderr
         );
+        assert_eq!(before, snapshot_all(&env), "零改动 (`{command}`)");
     }
-
-    assert_eq!(before, snapshot_all(&env), "零改动");
 }
 
 #[test]
 fn tilde_targets_reject_empty_or_relative_home_before_any_writes() {
     let env = env_with_source();
     env.write_manifest("[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"link/rc\"\n\n[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"~/.rc\"\n");
-    let before = snapshot_all(&env);
     for home in ["", "relative-home", ".", "../home"] {
         for command in COMMANDS {
+            let before = snapshot_all(&env);
             let result = observe(env.cmd().env("HOME", home).arg(command).output().unwrap());
             assert_eq!(result.code, 2, "{home:?}/{command}: {}", result.stdout);
             assert!(result.stdout.is_empty());

@@ -24,8 +24,11 @@ use crate::entry::Entry;
 use crate::error::{Error, Result};
 use crate::os;
 
-/// 撤销路径的暂存标签; 与替换路径的 `dotlink-replace.partial` 区分, 便于诊断残留.
-const UNDO_STAGING_LABEL: &str = "dotlink-undo.partial";
+/// 撤销路径的暂存标签; 与替换路径的 `dotlink-replace` 区分, 便于诊断残留.
+///
+/// 完整暂存名为 `<原名>.<pid>.<label>.partial`, 消歧序号插在 `label` 与 `.partial`
+/// 之间 (由 `os::stage_aside` 负责).
+const UNDO_STAGING_LABEL: &str = "dotlink-undo";
 
 /// 撤销单个条目.
 ///
@@ -250,9 +253,9 @@ mod tests {
     use crate::entry::OnConflict;
     use crate::os;
 
-    /// 测试侧的暂存候选名; 与生产路径共用 `os::staging_path`, 避免两套命名规则.
+    /// 测试侧的暂存候选名; 与生产路径共用 `os::staging_candidate`, 避免两套命名规则.
     fn aside_path(target: &Path) -> PathBuf {
-        os::staging_path(target, UNDO_STAGING_LABEL)
+        os::staging_candidate(target, UNDO_STAGING_LABEL, 1)
     }
 
     fn entry_for(repo: &Path, source: &str, target: &Path) -> Entry {
@@ -463,13 +466,9 @@ mod tests {
         let backup = target.with_file_name("bashrc.dotlink-backup.20260101T000000");
         fs::write(&backup, "original").unwrap();
 
-        let base = aside_path(&target);
-        let mut occupied = vec![base.clone()];
-        for serial in 2..=4 {
-            let mut name = base.as_os_str().to_os_string();
-            name.push(format!(".{serial}"));
-            occupied.push(PathBuf::from(name));
-        }
+        let occupied: Vec<PathBuf> = (1..=4)
+            .map(|serial| os::staging_candidate(&target, UNDO_STAGING_LABEL, serial))
+            .collect();
         fs::write(&occupied[0], "user file").unwrap();
         os::create_symlink(Path::new("managed"), &occupied[1]).unwrap();
         os::create_symlink(Path::new("missing"), &occupied[2]).unwrap();

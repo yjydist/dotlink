@@ -5,6 +5,83 @@ use std::path::{Path, PathBuf};
 use crate::error::{Error, Result};
 use crate::os;
 
+/// 清单校验使用的最长目标 basename 字节预算 (V-12).
+///
+/// 按 UTF-8 字节计数, 不是字符数或显示宽度. 该预算为备份最终名, 备份暂存名,
+/// 恢复暂存名与 apply/undo 暂存名的固定后缀预留空间; 后缀审计见
+/// [`MAX_GENERATED_SUFFIX_BYTES`].
+pub(crate) const MAX_TARGET_BASENAME_BYTES: usize = 200;
+
+/// 审计出的当前最长生成名后缀 (按 2 位消歧序号计): 50 字节.
+///
+/// 最长形态是备份暂存名: `.dotlink-backup.` (16) + 15 位时间戳 + `.` +
+/// 7 位 pid + `.` + 2 位序号 + `.partial` (8) = 50. 其余形态都更短:
+/// 备份最终名 16 + 15 + `.` + 2 = 34; 恢复暂存名 `.` + 7 + `.` + 2 +
+/// `.dotlink-restore.partial` (24) = 35; apply 暂存名 `.` + 7 + `.` +
+/// `dotlink-replace.partial` (23) + `.` + 2 = 35; undo 暂存名 `.` + 7 + `.` +
+/// `dotlink-undo.partial` (20) + `.` + 2 = 32.
+///
+/// 200 + 50 = 250, 不超过常见文件系统的 NAME_MAX 255.
+///
+/// 完整路径预算的分解为: 绝对路径前缀 (文件系统根 `/`, 1 字节), 各目录段与分隔符,
+/// 不超过 [`MAX_TARGET_BASENAME_BYTES`] 的 target basename, 以及最长生成后缀
+/// [`MAX_GENERATED_SUFFIX_BYTES`]. `bound-target-path-length` 的 V-13 复用这两个
+/// 常量与上述分解, 不另写一套预算.
+pub(crate) const MAX_GENERATED_SUFFIX_BYTES: usize = 50;
+
+/// 平台路径上限 (PATH_MAX), 按字节计.
+///
+/// Linux 取 `<limits.h>` 的 4096, macOS 取 `<sys/syslimits.h>` 的 1024. 其他平台
+/// 给出与 macOS 相同的保守值, 只为保证可编译: 平台门禁会在参数解析与清单读取之前
+/// 以退出码 3 结束进程, 常量不参与那些平台的运行时行为.
+#[cfg(target_os = "linux")]
+pub(crate) const PLATFORM_PATH_MAX_BYTES: usize = 4096;
+#[cfg(target_os = "macos")]
+pub(crate) const PLATFORM_PATH_MAX_BYTES: usize = 1024;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) const PLATFORM_PATH_MAX_BYTES: usize = 1024;
+
+/// 生成名后缀在完整路径预算中的预留字节数: 审计值 50 加 5 字节安全余量.
+///
+/// [`MAX_GENERATED_SUFFIX_BYTES`] 是当前最长生成名的审计值, 额外的 5 字节吸收
+/// 实现细节变化 (例如更长的标签或序号), 使 "清单接受即四条命令可用" 不因后缀
+/// 小改动而失效. 命名侧测试锁定实际最长后缀不超过预留.
+pub(crate) const MAX_GENERATED_SUFFIX_RESERVE_BYTES: usize = MAX_GENERATED_SUFFIX_BYTES + 5;
+
+// 编译期不变量: 实际最长后缀必须落在预留内, 且预留后仍有正的目标预算.
+const _: () = assert!(MAX_GENERATED_SUFFIX_BYTES <= MAX_GENERATED_SUFFIX_RESERVE_BYTES);
+const _: () = assert!(MAX_GENERATED_SUFFIX_RESERVE_BYTES < PLATFORM_PATH_MAX_BYTES);
+const _: () = assert!(MAX_GENERATED_SUFFIX_RESERVE_BYTES == 55);
+
+/// 目标完整路径的接受上限: 平台路径上限减去最长生成后缀预留.
+///
+/// 清单接受条件为 `target_path` 的字节数不超过该值; 说明中报告的预算也是这个数.
+pub(crate) const fn max_target_path_bytes() -> usize {
+    PLATFORM_PATH_MAX_BYTES - MAX_GENERATED_SUFFIX_RESERVE_BYTES
+}
+
+/// 规范化的目标路径字节数 (按 UTF-8 字节, 不是字符数或显示宽度).
+pub(crate) fn target_path_bytes(path: &Path) -> usize {
+    path.as_os_str().len()
+}
+
+/// 目标完整路径加上最长生成后缀后是否仍落在平台路径预算内 (V-13).
+pub(crate) fn target_path_fits_budget(path: &Path) -> bool {
+    target_path_bytes(path) + MAX_GENERATED_SUFFIX_RESERVE_BYTES <= PLATFORM_PATH_MAX_BYTES
+}
+
+// 编译期不变量: 预算加最长后缀必须仍落在 NAME_MAX 255 内.
+const _: () = assert!(MAX_TARGET_BASENAME_BYTES + MAX_GENERATED_SUFFIX_BYTES <= 255);
+
+/// 目标路径末段 basename 的 UTF-8 字节数; 无末段 (例如文件系统根 `/`) 时返回 0.
+///
+/// `target_path` 已过 [`os::normalize`], 因此 `file_name()` 取到的就是最终落点的
+/// 末段. 计数使用字节长度, 不是字符数或显示宽度. 根路径没有末段, 由 V-9 处理;
+/// 本函数只为 V-12 提供可相加的字节数.
+pub(crate) fn target_basename_bytes(path: &Path) -> usize {
+    path.file_name().map_or(0, |name| name.len())
+}
+
 /// 目标被非本工具内容占用时的策略.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OnConflict {
@@ -129,12 +206,62 @@ fn expand_target(
     Ok(repo_root.join(path))
 }
 
+/// `~` 简写按路径组件纯词法折叠后的主目录展开结果 (V-9c).
+///
+/// 展开规则与 [`expand_target`] 相同: `~` 展开为主目录, `~/...` 去掉 `~/` 前缀与
+/// 多余的前导分隔符后挂到主目录下. 区别是这里只按 [`Path::components`] 消去 `.`
+/// 与 `..`, **不访问文件系统, 不解析符号链接**: V-9c 要判定的是书写形态是否经
+/// `..` 离开主目录, 而不是展开后的物理落点.
+///
+/// 不得改用 `os::normalize` 代替: 它会解析祖先段的符号链接, 把
+/// `~/symlinked-dir/file` (父目录是指向主目录外部的符号链接) 这类有意配置的合法
+/// 结构误拒.
+///
+/// `written` 不是 `~` 简写 (也不是裸 `~`) 时返回 None.
+pub(crate) fn tilde_expansion_lexical(written: &str, home: &Path) -> Option<PathBuf> {
+    let rest = if let Some(rest) = written.strip_prefix("~/") {
+        // 与 `expand_target` 相同: `~/` 之后多写的分隔符仍属主目录简写.
+        rest.trim_start_matches(std::path::MAIN_SEPARATOR)
+    } else if written == "~" {
+        ""
+    } else {
+        return None;
+    };
+    Some(fold_components(&home.join(rest)))
+}
+
+/// 纯词法折叠绝对路径: 只消去 `.` 与 `..`, 不访问文件系统.
+///
+/// `path` 必须是绝对路径 (调用方传入展开后的 `~`, 主目录本身已校验为绝对路径).
+/// 上溯到根后 `..` 不再回退, 与 [`os::normalize`] 的词法部分一致.
+fn fold_components(path: &Path) -> PathBuf {
+    let mut parts: Vec<std::ffi::OsString> = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(_)
+            | std::path::Component::RootDir
+            | std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                parts.pop();
+            }
+            std::path::Component::Normal(part) => parts.push(part.to_os_string()),
+        }
+    }
+
+    let mut folded = PathBuf::from(std::path::MAIN_SEPARATOR_STR);
+    for part in parts {
+        folded.push(part);
+    }
+    folded
+}
+
 /// 解析 `source` 为未规范化的绝对路径.
 ///
 /// 源条目必须是仓库内的相对路径 (`openspec/specs/manifest-schema/spec.md` 的 V-6:
 /// "源条目路径始终相对于清单文件所在目录解析"). `~` 前缀与绝对路径都不属于"仓库内
 /// 的相对路径", 按 V-4 / V-6 整体拒绝, 以维持"条目来自仓库"这一心智模型. 词法拼接
-/// 之后仍可能越出仓库 (见 `resolve` 中归一化后的越界判定), 那一半不在此处裁决.
+/// 之后仍可能越出仓库 (见 [`resolve_with`] 中归一化后的越界判定), 那一半不在此处
+/// 裁决.
 fn expand_source(written: &str, repo_root: &Path) -> Result<PathBuf> {
     if written.starts_with('~') || Path::new(written).is_absolute() {
         return Err(Error::ManifestInvalid(format!(
@@ -341,5 +468,80 @@ mod tests {
         .unwrap();
         assert_eq!(entry.source_path, PathBuf::from("/repo/shell/bashrc"));
         assert_eq!(entry.target_path, PathBuf::from("/repo/link/rc"));
+    }
+
+    #[test]
+    fn target_basename_bytes_counts_bytes_and_handles_a_root_path() {
+        // ASCII: 字节数与字符数相同.
+        assert_eq!(target_basename_bytes(Path::new("/etc/bashrc")), 6);
+        // 多字节: 3 个 3 字节字符计 9 字节, 不是 3.
+        assert_eq!(target_basename_bytes(Path::new("/tmp/日本語")), 9);
+        // 根路径没有末段: V-12 返回 0, 落点退化由 V-9 处理.
+        assert_eq!(target_basename_bytes(Path::new("/")), 0);
+    }
+
+    #[test]
+    fn the_audited_suffix_leaves_the_budget_inside_name_max() {
+        // 预算上限由模块顶部的编译期断言保证; 这里锁定审计值与后缀分解同步.
+        assert_eq!(MAX_TARGET_BASENAME_BYTES, 200);
+        assert_eq!(MAX_GENERATED_SUFFIX_BYTES, 50);
+        assert_eq!(MAX_TARGET_BASENAME_BYTES + MAX_GENERATED_SUFFIX_BYTES, 250);
+        // 实际最长后缀 50 不超过完整路径预算的预留 55, 余量为 5 字节.
+        assert_eq!(
+            MAX_GENERATED_SUFFIX_RESERVE_BYTES - MAX_GENERATED_SUFFIX_BYTES,
+            5
+        );
+    }
+
+    /// 构造恰为 `bytes` 字节的绝对路径, 每段不超过 101 字节 (低于 V-12 的 200).
+    fn path_of_bytes(bytes: usize) -> String {
+        assert!(bytes >= 2, "绝对路径至少需要根与一个末段");
+        let content = bytes - 1;
+        let segments = (content - 1) / 101 + 1;
+        let last = content - 101 * (segments - 1);
+        let mut parts = Vec::with_capacity(segments);
+        for index in 0..segments {
+            let len = if index + 1 == segments { last } else { 100 };
+            parts.push("a".repeat(len));
+        }
+        format!("/{}", parts.join("/"))
+    }
+
+    #[test]
+    fn platform_path_budget_matches_the_supported_platforms() {
+        #[cfg(target_os = "linux")]
+        assert_eq!(PLATFORM_PATH_MAX_BYTES, 4096);
+        #[cfg(target_os = "macos")]
+        assert_eq!(PLATFORM_PATH_MAX_BYTES, 1024);
+        // 其他平台只为可编译而给出保守值, 平台门禁会先退 3.
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        assert_eq!(PLATFORM_PATH_MAX_BYTES, 1024);
+
+        assert_eq!(MAX_GENERATED_SUFFIX_RESERVE_BYTES, 55);
+        assert_eq!(max_target_path_bytes(), PLATFORM_PATH_MAX_BYTES - 55);
+    }
+
+    #[test]
+    fn target_path_budget_helper_accepts_the_limit_and_rejects_one_byte_over() {
+        let budget = max_target_path_bytes();
+
+        let under = path_of_bytes(budget - 1);
+        assert_eq!(target_path_bytes(Path::new(&under)), budget - 1);
+        assert!(target_path_fits_budget(Path::new(&under)));
+
+        let at = path_of_bytes(budget);
+        assert_eq!(target_path_bytes(Path::new(&at)), budget);
+        assert!(target_path_fits_budget(Path::new(&at)));
+
+        let over = path_of_bytes(budget + 1);
+        assert_eq!(target_path_bytes(Path::new(&over)), budget + 1);
+        assert!(!target_path_fits_budget(Path::new(&over)));
+    }
+
+    #[test]
+    fn target_path_bytes_counts_utf8_bytes_not_characters() {
+        // 3 个 3 字节字符计 9 字节, 不是 3 个字符或 6 列显示宽度.
+        assert_eq!(target_path_bytes(Path::new("/tmp/日本語")), 14);
+        assert_eq!(target_path_bytes(Path::new("/")), 1);
     }
 }

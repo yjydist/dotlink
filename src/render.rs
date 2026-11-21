@@ -13,35 +13,162 @@
 //!
 //! [`row_for`] 是上述入口共用的组装原语: token 与说明都已定, 它只负责落进报告行.
 
+use std::fmt::Write as _;
 use std::path::Path;
 
-use crate::classify::{Action, Current};
+use crate::classify::{Action, Current, EntryState};
 use crate::cli::Command;
 use crate::entry::Entry;
 use crate::error::EntryOutcome;
 
 /// token 列宽, 与 README 的输出示例一致.
 ///
-/// token 加其后空白的宽度恒为 9: `create` 之后接 3 个空格, 八个字符的 token
-/// (如 `conflict`) 之后只接 1 个空格.
+/// `render` 的格式串是 `"{:>index_width$}/{} {:<width$} {}{} {}\n"`: token 字段宽
+/// 9 列, 格式串随后再加 1 列分隔空格. 因此 `create` 之后是 4 个空格, 八个字符的
+/// token (如 `conflict`) 之后是 2 个空格; token 加其后空白的总宽恒为 10 列.
 const TOKEN_WIDTH: usize = 9;
 /// target 列宽 (含其后的分隔空格), 与 README 的输出示例一致: `~/.bashrc` 之后到
 /// 说明之间有 11 个空格 (`9 + 11 = 20`), `~/.config/nvim` 之后有 6 个
 /// (`14 + 6 = 20`).
 const TARGET_WIDTH: usize = 20;
 
-/// 字符串在终端中的近似显示宽度.
+/// East Asian Wide / Fullwidth 码点的排序区间表 (Unicode 17.0 的 `W` / `F` 两类).
+///
+/// 区间按起点升序且互不重叠, 供 [`character_width`] 二分查找. 数据取自 Unicode 17.0
+/// 的 `EastAsianWidth.txt`; 重新生成的方法: 用 Python 的
+/// `unicodedata.east_asian_width` 逐码点判定, 把命中的码点压缩成连续区间, 并为前向
+/// 兼容保留若干整块区间 (见下), 升级 Unicode 版本时重跑并更新版本号.
+///
+/// 整块保留: CJK 相关区块与两个 emoji 整块 (`U+1F300-U+1F64F`, `U+1F900-U+1F9FF`)
+/// 按整块计 2 列, 块内未分配的码点与文本呈现型 emoji 同样计 2 列, 使将来分配的字符
+/// 不必升级二进制. 测试侧保留独立的 `UNICODE_17_WIDE_RANGES` oracle, 不复用本表,
+/// 以免同源错误互相掩盖.
+///
+/// 分组顺序与表格顺序一致: Hangul Jamo 与 CJK 部首, 笔画, 假名, 汉字, 谚文, 兼容
+/// 表意文字; 杂项符号, 装饰符号与常见 emoji; 唐古特, 契丹, 女真等历史文字与竖排
+/// 标点; 麻将, 扑克与带圈 CJK 符号; 最后是 emoji 区块与 CJK 扩展平面.
+const WIDE_RANGES: &[(u32, u32)] = &[
+    (0x1100, 0x115F),
+    (0x231A, 0x231B),
+    (0x2329, 0x232A),
+    (0x23E9, 0x23EC),
+    (0x23F0, 0x23F0),
+    (0x23F3, 0x23F3),
+    (0x25FD, 0x25FE),
+    (0x2614, 0x2615),
+    (0x2630, 0x2637),
+    (0x2648, 0x2653),
+    (0x267F, 0x267F),
+    (0x268A, 0x268F),
+    (0x2693, 0x2693),
+    (0x26A1, 0x26A1),
+    (0x26AA, 0x26AB),
+    (0x26BD, 0x26BE),
+    (0x26C4, 0x26C5),
+    (0x26CE, 0x26CE),
+    (0x26D4, 0x26D4),
+    (0x26EA, 0x26EA),
+    (0x26F2, 0x26F3),
+    (0x26F5, 0x26F5),
+    (0x26FA, 0x26FA),
+    (0x26FD, 0x26FD),
+    (0x2705, 0x2705),
+    (0x270A, 0x270B),
+    (0x2728, 0x2728),
+    (0x274C, 0x274C),
+    (0x274E, 0x274E),
+    (0x2753, 0x2755),
+    (0x2757, 0x2757),
+    (0x2795, 0x2797),
+    (0x27B0, 0x27B0),
+    (0x27BF, 0x27BF),
+    (0x2B1B, 0x2B1C),
+    (0x2B50, 0x2B50),
+    (0x2B55, 0x2B55),
+    (0x2E80, 0x303E),
+    (0x3041, 0x33FF),
+    (0x3400, 0x4DBF),
+    (0x4DC0, 0x4DFF),
+    (0x4E00, 0x9FFF),
+    (0xA000, 0xA4CF),
+    (0xA960, 0xA97C),
+    (0xAC00, 0xD7A3),
+    (0xF900, 0xFAFF),
+    (0xFE10, 0xFE19),
+    (0xFE30, 0xFE6F),
+    (0xFF00, 0xFF60),
+    (0xFFE0, 0xFFE6),
+    (0x16FE0, 0x16FE4),
+    (0x16FF0, 0x16FF6),
+    (0x17000, 0x18CD5),
+    (0x18CFF, 0x18D1E),
+    (0x18D80, 0x18DF2),
+    (0x1AFF0, 0x1AFF3),
+    (0x1AFF5, 0x1AFFB),
+    (0x1AFFD, 0x1AFFE),
+    (0x1B000, 0x1B122),
+    (0x1B132, 0x1B132),
+    (0x1B150, 0x1B152),
+    (0x1B155, 0x1B155),
+    (0x1B164, 0x1B167),
+    (0x1B170, 0x1B2FB),
+    (0x1D300, 0x1D356),
+    (0x1D360, 0x1D376),
+    (0x1F004, 0x1F004),
+    (0x1F0CF, 0x1F0CF),
+    (0x1F18E, 0x1F18E),
+    (0x1F191, 0x1F19A),
+    (0x1F200, 0x1F202),
+    (0x1F210, 0x1F23B),
+    (0x1F240, 0x1F248),
+    (0x1F250, 0x1F251),
+    (0x1F260, 0x1F265),
+    (0x1F300, 0x1F64F),
+    (0x1F680, 0x1F6C5),
+    (0x1F6CC, 0x1F6CC),
+    (0x1F6D0, 0x1F6D2),
+    (0x1F6D5, 0x1F6D8),
+    (0x1F6DC, 0x1F6DF),
+    (0x1F6EB, 0x1F6EC),
+    (0x1F6F4, 0x1F6FC),
+    (0x1F7E0, 0x1F7EB),
+    (0x1F7F0, 0x1F7F0),
+    (0x1F900, 0x1F9FF),
+    (0x1FA70, 0x1FA7C),
+    (0x1FA80, 0x1FA8A),
+    (0x1FA8E, 0x1FAC6),
+    (0x1FAC8, 0x1FAC8),
+    (0x1FACD, 0x1FADC),
+    (0x1FADF, 0x1FAEA),
+    (0x1FAEF, 0x1FAF8),
+    (0x20000, 0x3FFFD),
+];
+
+/// 码点是否落在 [`WIDE_RANGES`] 的任一区间内.
+///
+/// 表已按起点排序且互不重叠, 因此用 `binary_search_by` 把"码点落在区间内"表达为
+/// 与区间元素的比较: 码点小于起点时元素更大, 大于终点时元素更小, 落在区间内即相等.
+fn is_wide(code: u32) -> bool {
+    WIDE_RANGES
+        .binary_search_by(|&(start, end)| {
+            if code < start {
+                std::cmp::Ordering::Greater
+            } else if code > end {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
+}
+
+/// 字符串在终端中的近似显示宽度 (测试侧用).
 ///
 /// 只依赖码点区间, 不引入依赖: 组合记号区段与变体选择符按 0 列, East Asian Wide /
 /// Fullwidth 码点与整块保留的区间按 2 列, 其余按 1 列.
 ///
-/// 宽字符区间取自 Unicode 17.0 的 `EastAsianWidth.txt` 中 `W` 与 `F` 两类. 重新生成
-/// 的方法: 用 Python 的 `unicodedata.east_asian_width` 逐码点判定, 把命中的码点压缩成
-/// 连续区间, 并为前向兼容保留若干整块区间 (见下), 升级 Unicode 版本时重跑并更新版本号.
-///
-/// 整块保留: CJK 相关区块与两个 emoji 整块 (`U+1F300-U+1F64F`, `U+1F900-U+1F9FF`)
-/// 按整块计 2 列, 块内未分配的码点与文本呈现型 emoji 同样计 2 列, 使将来分配的字符
-/// 不必升级二进制.
+/// 生产侧的 [`render`] 在转义的同时计宽 ([`push_escaped`]), 不先构造转义后的
+/// `String`; 本函数只供测试对已转义文本做同样的逐码点计宽.
 ///
 /// 近似之处: 不按字素簇分段, emoji ZWJ 序列与区域指示符按码点近似; 整块区间之外的
 /// East Asian Ambiguous 按 1 列; 组合记号只在 `character_width` 0 列分支列出的区段
@@ -49,6 +176,7 @@ const TARGET_WIDTH: usize = 20;
 /// `U+FE20-U+FE2F`) 内按 0 列, 区段之外的组合记号按 East Asian 宽度判定 (少数 East
 /// Asian Wide 的仍计 2 列, 例如 `U+3099`); 已转义的 `\u{...}` 文本按字面字符计宽. 这些
 /// 差异只影响列对齐, 不影响文件系统操作或退出码.
+#[cfg(test)]
 fn display_width(text: &str) -> usize {
     text.chars().map(character_width).sum()
 }
@@ -65,110 +193,8 @@ fn character_width(character: char) -> usize {
         | 0xFE20..=0xFE2F => 0,
         // 已在显示层转义的零宽 / bidi 控制符: 转义后是字面文本, 但直接传入时按 0 列.
         0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x2069 | 0xFEFF => 0,
-        // East Asian Wide / Fullwidth 与 emoji (Unicode 17.0 的 `W` / `F`).
-        //
-        // CJK 区块沿用整块区间 (含未分配码点), 使将来分配的字符不必升级二进制;
-        // 其余区块只列已分配的码点, 避免把相邻的窄码点也算成 2 列.
-        //
-        // Hangul Jamo 与 CJK 部首, 笔画, 假名, 汉字, 谚文, 兼容表意文字.
-        0x1100..=0x115F
-        | 0x2E80..=0x303E
-        | 0x3041..=0x33FF
-        | 0x3400..=0x4DBF
-        | 0x4DC0..=0x4DFF
-        | 0x4E00..=0x9FFF
-        | 0xA000..=0xA4CF
-        | 0xA960..=0xA97C
-        | 0xAC00..=0xD7A3
-        | 0xF900..=0xFAFF
-        | 0xFE10..=0xFE19
-        | 0xFE30..=0xFE6F
-        | 0xFF00..=0xFF60
-        | 0xFFE0..=0xFFE6
-        // 杂项符号, 装饰符号与常见 emoji (含 U+231A 起的宽字符).
-        | 0x231A..=0x231B
-        | 0x2329..=0x232A
-        | 0x23E9..=0x23EC
-        | 0x23F0
-        | 0x23F3
-        | 0x25FD..=0x25FE
-        | 0x2614..=0x2615
-        | 0x2630..=0x2637
-        | 0x2648..=0x2653
-        | 0x267F
-        | 0x268A..=0x268F
-        | 0x2693
-        | 0x26A1
-        | 0x26AA..=0x26AB
-        | 0x26BD..=0x26BE
-        | 0x26C4..=0x26C5
-        | 0x26CE
-        | 0x26D4
-        | 0x26EA
-        | 0x26F2..=0x26F3
-        | 0x26F5
-        | 0x26FA
-        | 0x26FD
-        | 0x2705
-        | 0x270A..=0x270B
-        | 0x2728
-        | 0x274C
-        | 0x274E
-        | 0x2753..=0x2755
-        | 0x2757
-        | 0x2795..=0x2797
-        | 0x27B0
-        | 0x27BF
-        | 0x2B1B..=0x2B1C
-        | 0x2B50
-        | 0x2B55
-        // 唐古特, 契丹, 女真等历史文字与竖排标点.
-        | 0x16FE0..=0x16FE4
-        | 0x16FF0..=0x16FF6
-        | 0x17000..=0x18CD5
-        | 0x18CFF..=0x18D1E
-        | 0x18D80..=0x18DF2
-        | 0x1AFF0..=0x1AFF3
-        | 0x1AFF5..=0x1AFFB
-        | 0x1AFFD..=0x1AFFE
-        | 0x1B000..=0x1B122
-        | 0x1B132
-        | 0x1B150..=0x1B152
-        | 0x1B155
-        | 0x1B164..=0x1B167
-        | 0x1B170..=0x1B2FB
-        | 0x1D300..=0x1D356
-        | 0x1D360..=0x1D376
-        // 麻将, 扑克与带圈 CJK 符号.
-        | 0x1F004
-        | 0x1F0CF
-        | 0x1F18E
-        | 0x1F191..=0x1F19A
-        | 0x1F200..=0x1F202
-        | 0x1F210..=0x1F23B
-        | 0x1F240..=0x1F248
-        | 0x1F250..=0x1F251
-        | 0x1F260..=0x1F265
-        // emoji 区块: 现有整块区间保留, 其余按已分配的宽码点补齐.
-        | 0x1F300..=0x1F64F
-        | 0x1F680..=0x1F6C5
-        | 0x1F6CC
-        | 0x1F6D0..=0x1F6D2
-        | 0x1F6D5..=0x1F6D8
-        | 0x1F6DC..=0x1F6DF
-        | 0x1F6EB..=0x1F6EC
-        | 0x1F6F4..=0x1F6FC
-        | 0x1F7E0..=0x1F7EB
-        | 0x1F7F0
-        | 0x1F900..=0x1F9FF
-        | 0x1FA70..=0x1FA7C
-        | 0x1FA80..=0x1FA8A
-        | 0x1FA8E..=0x1FAC6
-        | 0x1FAC8
-        | 0x1FACD..=0x1FADC
-        | 0x1FADF..=0x1FAEA
-        | 0x1FAEF..=0x1FAF8
-        | 0x20000..=0x3FFFD => 2,
+        // East Asian Wide / Fullwidth 与 emoji: 数据与二分查找集中在 `WIDE_RANGES`.
+        _ if is_wide(code) => 2,
         _ => 1,
     }
 }
@@ -185,14 +211,29 @@ fn character_width(character: char) -> usize {
 /// (`openspec/specs/cli-contract/spec.md` 的"报告中的控制字符必须转义").
 pub fn escape_controls(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
+    push_escaped(&mut escaped, text);
+    escaped
+}
+
+/// 把转义后的 `text` 追加到 `out`, 返回转义结果的显示宽度.
+///
+/// 转义只把控制字符与布局控制符展开为 ASCII (`\n` / `\u{...}`), 其中每个字符各占
+/// 1 列; 其余字符按 [`character_width`] 计宽. 一次遍历同时完成转义与计宽, 供
+/// [`render`] 直接写入输出缓冲, 避免为每行先构造转义后的 `String`.
+fn push_escaped(out: &mut String, text: &str) -> usize {
+    let mut width = 0;
     for character in text.chars() {
         if character.is_control() || is_layout_control(character) {
-            escaped.extend(character.escape_default());
+            for escaped in character.escape_default() {
+                out.push(escaped);
+                width += 1;
+            }
         } else {
-            escaped.push(character);
+            out.push(character);
+            width += character_width(character);
         }
     }
-    escaped
+    width
 }
 
 /// 会改变行布局或视觉顺序, 但不是 `char::is_control()` 的字符.
@@ -284,14 +325,19 @@ fn row_for(entry: &Entry, token: EntryOutcome, note: String) -> ReportRow {
 pub fn row_from_state(
     command: Command,
     entry: &Entry,
-    current: Current,
-    action: Action,
-    detail: &str,
+    state: &EntryState,
     has_backup: bool,
     backup_path: Option<&Path>,
 ) -> ReportRow {
-    let token = token_for(command, current, action, has_backup);
-    let note = note_for_token(command, token, entry, current, detail, backup_path);
+    let token = token_for(command, state.current, state.action, has_backup);
+    let note = note_for_token(
+        command,
+        token,
+        entry,
+        state.current,
+        &state.detail,
+        backup_path,
+    );
     row_for(entry, token, note)
 }
 
@@ -344,26 +390,33 @@ pub fn render(rows: &[ReportRow]) -> String {
     let total = rows.len();
     // 序号按总数的位数右对齐: 总数达到 10 时, ` 1/12` 与 `12/12` 的 token 列对齐.
     let index_width = total.to_string().len();
-    let mut out = String::new();
+    // 每条目行大致 60-80 列, 汇总行另计; 预分配避免逐行扩容.
+    let mut out = String::with_capacity(rows.len() * 72 + 64);
 
     for (index, row) in rows.iter().enumerate() {
-        let target_display = escape_controls(&row.target_display);
-        let note = escape_controls(&row.note);
-        // `TARGET_WIDTH` 含其后那一格分隔空格, 因此字段本身少一格; 按显示宽度而非
-        // 字符数补齐, 使 CJK target 之后的说明列仍然对齐. 超长 target 不截断, 只让
-        // 说明列右移.
-        let padding = (TARGET_WIDTH - 1).saturating_sub(display_width(&target_display));
-        out.push_str(&format!(
-            "{:>index_width$}/{} {:<width$} {}{} {}\n",
-            index + 1,
-            total,
-            token_name(row.token),
-            target_display,
-            " ".repeat(padding),
-            note,
-            index_width = index_width,
-            width = TOKEN_WIDTH,
+        // 序号右对齐后接 `/总数` 与一格分隔.
+        write!(out, "{:>index_width$}/{} ", index + 1, total).expect("写入 String 不会失败");
+
+        // token 左对齐到 `TOKEN_WIDTH` 列, 其后一格分隔.
+        let token = token_name(row.token);
+        out.push_str(token);
+        // 与 `{:width$}` 一致: 超宽字段不截断, 只是没有补齐空格.
+        out.extend(std::iter::repeat_n(
+            ' ',
+            TOKEN_WIDTH.saturating_sub(token.len()),
         ));
+        out.push(' ');
+
+        // target 直接转义写入输出缓冲, 同时得到显示宽度. `TARGET_WIDTH` 含其后那一格
+        // 分隔空格, 因此字段本身少一格; 按显示宽度而非字符数补齐, 使 CJK target 之后
+        // 的说明列仍然对齐. 超长 target 不截断, 只让说明列右移.
+        let target_width = push_escaped(&mut out, &row.target_display);
+        let padding = (TARGET_WIDTH - 1).saturating_sub(target_width);
+        out.extend(std::iter::repeat_n(' ', padding));
+        out.push(' ');
+
+        push_escaped(&mut out, &row.note);
+        out.push('\n');
     }
 
     out.push_str(&summary_line_of(rows));
@@ -373,10 +426,20 @@ pub fn render(rows: &[ReportRow]) -> String {
 /// 汇总行的计数: 成功 / 已是最新 / 未处理 / 失败.
 ///
 /// 四项按 token 严格分桶且**互斥**, 相加恒等于 token 总数 (`render` 保证其等于 N).
+/// 生产路径走 [`tally_iter`] 直接从报告行计数; 本函数保留给测试对 token 序列断言.
+#[cfg(test)]
 pub fn tally(outcomes: &[EntryOutcome]) -> (usize, usize, usize, usize) {
+    tally_iter(outcomes.iter().copied())
+}
+
+/// `tally` 的迭代器入口: 汇总行直接从报告行计数, 不物化 token `Vec`.
+fn tally_iter<I>(outcomes: I) -> (usize, usize, usize, usize)
+where
+    I: IntoIterator<Item = EntryOutcome>,
+{
     let mut tally = (0, 0, 0, 0);
     for outcome in outcomes {
-        match column_of(*outcome) {
+        match column_of(outcome) {
             Column::Succeeded => tally.0 += 1,
             Column::UpToDate => tally.1 += 1,
             Column::Pending => tally.2 += 1,
@@ -392,15 +455,17 @@ pub fn tally(outcomes: &[EntryOutcome]) -> (usize, usize, usize, usize) {
 /// "有意不处理"的 `conflict` / `skip` 与"没有动作可执行"的 `foreign` / `absent` /
 /// `wrong`, 后三个出现在只读的 `status` 上
 /// (`openspec/specs/cli-contract/spec.md` 的"汇总分列为四列且是 token 的划分").
+/// 生产路径由 [`summary_line_of`] 从报告行计数; 本函数保留给测试对 token 序列断言.
+#[cfg(test)]
 pub fn summary_line(outcomes: &[EntryOutcome]) -> String {
-    let counts = tally(outcomes);
+    summary_line_with_counts(outcomes.len(), tally(outcomes))
+}
+
+/// 由总数与四列计数拼出汇总行; slice 与迭代器入口共用同一份措辞.
+fn summary_line_with_counts(total: usize, counts: (usize, usize, usize, usize)) -> String {
     format!(
-        "{} 个条目: {} 成功, {} 已是最新, {} 未处理, {} 失败\n",
-        outcomes.len(),
-        counts.0,
-        counts.1,
-        counts.2,
-        counts.3
+        "{total} 个条目: {} 成功, {} 已是最新, {} 未处理, {} 失败\n",
+        counts.0, counts.1, counts.2, counts.3
     )
 }
 
@@ -441,8 +506,25 @@ fn deploy_token(current: Current, action: Action) -> EntryOutcome {
         // 文件系统事实 (`openspec/specs/entry-classification/spec.md` 的"求值顺序: 环境故障先于确定事实"), 因此四条命令下都是 `fail`.
         Current::Unreadable => EntryOutcome::Fail,
         Current::SourceMissing => EntryOutcome::Missing,
-        Current::Absent if action == Action::Create => EntryOutcome::Create,
-        Current::LinkedCorrect if action == Action::Noop => EntryOutcome::Ok,
+        Current::Absent => match action {
+            Action::Create => EntryOutcome::Create,
+            // 表外组合: 回落到该 `Current` 自身的分桶, 不退化为 `fail`.
+            Action::ReportMissingSource
+            | Action::Noop
+            | Action::RefuseConflict
+            | Action::ReplaceAndBackup
+            | Action::ReportUnreadable => status_token(current),
+        },
+        Current::LinkedCorrect => match action {
+            Action::Noop => EntryOutcome::Ok,
+            // 表外组合 (例如 `preview` 拿到了它不该有的 `Create`): 同样是回落,
+            // 不退化为 `fail` -- `fail` 只表示"真的没成功".
+            Action::ReportMissingSource
+            | Action::Create
+            | Action::RefuseConflict
+            | Action::ReplaceAndBackup
+            | Action::ReportUnreadable => status_token(current),
+        },
         // 特殊文件无法备份: token 恒为 `conflict`, 即使调用方错误地传入了
         // `ReplaceAndBackup` 也不得承诺 `replace`
         // (`openspec/specs/link-deployment/spec.md` 的"不可备份的占用物不建立链接").
@@ -453,11 +535,11 @@ fn deploy_token(current: Current, action: Action) -> EntryOutcome {
         | Current::ForeignDir => match action {
             Action::RefuseConflict => EntryOutcome::Conflict,
             Action::ReplaceAndBackup => EntryOutcome::Replace,
-            _ => status_token(current),
+            Action::ReportMissingSource
+            | Action::Create
+            | Action::Noop
+            | Action::ReportUnreadable => status_token(current),
         },
-        // 表外组合 (例如 `preview` 拿到了它不该有的 `Create`): 一律回落到该 `Current`
-        // 自身的分桶, 不退化为 `fail` -- `fail` 只表示"真的没成功".
-        _ => status_token(current),
     }
 }
 
@@ -671,7 +753,7 @@ fn non_empty(detail: &str) -> Option<&str> {
 
 /// 由行集合导出的汇总行.
 fn summary_line_of(rows: &[ReportRow]) -> String {
-    summary_line(&rows.iter().map(|row| row.token).collect::<Vec<_>>())
+    summary_line_with_counts(rows.len(), tally_iter(rows.iter().map(|row| row.token)))
 }
 
 #[cfg(test)]
@@ -749,6 +831,15 @@ mod tests {
             on_conflict: OnConflict::Skip,
             source_path: PathBuf::from("/repo").join(source),
             target_path: PathBuf::from("/home/u").join(target),
+        }
+    }
+
+    /// 测试用判定结果: `row_from_state` 的生产输入形态.
+    fn state(current: Current, action: Action, detail: &str) -> EntryState {
+        EntryState {
+            current,
+            action,
+            detail: detail.to_string(),
         }
     }
 
@@ -1081,9 +1172,7 @@ mod tests {
                             rows.push(row_from_state(
                                 command,
                                 &entry("shell/bashrc", "~/.bashrc"),
-                                current,
-                                action,
-                                "/repo/other",
+                                &state(current, action, "/repo/other"),
                                 has_backup,
                                 backup,
                             ));
@@ -1480,9 +1569,7 @@ mod tests {
         let rows = vec![row_from_state(
             Command::Apply,
             &e,
-            Current::Absent,
-            Action::Create,
-            "",
+            &state(Current::Absent, Action::Create, ""),
             false,
             None,
         )];
@@ -1706,6 +1793,23 @@ mod tests {
         (0x30000, 0x3FFFD),
     ];
 
+    /// 生产宽度表必须按起点升序且互不重叠: 二分查找依赖这一不变量.
+    #[test]
+    fn wide_range_table_is_sorted_and_disjoint() {
+        for pair in WIDE_RANGES.windows(2) {
+            let (start, end) = pair[0];
+            let (next_start, _) = pair[1];
+            assert!(start <= end, "U+{start:04X}..U+{end:04X} 区间倒置");
+            assert!(
+                end < next_start,
+                "U+{end:04X} 与 U+{next_start:04X} 重叠或未按起点排序"
+            );
+        }
+        if let Some(&(start, end)) = WIDE_RANGES.last() {
+            assert!(start <= end, "U+{start:04X}..U+{end:04X} 区间倒置");
+        }
+    }
+
     /// Unicode 17.0 的每个 Wide / Fullwidth 码点都计 2 列, 防止区间表再次漏块.
     #[test]
     fn every_unicode_17_wide_or_fullwidth_codepoint_counts_as_two_columns() {
@@ -1831,36 +1935,28 @@ mod tests {
             row_from_state(
                 Command::Apply,
                 &bashrc,
-                Current::Absent,
-                Action::Create,
-                "",
+                &state(Current::Absent, Action::Create, ""),
                 false,
                 None,
             ),
             row_from_state(
                 Command::Apply,
                 &zshrc,
-                Current::LinkedCorrect,
-                Action::Noop,
-                "",
+                &state(Current::LinkedCorrect, Action::Noop, ""),
                 false,
                 None,
             ),
             row_from_state(
                 Command::Apply,
                 &gitconfig,
-                Current::ForeignFile,
-                Action::RefuseConflict,
-                "",
+                &state(Current::ForeignFile, Action::RefuseConflict, ""),
                 false,
                 None,
             ),
             row_from_state(
                 Command::Apply,
                 &nvim,
-                Current::SourceMissing,
-                Action::ReportMissingSource,
-                "",
+                &state(Current::SourceMissing, Action::ReportMissingSource, ""),
                 false,
                 None,
             ),

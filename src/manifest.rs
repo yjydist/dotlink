@@ -1,11 +1,12 @@
-//! 清单解析与全量校验 (V-1 到 V-11).
+//! 清单解析与全量校验 (V-1 到 V-13).
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::entry::{self, Entry, OnConflict};
 use crate::error::{Error, Result};
 use crate::os;
+use crate::os::FileIdentity;
 
 /// 清单文件的固定名字: 当前工作目录下的这一个, 不向上搜索父目录 (FR-015).
 const MANIFEST_NAME: &str = "dotlink.toml";
@@ -34,6 +35,33 @@ pub struct Manifest {
     pub entries: Vec<Entry>,
 }
 
+/// 每个条目的清单比较形态: 只用于校验, 不进入 [`Entry`], 也不改变运行时路径.
+///
+/// `target` / `source` 是 [`os::comparison_form`] 的结果: 在词法规范化之外再解析
+/// 末段符号链接链. 运行时仍使用 `Entry.target_path` / `source_path` 的"末段不解析"
+/// 形态.
+struct ComparisonForms {
+    /// 目标末段解析后的比较形态.
+    target: std::path::PathBuf,
+    /// 源末段解析后的比较形态 (源符号链接的解析目标).
+    source: std::path::PathBuf,
+    /// 目标比较形态是否就是本条目的源: 这表示目标已是正确部署的链接. 这种形态
+    /// 不得参与目标去重与目标间嵌套判定, 否则"多个独立目标共享同一源"的合法清单
+    /// 在部署后会因两个链接指向同一源而被误拒.
+    target_is_own_source_link: bool,
+}
+
+impl ComparisonForms {
+    /// 参与目标去重与目标间比较的形态; 已正确部署的链接只按词法形态比较.
+    fn target_key(&self) -> Option<&Path> {
+        if self.target_is_own_source_link {
+            None
+        } else {
+            Some(self.target.as_path())
+        }
+    }
+}
+
 /// 从当前工作目录读取并校验 `dotlink.toml`.
 ///
 /// V-1 的前一半: 清单文件与**当前工作目录**都必须可用. 二者的说明必须可区分
@@ -53,14 +81,22 @@ pub fn load() -> Result<Manifest> {
 
 /// 解析并校验给定的清单文本.
 ///
-/// 只读, 不写文件系统: 只读取 `text` 与 `repo_root` (以及展开 `~` 所需的 `HOME`), 不产生任何
-/// 文件系统改动. 校验规则 V-1 到 V-8 见 `openspec/specs/manifest-schema/spec.md`, 逐条对应如下:
+/// 只读, 不写文件系统: 读取 `text` 与 `repo_root`, 展开 `~` 所需的 `HOME`, 以及
+/// V-9 / V-9b / V-9c / V-11 需要的文件系统元数据与符号链接解析结果, 不产生任何
+/// 文件系统改动. 校验规则 V-1 到 V-13 见 `openspec/specs/manifest-schema/spec.md`,
+/// 逐条对应如下:
 /// V-2 语法 (本函数前半), V-3 条目非空, V-4 两字段非空, V-5 目标路径互不重复,
 /// V-6 目标可解析为绝对路径, V-7 `on_conflict` 取值合法, V-8 只出现已定义的键.
-/// V-9 (目标落点不得退化) 与 V-10 (目标不得自指) 是其后新增的两条落点校验,
-/// 定义见 `openspec/specs/manifest-schema/spec.md`.
+/// V-9 (目标落点不得退化), V-9a (主目录落点的两种形态), V-9b (落点命中按文件系统
+/// 身份判定) 与 V-10 (目标不得自指) 是条目循环内的落点校验, 定义见
+/// `openspec/specs/manifest-schema/spec.md`.
 ///
-/// V-11 在全部条目解析后检查目标之间, 目标与源之间的路径隔离.
+/// V-9c 把主目录的保护面从"主目录本身"扩展到"主目录的祖先", 并拒绝经 `..` 离开
+/// 主目录的 `~` 简写; 它与其他 V-9 判定同在条目循环内运行.
+///
+/// V-11 在全部条目解析后检查目标之间, 目标与源之间的路径隔离. V-12 随后检查
+/// 目标末段 basename 的字节预算, V-13 最后检查目标完整路径的平台预算; 两条预算
+/// 都放在 V-9 / V-10 / V-11 之后以保持既有报错优先级.
 /// 不校验源条目是否存在 (那是运行时状态 `SourceMissing`) 或条目数量上限.
 pub fn parse(text: &str, repo_root: &Path) -> Result<Manifest> {
     // 手工从 `toml::Table` 读而不是反序列化进一个 `#[derive(Deserialize)]` 的中间
@@ -119,6 +155,13 @@ pub fn parse(text: &str, repo_root: &Path) -> Result<Manifest> {
     // 同一表按文件系统身份再存一份: 两个不同写法指向同一对象时字符串不会重合.
     let mut first_declared_identity: HashMap<os::FileIdentity, usize> =
         HashMap::with_capacity(written_entries.len());
+    // 同一表按比较形态 (末段也解析) 再存一份: 符号链接目标与其 referent 作为两个
+    // 目标出现时, 词法字符串不会重合. 已正确部署的链接 (比较形态等于自己的源) 不
+    // 进入本表, 使"多个独立目标共享同一源"在部署后仍被接受.
+    let mut first_declared_comparison: HashMap<std::path::PathBuf, usize> =
+        HashMap::with_capacity(written_entries.len());
+    // 每个条目的比较形态; 与 `entries` 一一对应, 只在校验内使用.
+    let mut forms: Vec<ComparisonForms> = Vec::with_capacity(written_entries.len());
 
     for (index, written) in written_entries.iter().enumerate() {
         let Some(table) = written.as_table() else {
@@ -205,6 +248,40 @@ pub fn parse(text: &str, repo_root: &Path) -> Result<Manifest> {
             }
         }
 
+        // 清单比较形态: 只在校验内使用, 不写回 `Entry`.
+        let target_comparison = os::comparison_form(&resolved.target_path);
+        let source_comparison = os::comparison_form(&resolved.source_path);
+        let comparison = ComparisonForms {
+            target_is_own_source_link: target_comparison == resolved.source_path,
+            target: target_comparison,
+            source: source_comparison,
+        };
+
+        // V-10: `source` 是符号链接时, 其解析目标同样参与自指判定. 目标等于源的
+        // 解析目标时, 建出的链接会形成 `target -> source -> target` 的环.
+        if comparison.source != resolved.source_path && resolved.target_path == comparison.source {
+            return Err(invalid_entry(
+                index,
+                format!(
+                    "`{target}` 与本条目的 `{SOURCE_KEY} = {source}` 的符号链接解析目标相同 (均为 `{}`): 自指链接恒为断链",
+                    comparison.source.display()
+                ),
+            ));
+        }
+        // 源是符号链接时, follow 身份指向其最终对象. 目标落点与该对象相同时同样
+        // 构成自指; 保留上面的 lstat 判等, 以覆盖目标本身是链接对象的情况.
+        if let Some(landing_identity) = landing_identity
+            && os::basis_identity(&resolved.source_path).ok() == Some(landing_identity)
+        {
+            return Err(invalid_entry(
+                index,
+                format!(
+                    "`{target}` 与本条目的 `{SOURCE_KEY} = {source}` 的符号链接解析目标指向同一个对象 (目标落点 `{}`): 自指链接恒为断链",
+                    resolved.target_path.display()
+                ),
+            ));
+        }
+
         // V-5: 比较 `os::normalize` 之后的 `target_path` (由 `resolve_with` 产出).
         // 不得用 `Path::canonicalize`: 待部署的目标通常尚不存在.
         if let Some(&previous) = first_declared_at.get(resolved.target_path.as_path()) {
@@ -213,6 +290,18 @@ pub fn parse(text: &str, repo_root: &Path) -> Result<Manifest> {
                 entry_label(previous),
                 entry_label(index),
                 resolved.target_path.display()
+            )));
+        }
+        // 目标比较形态重合: 符号链接目标与它解析后的同一对象作为两个目标出现.
+        // 已正确部署的链接 (比较形态等于自己的源) 不参与, 见 `ComparisonForms`.
+        if let Some(key) = comparison.target_key()
+            && let Some(&previous) = first_declared_comparison.get(key)
+        {
+            return Err(Error::ManifestInvalid(format!(
+                "条目 `{}` 与条目 `{}` 声明了同一个目标路径 (比较形态均为 `{}`): 符号链接目标与它解析后的对象不能同时作为目标",
+                entry_label(previous),
+                entry_label(index),
+                key.display()
             )));
         }
         // 字符串不同但两侧都存在且身份相同: 大小写别名等写法仍指向同一个目标.
@@ -227,14 +316,28 @@ pub fn parse(text: &str, repo_root: &Path) -> Result<Manifest> {
             )));
         }
         first_declared_at.insert(resolved.target_path.clone(), index);
+        if let Some(key) = comparison.target_key() {
+            first_declared_comparison.insert(key.to_path_buf(), index);
+        }
         if let Some(identity) = landing_identity {
             first_declared_identity.insert(identity, index);
         }
 
+        forms.push(comparison);
         entries.push(resolved);
     }
 
-    reject_overlapping_paths(&entries, &first_declared_at)?;
+    reject_overlapping_paths(
+        &entries,
+        &forms,
+        &first_declared_at,
+        &first_declared_comparison,
+    )?;
+    // V-12: 目标末段 basename 的字节预算. 放在 V-9 / V-10 / V-11 之后: 长 basename
+    // 与既有规则同时命中时仍报原规则.
+    reject_overlong_target_basenames(&entries)?;
+    // V-13: 目标完整路径的平台预算. 放在 V-12 之后: basename 超限时仍先报 V-12.
+    reject_overlong_target_paths(&entries)?;
 
     Ok(Manifest {
         repo_root: repo_root.to_path_buf(),
@@ -242,76 +345,227 @@ pub fn parse(text: &str, repo_root: &Path) -> Result<Manifest> {
     })
 }
 
+/// 把一条可选身份登记到 `map`; 首次出现的条目下标保留 (与字符串表同一口径).
+fn insert_identity(
+    map: &mut HashMap<os::FileIdentity, usize>,
+    identity: Option<os::FileIdentity>,
+    index: usize,
+) {
+    if let Some(identity) = identity {
+        map.entry(identity).or_insert(index);
+    }
+}
+
+/// V-11: 目标之间, 目标与源之间都不得存在路径重叠.
+///
+/// 所有判定都在**词法形态**与**比较形态**两套路径上执行, 任一形态命中即拒绝:
+///
+/// - 目标之间: 词法形态用于目标祖先/后代; 比较形态把"父目标末段是符号链接"的
+///   嵌套补回来 (`~/.config` 是链接, 子目标经它解析到 referent).
+/// - 目标与源: 目标侧使用词法形态 (运行时会操作的路径), 源侧同时使用词法形态与
+///   比较形态, 使源符号链接的解析目标参与包含判定.
+/// - 身份: 目标之间比较两种形态的 lstat 身份; 源的身份集合同时含 lstat 与 follow,
+///   使源符号链接的解析目标命中目标或其祖先. 目标侧不用 follow 身份, 因为目标
+///   本身是链接对象, 指向另一个源的链接仍应交给运行时分类 (`wrong` / `foreign`).
+///
+/// 已正确部署的链接 (目标比较形态等于自己的源) 不参与目标间的比较形态与身份,
+/// 否则两个共享同一源的合法目标在部署后会被误判为同一对象.
+///
+/// 复杂度仍为 O(N * depth): 每个条目只计算常数次形态, 身份与字符串索引各建一份,
+/// 不做两两比较.
 fn reject_overlapping_paths(
     entries: &[Entry],
-    targets: &HashMap<std::path::PathBuf, usize>,
+    forms: &[ComparisonForms],
+    lexical_targets: &HashMap<std::path::PathBuf, usize>,
+    comparison_targets: &HashMap<std::path::PathBuf, usize>,
 ) -> Result<()> {
-    let mut sources = BTreeMap::new();
-    // 源路径身份 -> 条目下标. 只收已存在的源; 取不到身份时仍由字符串判定兜底.
+    // 源侧索引: 词法形态, 比较形态, 以及每个源路径的 lstat 与 follow 身份.
+    let mut lexical_sources = BTreeMap::new();
+    let mut comparison_sources = BTreeMap::new();
     let mut source_identities: HashMap<os::FileIdentity, usize> = HashMap::new();
     for (index, entry) in entries.iter().enumerate() {
-        sources.entry(entry.source_path.as_path()).or_insert(index);
-        if let Ok(identity) = os::target_identity(&entry.source_path) {
-            source_identities.entry(identity).or_insert(index);
+        lexical_sources
+            .entry(entry.source_path.as_path())
+            .or_insert(index);
+        let form = &forms[index];
+        comparison_sources
+            .entry(form.source.as_path())
+            .or_insert(index);
+        for path in [entry.source_path.as_path(), form.source.as_path()] {
+            insert_identity(
+                &mut source_identities,
+                os::target_identity(path).ok(),
+                index,
+            );
+            insert_identity(&mut source_identities, os::basis_identity(path).ok(), index);
         }
     }
 
-    // 目标路径身份 -> 条目下标. 同样只收已存在的目标.
-    let mut target_identities: HashMap<os::FileIdentity, usize> = HashMap::new();
+    // 目标侧身份分两份:
+    // - `target_nesting_identities` 供目标之间使用, 含比较形态的 lstat 身份, 用于
+    //   识别"父目标的 referent 包含另一个目标";
+    // - `target_landing_identities` 只含 `target_path` 的 lstat 身份, 供源侧比较使用.
+    //   目标的比较形态/follow 身份代表它指向的对象, 但目标本身仍是链接对象; 把
+    //   后者当成目标会让"指向另一个源的错误链接"被误判成目标与源重叠, 破坏
+    //   `status` 对 `wrong` 的既有分类.
+    let mut target_nesting_identities: HashMap<os::FileIdentity, usize> = HashMap::new();
+    let mut target_landing_identities: HashMap<os::FileIdentity, usize> = HashMap::new();
     for (index, entry) in entries.iter().enumerate() {
-        if let Ok(identity) = os::target_identity(&entry.target_path) {
-            target_identities.entry(identity).or_insert(index);
+        let form = &forms[index];
+        let landing = os::target_identity(&entry.target_path).ok();
+        insert_identity(&mut target_landing_identities, landing, index);
+        insert_identity(&mut target_nesting_identities, landing, index);
+        if !form.target_is_own_source_link {
+            insert_identity(
+                &mut target_nesting_identities,
+                os::target_identity(&form.target).ok(),
+                index,
+            );
         }
     }
 
+    // V-11 的祖先身份按路径缓存: 不同条目的祖先大量重合, 同一路径的 lstat 结果在
+    // 一次校验内不变 (校验期间目录树视为稳定). 取不到身份时同样缓存 `None`, 使
+    // 不存在或不可读的祖先不会被反复 stat. 复杂度仍为 O(条目数 * 深度).
+    let mut identity_cache: HashMap<PathBuf, Option<FileIdentity>> = HashMap::new();
+
     for (index, entry) in entries.iter().enumerate() {
-        for ancestor in entry.target_path.ancestors().skip(1) {
-            if let Some(&other) = targets.get(ancestor) {
-                return Err(path_overlap(index, entry, other, TARGET_KEY, ancestor));
-            }
-            if let Some(other) = identity_entry(ancestor, &target_identities)
-                && other != index
-            {
-                return Err(path_overlap(index, entry, other, TARGET_KEY, ancestor));
+        let form = &forms[index];
+        // 目标之间: 词法形态与比较形态的严格祖先都要查; 身份同时覆盖两种形态.
+        let target_forms = [Some(entry.target_path.as_path()), form.target_key()];
+        for target_form in target_forms.into_iter().flatten() {
+            for ancestor in target_form.ancestors().skip(1) {
+                if let Some(&other) = lexical_targets.get(ancestor) {
+                    return Err(path_overlap(index, entry, other, TARGET_KEY, ancestor));
+                }
+                if let Some(&other) = comparison_targets.get(ancestor) {
+                    return Err(path_overlap(index, entry, other, TARGET_KEY, ancestor));
+                }
+                if let Some(other) =
+                    identity_entry(ancestor, &target_nesting_identities, &mut identity_cache)
+                    && other != index
+                {
+                    return Err(path_overlap(index, entry, other, TARGET_KEY, ancestor));
+                }
             }
         }
+
+        // 目标词法形态 (运行时会操作的路径) 与源的两套形态:
+        // 相等或目标落在源内 (目标祖先等于源). 源符号链接的解析目标在这里也参与.
         for ancestor in entry.target_path.ancestors() {
-            if let Some(&other) = sources.get(ancestor) {
+            if let Some(&other) = lexical_sources.get(ancestor) {
                 return Err(path_overlap(index, entry, other, SOURCE_KEY, ancestor));
             }
-            if let Some(other) = identity_entry(ancestor, &source_identities) {
+            if let Some(&other) = comparison_sources.get(ancestor) {
+                return Err(path_overlap(index, entry, other, SOURCE_KEY, ancestor));
+            }
+            if let Some(other) = identity_entry(ancestor, &source_identities, &mut identity_cache) {
                 return Err(path_overlap(index, entry, other, SOURCE_KEY, ancestor));
             }
         }
-        // Path 按组件排序: 若存在以 target 为祖先的源, 下界的第一项即在该子树内.
-        if let Some((&source, &other)) = sources.range(entry.target_path.as_path()..).next()
-            && source.starts_with(&entry.target_path)
-        {
-            return Err(path_overlap(index, entry, other, SOURCE_KEY, source));
-        }
-    }
 
-    // 目标包含源 (含本条目的源): 沿源的祖先逐级比较身份, 覆盖字符串不重合的别名
-    // 形态. 反向 (目标落在源内) 已由上面的目标祖先循环处理.
-    for (source_index, entry) in entries.iter().enumerate() {
-        for ancestor in entry.source_path.ancestors() {
-            if let Some(other) = identity_entry(ancestor, &target_identities) {
-                return Err(path_overlap(
-                    other,
-                    &entries[other],
-                    source_index,
-                    SOURCE_KEY,
-                    &entry.source_path,
-                ));
+        // 源的两套形态 (含源符号链接的解析目标) 与目标词法形态:
+        // 源落在目标内, 或源与目标重合. 目标侧只取 `target_path` 的 lstat 身份,
+        // 不比较目标比较形态: 那会把"指向另一个源的错误链接"误判为重叠.
+        for source_form in [entry.source_path.as_path(), form.source.as_path()] {
+            for ancestor in source_form.ancestors() {
+                if let Some(&other) = lexical_targets.get(ancestor) {
+                    return Err(path_overlap(
+                        other,
+                        &entries[other],
+                        index,
+                        SOURCE_KEY,
+                        source_form,
+                    ));
+                }
+                if let Some(other) =
+                    identity_entry(ancestor, &target_landing_identities, &mut identity_cache)
+                {
+                    return Err(path_overlap(
+                        other,
+                        &entries[other],
+                        index,
+                        SOURCE_KEY,
+                        source_form,
+                    ));
+                }
             }
         }
     }
     Ok(())
 }
 
+/// V-12: `target` 的末段 basename 不得超过 [`entry::MAX_TARGET_BASENAME_BYTES`] 字节.
+///
+/// 计数使用 `target_path` 的原始 UTF-8 字节, 不是字符数或显示宽度. 超限时整体拒绝
+/// (退出码 2, 零改动), 说明给出条目下标, 书写形态, 实际字节数与上限. 该预算为备份
+/// 最终名, 备份暂存名, 恢复暂存名与 apply/undo 暂存名的固定后缀预留空间, 使清单
+/// 接受的每个目标都能被四条命令处理; 只创建链接的条目也按同一预算拒绝.
+///
+/// 本校验在 V-9 / V-10 / V-11 之后运行: 既有规则的报错优先级不因新增预算而改变.
+fn reject_overlong_target_basenames(entries: &[Entry]) -> Result<()> {
+    for (index, entry) in entries.iter().enumerate() {
+        let bytes = entry::target_basename_bytes(&entry.target_path);
+        if bytes > entry::MAX_TARGET_BASENAME_BYTES {
+            return Err(invalid_entry(
+                index,
+                format!(
+                    "`{}` 的末段 basename 为 {bytes} 字节, 超过上限 {} 字节 (按 UTF-8 字节计数): 备份与暂存名需要追加固定后缀, 请缩短目标末段",
+                    entry.target,
+                    entry::MAX_TARGET_BASENAME_BYTES
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// V-13: `target` 的规范化绝对路径字节数加最长生成后缀不得超过平台路径预算.
+///
+/// 计数使用 `target_path` 的原始 UTF-8 字节, 不是字符数或显示宽度. 超限时整体拒绝
+/// (退出码 2, 零改动), 说明给出条目下标, 书写形态, 解析后的绝对路径, 实际字节数与
+/// 预算. 预算为平台 PATH_MAX (Linux 4096, macOS 1024) 减去
+/// [`entry::MAX_GENERATED_SUFFIX_RESERVE_BYTES`] 的生成后缀预留; 备份最终名, 备份
+/// 暂存名, 恢复暂存名与 apply/undo 暂存名都在目标路径后追加固定后缀, 因此完整路径
+/// 与 basename 一样必须在清单层受限.
+///
+/// 本校验在 V-9 / V-10 / V-11 / V-12 之后运行: 既有规则的报错优先级不因新增预算而
+/// 改变. 相对 `target` 按仓库根解析, 所以同一清单的接受面随仓库位置变化.
+fn reject_overlong_target_paths(entries: &[Entry]) -> Result<()> {
+    for (index, entry) in entries.iter().enumerate() {
+        if entry::target_path_fits_budget(&entry.target_path) {
+            continue;
+        }
+        let bytes = entry::target_path_bytes(&entry.target_path);
+        let budget = entry::max_target_path_bytes();
+        return Err(invalid_entry(
+            index,
+            format!(
+                "`{}` 的解析后完整路径 `{}` 为 {bytes} 字节, 超过上限 {budget} 字节 (平台路径上限 {} 字节减去最长生成后缀预留 {} 字节): 备份与暂存名需要追加固定后缀, 请缩短目标的完整路径",
+                entry.target,
+                entry.target_path.display(),
+                entry::PLATFORM_PATH_MAX_BYTES,
+                entry::MAX_GENERATED_SUFFIX_RESERVE_BYTES
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// 取 `path` 的落点身份并查出映射中的条目下标; 路径不存在时返回 None.
-fn identity_entry(path: &Path, identities: &HashMap<os::FileIdentity, usize>) -> Option<usize> {
-    let identity = os::target_identity(path).ok()?;
+///
+/// 身份查询先经过 `cache`: 同一路径在一次 V-11 校验内只 `lstat` 一次, 失败结果
+/// 也以 `None` 缓存. 缓存键是祖先的原始路径, 不做额外规范化, 保持 V-11 当前的
+/// 字符串与祖先语义 (设计 D7).
+fn identity_entry(
+    path: &Path,
+    identities: &HashMap<os::FileIdentity, usize>,
+    cache: &mut HashMap<PathBuf, Option<FileIdentity>>,
+) -> Option<usize> {
+    let cached = *cache
+        .entry(path.to_path_buf())
+        .or_insert_with(|| os::target_identity(path).ok());
+    let identity = cached?;
     identities.get(&identity).copied()
 }
 
@@ -406,7 +660,7 @@ fn parse_on_conflict(table: &toml::Table, index: usize) -> Result<OnConflict> {
     }
 }
 
-/// 条目级校验失败的统一说明: V-4 到 V-10 的每一条都必须能指出条目下标.
+/// 条目级校验失败的统一说明: V-4 到 V-13 的每一条都必须能指出条目下标.
 ///
 /// 下标只以 `entry[{index}]` 的形态出现一次.
 fn invalid_entry(index: usize, detail: impl std::fmt::Display) -> Error {
@@ -424,18 +678,38 @@ const HOME_PHYSICAL_PROBE: &str = ".dotlink-home-probe";
 
 /// V-9 的身份比较基准: 每一类基准点尽力取得文件系统身份.
 ///
+/// 每个基准点同时保存 lstat 形态与 follow 形态: `HOME` 与清单文件本身都可能是
+/// 符号链接, 同一对象因此有两个身份; 落点的 lstat 身份命中任一形态都必须拒绝.
 /// 取不到身份的基准点不进入集合, 该类只剩规范化字符串比较 (路径不存在或元数据
 /// 读取失败时不得因此拒绝清单). 基准点数量与条目数无关, 每份清单只多做常数次
 /// `stat`.
 struct BaselineIdentities {
     /// 文件系统根.
-    root: Option<os::FileIdentity>,
-    /// 主目录的书写形态与物理形态; 同一对象只保留一份.
+    root: Vec<os::FileIdentity>,
+    /// 主目录的书写形态与物理形态; 每一形态再取 lstat 与 follow.
     home: Vec<os::FileIdentity>,
+    /// 主目录书写形态与物理形态的全部祖先 (V-9c). 与 `home` 分开保存, 以便祖先
+    /// 命中给出独立说明; 取不到身份的祖先不进入集合, 只保留字符串判定.
+    home_ancestors: Vec<os::FileIdentity>,
     /// 仓库根及其全部祖先.
     repo: Vec<os::FileIdentity>,
-    /// 清单文件自身 (跟随符号链接).
-    manifest: Option<os::FileIdentity>,
+    /// 清单文件自身.
+    manifest: Vec<os::FileIdentity>,
+}
+
+/// 取 `path` 的 lstat 与 follow 身份, 去重后追加到 `out`.
+fn extend_identities(out: &mut Vec<os::FileIdentity>, path: &Path) {
+    for identity in [
+        os::target_identity(path).ok(),
+        os::basis_identity(path).ok(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !out.contains(&identity) {
+            out.push(identity);
+        }
+    }
 }
 
 impl BaselineIdentities {
@@ -447,21 +721,41 @@ impl BaselineIdentities {
     ) -> Self {
         let mut home_identities = Vec::new();
         for path in [home, home_physical].into_iter().flatten() {
-            if let Ok(identity) = os::basis_identity(path)
-                && !home_identities.contains(&identity)
-            {
-                home_identities.push(identity);
+            extend_identities(&mut home_identities, path);
+        }
+
+        let mut home_ancestors = Vec::new();
+        for path in [home, home_physical].into_iter().flatten() {
+            // `HOME` 是符号链接时两种形态的祖先链可能不同, 因此两条都遍历; 已作为
+            // "主目录本身"记录的身份不再重复进入祖先集合, 使两类命中保持可区分.
+            for ancestor in path.ancestors() {
+                let mut identities = Vec::new();
+                extend_identities(&mut identities, ancestor);
+                for identity in identities {
+                    if !home_identities.contains(&identity) && !home_ancestors.contains(&identity) {
+                        home_ancestors.push(identity);
+                    }
+                }
             }
         }
 
+        let mut root = Vec::new();
+        extend_identities(&mut root, Path::new("/"));
+
+        let mut repo_identities = Vec::new();
+        for ancestor in repo.ancestors() {
+            extend_identities(&mut repo_identities, ancestor);
+        }
+
+        let mut manifest = Vec::new();
+        extend_identities(&mut manifest, &repo_root.join(MANIFEST_NAME));
+
         Self {
-            root: os::basis_identity(Path::new("/")).ok(),
+            root,
             home: home_identities,
-            repo: repo
-                .ancestors()
-                .filter_map(|path| os::basis_identity(path).ok())
-                .collect(),
-            manifest: os::basis_identity(&repo_root.join(MANIFEST_NAME)).ok(),
+            home_ancestors,
+            repo: repo_identities,
+            manifest,
         }
     }
 }
@@ -484,7 +778,7 @@ fn physical_home(home: &Path) -> std::path::PathBuf {
 
 /// V-9: 目标落点不得退化 -- 归一化后命中以下位置之一即整体拒绝.
 ///
-/// 四个落点的共同点是命中它们的条目一旦落地 (`replace_and_backup` 尤甚) 就会毁掉
+/// 落点的共同点是命中它们的条目一旦落地 (`replace_and_backup` 尤甚) 就会毁掉
 /// 远超单个链接范围的内容: 文件系统根或主目录本身被替换备份, 毁掉的是一整棵树;
 /// 仓库根本身或其祖先被替换备份, 毁掉的是源仓库; 清单文件自身被替换备份, 之后所有
 /// 命令都因清单不可读而退 2. `.` / `..` / 裸 `~` / `dotlink.toml` 都是极易写出的
@@ -492,6 +786,7 @@ fn physical_home(home: &Path) -> std::path::PathBuf {
 ///
 /// 主目录有两个比较基准 (`HOME` 的书写形态与解析符号链接后的物理形态), 二者都要
 /// 拒绝: `HOME` 自身可能是符号链接, 只比较一种形态会让另一种写法的主目录落点漏过.
+/// V-9c 把同一保护面扩展到主目录的祖先, 并拒绝经 `..` 离开主目录的 `~` 简写.
 ///
 /// 目标落点存在时再比较文件系统身份: 大小写别名与 firmlink 别名不改变字符串, 却与
 /// 基准点指向同一对象, 同样必须命中. 身份取不到时退回上面的字符串判定.
@@ -531,9 +826,30 @@ fn reject_degenerate_target(
     if landing.as_path() == repo.join(MANIFEST_NAME) {
         return Err(degenerate_manifest(index, written));
     }
+    // V-9c: 主目录的真祖先. 文件系统根与主目录本身已在前两项拒绝, 因此这里只剩
+    // 真祖先. 两种形态都检查: `HOME` 可能是符号链接, 只比较书写形态会让物理形态下
+    // 的祖先漏过. 本判定放在仓库祖先之后: 祖先恰好覆盖源仓库时保留 V-9b 的既有报错
+    // (例如夹具把 HOME 放在仓库内的 `..` 落点), 不改变既有行为.
+    if [home, home_physical]
+        .into_iter()
+        .flatten()
+        .any(|basis| basis.starts_with(landing))
+    {
+        return Err(degenerate_home_ancestor(index, written));
+    }
+    // V-9c: `~` 简写不得经 `..` 离开主目录. 只做纯词法折叠 (`Path::components`),
+    // 不解析符号链接 -- 用规范化后的落点判定会把 `~/symlinked-dir/file` 这类有意
+    // 指向主目录外部的合法符号链接子目录误拒. HOME 不可用时跳过: 这类条目已由
+    // V-6 处理, 绝对路径不得因此被拒.
+    if let Some(home) = home
+        && let Some(folded) = entry::tilde_expansion_lexical(written, home)
+        && !folded.starts_with(home)
+    {
+        return Err(degenerate_home_escape(index, written));
+    }
 
     if let Some(identity) = landing_identity {
-        if baselines.root == Some(identity) {
+        if baselines.root.contains(&identity) {
             return Err(degenerate_file_system_root(index, written));
         }
         if baselines.home.contains(&identity) {
@@ -542,8 +858,13 @@ fn reject_degenerate_target(
         if baselines.repo.contains(&identity) {
             return Err(degenerate_repo(index, written));
         }
-        if baselines.manifest == Some(identity) {
+        if baselines.manifest.contains(&identity) {
             return Err(degenerate_manifest(index, written));
+        }
+        // V-9c: 祖先目录的大小写别名与其它等价写法; 放在既有基准之后以保持既有
+        // 报错优先级.
+        if baselines.home_ancestors.contains(&identity) {
+            return Err(degenerate_home_ancestor(index, written));
         }
     }
     Ok(())
@@ -560,6 +881,24 @@ fn degenerate_home(index: usize, written: &str) -> Error {
     invalid_entry(
         index,
         format!("`{written}` 归一化后是当前用户主目录: 不能以主目录本身为落点"),
+    )
+}
+
+fn degenerate_home_ancestor(index: usize, written: &str) -> Error {
+    invalid_entry(
+        index,
+        format!(
+            "`{written}` 归一化后是当前用户主目录的祖先: 不能以主目录的祖先为落点 (会连同主目录一起被替换备份)"
+        ),
+    )
+}
+
+fn degenerate_home_escape(index: usize, written: &str) -> Error {
+    invalid_entry(
+        index,
+        format!(
+            "`{written}` 的 `~` 简写经 `..` 离开了当前用户主目录: `~` 写法只能表达主目录及其之下的词法路径"
+        ),
     )
 }
 
@@ -625,15 +964,21 @@ mod tests {
     /// 与文件系统根区分开).
     #[track_caller]
     fn assert_invalid_at(text: &str, repo_root: &Path, needles: &[&str]) {
+        let message = invalid_message_at(text, repo_root);
+        for needle in needles {
+            assert!(message.contains(needle), "说明中缺少 {needle:?}: {message}");
+        }
+    }
+
+    /// 断言 `parse` 整体拒绝并返回说明, 供需要检查"未命中某条规则"的用例使用.
+    #[track_caller]
+    fn invalid_message_at(text: &str, repo_root: &Path) -> String {
         let error = parse(text, repo_root)
             .err()
             .unwrap_or_else(|| panic!("期望整体拒绝, 实际接受了这份清单:\n{text}"));
-        let message = match error {
+        match error {
             Error::ManifestInvalid(message) => message,
             other => panic!("期望 Error::ManifestInvalid, 实际为 {other:?}"),
-        };
-        for needle in needles {
-            assert!(message.contains(needle), "说明中缺少 {needle:?}: {message}");
         }
     }
 
@@ -678,6 +1023,44 @@ mod tests {
             Err(Error::ManifestInvalid(message)) => eprintln!("{message}"),
             other => panic!("HOME 缺失时期望整体拒绝, 实际为 {other:?}"),
         }
+    }
+
+    /// 在**没有** `HOME` 的子进程中跑 `parse`, 断言清单被接受.
+    ///
+    /// `HOME` 缺失时 V-9c 的祖先与 `~` 判定都不适用, 绝对路径不得因此被拒.
+    fn parse_without_home_accepts(text: &str) {
+        let output = std::process::Command::new(std::env::current_exe().expect("测试二进制路径"))
+            .args([
+                "--ignored",
+                "--exact",
+                "--nocapture",
+                "manifest::tests::home_absent_accept_probe",
+            ])
+            .env("DOTLINK_TEST_MANIFEST", text)
+            .env_remove("HOME")
+            .output()
+            .expect("重新执行测试二进制");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "子进程未跑到探针: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// 子进程侧的探针: `HOME` 缺失时绝对 target 必须被接受.
+    ///
+    /// 默认 `#[ignore]`, 只在 `parse_without_home_accepts` 显式拉起的子进程中运行.
+    #[test]
+    #[ignore = "由 parse_without_home_accepts 在隔离子进程中拉起"]
+    fn home_absent_accept_probe() {
+        let text = std::env::var("DOTLINK_TEST_MANIFEST").expect("父进程应传入清单文本");
+        assert!(
+            std::env::var_os("HOME").is_none(),
+            "该探针必须在没有 HOME 的进程中运行"
+        );
+        parse(&text, &repo()).expect("HOME 缺失时绝对 target 不得被拒绝");
     }
 
     // -----------------------------------------------------------------------
@@ -829,6 +1212,60 @@ mod tests {
 
         let text = "[[entry]]\nsource = \"a\"\ntarget = \"one\"\n\n[[entry]]\nsource = \"b\"\ntarget = \"two\"\n";
         let manifest = parse(text, &root).expect("不同对象必须仍被接受");
+        assert_eq!(manifest.entries.len(), 2);
+    }
+
+    #[test]
+    fn v5_a_symlink_target_and_its_referent_cannot_both_be_targets() {
+        let dir = tempfile::tempdir().expect("创建临时目录");
+        let root = std::fs::canonicalize(dir.path()).expect("临时目录的物理路径");
+        std::fs::create_dir(root.join("real")).expect("创建 referent 目录");
+        std::os::unix::fs::symlink(root.join("real"), root.join("alias"))
+            .expect("建立目标别名链接");
+
+        // `alias` 的末段是符号链接, 词法形态与 `real` 不同; 比较形态才会重合.
+        assert_invalid_at(
+            "[[entry]]\nsource = \"a\"\ntarget = \"alias\"\n\n[[entry]]\nsource = \"b\"\ntarget = \"real\"\n",
+            &root,
+            &["entry[0]", "entry[1]", "目标路径", "比较形态"],
+        );
+    }
+
+    #[test]
+    fn v5_two_symlinks_pointing_at_one_object_conflict() {
+        let dir = tempfile::tempdir().expect("创建临时目录");
+        let root = std::fs::canonicalize(dir.path()).expect("临时目录的物理路径");
+        std::fs::create_dir(root.join("real")).expect("创建 referent 目录");
+        for name in ["alias-one", "alias-two"] {
+            std::os::unix::fs::symlink(root.join("real"), root.join(name))
+                .expect("建立目标别名链接");
+        }
+
+        // 两个链接对象本身不同 (lstat 身份不同), 但比较形态指向同一对象.
+        assert_invalid_at(
+            "[[entry]]\nsource = \"a\"\ntarget = \"alias-one\"\n\n[[entry]]\nsource = \"b\"\ntarget = \"alias-two\"\n",
+            &root,
+            &["entry[0]", "entry[1]", "目标路径", "比较形态"],
+        );
+    }
+
+    #[test]
+    fn v5_deployed_links_sharing_one_source_are_still_accepted() {
+        let dir = tempfile::tempdir().expect("创建临时目录");
+        let root = std::fs::canonicalize(dir.path()).expect("临时目录的物理路径");
+        std::fs::write(root.join("shared"), "payload").expect("创建共享源");
+        // 两个目标都已是正确的部署链接 (指向自己的源): 比较形态相同, 但不得因此
+        // 被 V-5 误判为重复目标.
+        for name in ["one", "two"] {
+            std::os::unix::fs::symlink(root.join("shared"), root.join(name))
+                .expect("建立正确部署的链接");
+        }
+
+        let manifest = parse(
+            "[[entry]]\nsource = \"shared\"\ntarget = \"one\"\n\n[[entry]]\nsource = \"shared\"\ntarget = \"two\"\n",
+            &root,
+        )
+        .expect("多个独立目标共享同一源必须仍被接受");
         assert_eq!(manifest.entries.len(), 2);
     }
 
@@ -1015,8 +1452,196 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // V-10: 目标不得指向本条目自己的 source (自指链接恒为断链)
+    // V-9c: 主目录的祖先也是受保护落点, 且 `~` 简写不得经 `..` 离开主目录
     // -----------------------------------------------------------------------
+
+    /// 当前进程是否有可用的 `HOME`.
+    fn home_is_available() -> bool {
+        std::env::var_os("HOME").is_some_and(|value| !value.is_empty())
+    }
+
+    /// 直接驱动 V-9 判定, 用显式 `home` 控制主目录形态.
+    ///
+    /// edition 2024 下 `std::env::set_var` 是 `unsafe`, 需要 `HOME` 是符号链接等
+    /// 形态的用例不能修改进程环境, 只能直接调用判定函数并显式传入两种主目录形态.
+    /// 仓库放在独立的临时目录, 避免落点先命中仓库祖先判定.
+    fn reject_with_home(written: &str, home: &Path, repo_root: &Path) -> Result<()> {
+        let repo = os::normalize(repo_root);
+        let written_home = os::normalize(home);
+        let physical = physical_home(&written_home);
+        let expanded = if let Some(rest) = written.strip_prefix("~/") {
+            written_home.join(rest.trim_start_matches(std::path::MAIN_SEPARATOR))
+        } else if written == "~" {
+            written_home.clone()
+        } else {
+            PathBuf::from(written)
+        };
+        let entry = Entry {
+            source: "a".to_string(),
+            target: written.to_string(),
+            on_conflict: OnConflict::Skip,
+            source_path: repo.join("a"),
+            target_path: os::normalize(&expanded),
+        };
+        let baselines =
+            BaselineIdentities::collect(repo_root, &repo, Some(&written_home), Some(&physical));
+        let landing_identity = os::target_identity(&entry.target_path).ok();
+        reject_degenerate_target(
+            0,
+            &entry,
+            &repo,
+            Some(&written_home),
+            Some(&physical),
+            landing_identity,
+            &baselines,
+        )
+    }
+
+    /// 建一个独立的临时仓库根, 与调用方的主目录互不包含.
+    fn separate_repo_root() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("创建仓库临时目录");
+        let root = std::fs::canonicalize(dir.path()).expect("仓库临时目录的物理路径");
+        (dir, root)
+    }
+
+    #[test]
+    fn v9c_tilde_parent_and_absolute_home_parent_are_rejected() {
+        let home_dir = tempfile::tempdir().expect("创建主目录临时目录");
+        let home_root = std::fs::canonicalize(home_dir.path()).expect("主目录物理路径");
+        let home = home_root.join("user");
+        std::fs::create_dir_all(&home).expect("创建主目录");
+        let (_repo_dir, repo_root) = separate_repo_root();
+
+        // `~/..` 与绝对形式的 HOME 父目录都归一化为主目录的祖先.
+        let absolute_parent = home_root.display().to_string();
+        for written in ["~/..".to_string(), absolute_parent] {
+            let error =
+                reject_with_home(&written, &home, &repo_root).expect_err("主目录的祖先必须被拒绝");
+            let Error::ManifestInvalid(message) = error else {
+                panic!("必须归入 ManifestInvalid");
+            };
+            for needle in ["entry[0]", &format!("`{written}`"), "主目录的祖先"] {
+                assert!(message.contains(needle), "说明中缺少 {needle:?}: {message}");
+            }
+        }
+    }
+
+    #[test]
+    fn v9c_tilde_escape_through_parent_is_rejected() {
+        if !home_is_available() {
+            println!("跳过 v9c_tilde_escape_through_parent_is_rejected: HOME 不可用");
+            return;
+        }
+        // `~//../x` 折叠后落在主目录的父目录之下: 虽不是祖先本身, 也属 `~` 逃逸.
+        assert_invalid(
+            "[[entry]]\nsource = \"a\"\ntarget = \"~//../x\"\n",
+            &["entry[0]", "`~//../x`", "主目录及其之下"],
+        );
+    }
+
+    #[test]
+    fn v9c_legal_tilde_and_absolute_targets_are_still_accepted() {
+        if !home_is_available() {
+            println!("跳过 v9c_legal_tilde_and_absolute_targets_are_still_accepted: HOME 不可用");
+            return;
+        }
+        // `~/sub` 是主目录之下的词法路径, `/etc/hosts` 也不是主目录的祖先.
+        let text = "[[entry]]\nsource = \"a\"\ntarget = \"~/sub\"\n\n[[entry]]\nsource = \"b\"\ntarget = \"/etc/hosts\"\n";
+        let manifest = parse(text, &repo()).expect("合法落点不得被 V-9c 误伤");
+        assert_eq!(manifest.entries.len(), 2);
+        assert_eq!(
+            manifest.entries[1].target_path,
+            crate::os::normalize(Path::new("/etc/hosts"))
+        );
+    }
+
+    #[test]
+    fn v9c_physical_form_ancestor_of_a_symlinked_home_is_rejected() {
+        // 物理形态的主目录在另一个临时根下; 书写形态的别名则在别处, 使祖先落点
+        // 只可能由物理形态命中.
+        let physical_dir = tempfile::tempdir().expect("创建物理主目录临时目录");
+        let physical_root =
+            std::fs::canonicalize(physical_dir.path()).expect("物理主目录临时目录的物理路径");
+        let real_home = physical_root.join("real-home");
+        std::fs::create_dir_all(&real_home).expect("创建物理主目录");
+
+        let alias_dir = tempfile::tempdir().expect("创建别名临时目录");
+        let alias_root = std::fs::canonicalize(alias_dir.path()).expect("别名临时目录的物理路径");
+        let home_alias = alias_root.join("home-alias");
+        std::os::unix::fs::symlink(&real_home, &home_alias).expect("建立主目录别名链接");
+
+        let written = physical_root.display().to_string();
+        let (_repo_dir, repo_root) = separate_repo_root();
+        let error = reject_with_home(&written, &home_alias, &repo_root)
+            .expect_err("主目录物理形态的祖先必须被拒绝");
+        let Error::ManifestInvalid(message) = error else {
+            panic!("必须归入 ManifestInvalid");
+        };
+        for needle in ["entry[0]", &format!("`{written}`"), "主目录的祖先"] {
+            assert!(message.contains(needle), "说明中缺少 {needle:?}: {message}");
+        }
+    }
+
+    #[test]
+    fn v9c_case_alias_of_a_home_ancestor_is_rejected() {
+        if !case_insensitive_volume() {
+            println!(
+                "跳过 v9c_case_alias_of_a_home_ancestor_is_rejected: 当前卷大小写敏感, 无法构造大小写别名"
+            );
+            return;
+        }
+
+        let home_dir = tempfile::tempdir().expect("创建主目录临时目录");
+        let home_root = std::fs::canonicalize(home_dir.path()).expect("主目录物理路径");
+        let home = home_root.join("user");
+        std::fs::create_dir_all(&home).expect("创建主目录");
+        let (_repo_dir, repo_root) = separate_repo_root();
+
+        let alias = home_root.display().to_string().to_uppercase();
+        if alias == home_root.display().to_string() {
+            println!(
+                "跳过 v9c_case_alias_of_a_home_ancestor_is_rejected: 路径不含可改变大小写的字符"
+            );
+            return;
+        }
+        // 字符串比较不命中 (大小写不同), 只有文件系统身份能识别出这是同一个祖先.
+        let error = reject_with_home(&alias, &home, &repo_root)
+            .expect_err("祖先目录的大小写别名必须被拒绝");
+        let Error::ManifestInvalid(message) = error else {
+            panic!("必须归入 ManifestInvalid");
+        };
+        for needle in ["entry[0]", &format!("`{alias}`"), "主目录的祖先"] {
+            assert!(message.contains(needle), "说明中缺少 {needle:?}: {message}");
+        }
+    }
+
+    #[test]
+    fn v9c_absolute_target_is_not_rejected_without_home() {
+        // HOME 缺失时祖先与 `~` 判定都不适用: 绝对路径不得因此被拒.
+        parse_without_home_accepts("[[entry]]\nsource = \"a\"\ntarget = \"/etc/hosts\"\n");
+    }
+
+    #[test]
+    fn v9c_tilde_target_through_an_outside_symlink_is_accepted() {
+        let home_dir = tempfile::tempdir().expect("创建主目录临时目录");
+        let home_root = std::fs::canonicalize(home_dir.path()).expect("主目录物理路径");
+        let home = home_root.join("user");
+        std::fs::create_dir_all(&home).expect("创建主目录");
+        // 指向主目录外部 (但既不是主目录也不是其祖先) 的符号链接子目录是有意配置.
+        let outside = home_root.join("outside");
+        std::fs::create_dir_all(&outside).expect("创建主目录外目录");
+        let symlinked_dir = home.join("symlinked-dir");
+        std::os::unix::fs::symlink(&outside, &symlinked_dir).expect("建立符号链接子目录");
+
+        let (_repo_dir, repo_root) = separate_repo_root();
+        reject_with_home("~/symlinked-dir/file", &home, &repo_root)
+            .expect("指向主目录外部的符号链接子目录不得被词法 `~` 判定误伤");
+
+        // 词法折叠只看书写形态: 展开路径仍落在主目录之下.
+        let folded = entry::tilde_expansion_lexical("~/symlinked-dir/file", &os::normalize(&home))
+            .expect("`~/...` 应被识别为 `~` 简写");
+        assert!(folded.starts_with(os::normalize(&home)));
+    }
 
     #[test]
     fn v10_a_self_referential_target_is_rejected() {
@@ -1052,6 +1677,49 @@ mod tests {
     }
 
     #[test]
+    fn v10_a_source_symlink_that_resolves_to_the_target_is_rejected() {
+        let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) else {
+            return;
+        };
+        let home = PathBuf::from(home);
+        let dir = tempfile::tempdir().expect("创建临时目录");
+        let root = std::fs::canonicalize(dir.path()).expect("临时目录的物理路径");
+        let referent = home.join(".dotlink-v10-referent");
+        std::os::unix::fs::symlink(&referent, root.join("link")).expect("建立源符号链接");
+
+        // 源的解析目标等于目标路径: 建链会得到 `target -> source -> target` 的环.
+        assert_invalid_at(
+            "[[entry]]\nsource = \"link\"\ntarget = \"~/.dotlink-v10-referent\"\n",
+            &root,
+            &[
+                "entry[0]",
+                "自指",
+                "符号链接解析目标",
+                "~/.dotlink-v10-referent",
+            ],
+        );
+    }
+
+    #[test]
+    fn v10_an_unrelated_source_symlink_is_accepted() {
+        let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) else {
+            return;
+        };
+        let home = PathBuf::from(home);
+        let dir = tempfile::tempdir().expect("创建临时目录");
+        let root = std::fs::canonicalize(dir.path()).expect("临时目录的物理路径");
+        std::os::unix::fs::symlink(home.join(".dotlink-v10-unrelated"), root.join("link"))
+            .expect("建立源符号链接");
+
+        let manifest = parse(
+            "[[entry]]\nsource = \"link\"\ntarget = \"~/.dotlink-v10-target\"\n",
+            &root,
+        )
+        .expect("解析目标与目标无关的源符号链接必须仍被接受");
+        assert_eq!(manifest.entries.len(), 1);
+    }
+
+    #[test]
     fn v11_a_target_cannot_replace_another_entries_source() {
         let text = "[[entry]]\nsource = \"a\"\ntarget = \"b\"\n\n[[entry]]\nsource = \"b\"\ntarget = \"c\"\n";
         assert_invalid(text, &["entry[0]", "entry[1]", "source", "路径重叠"]);
@@ -1082,6 +1750,56 @@ mod tests {
     }
 
     #[test]
+    fn v11_a_child_target_below_a_symlinked_parent_target_is_rejected() {
+        let dir = tempfile::tempdir().expect("创建临时目录");
+        let root = std::fs::canonicalize(dir.path()).expect("临时目录的物理路径");
+        std::fs::create_dir_all(root.join("data/nvim")).expect("创建 referent 目录");
+        std::os::unix::fs::symlink(root.join("data"), root.join("alias"))
+            .expect("建立父目标别名链接");
+
+        // 第一个目标 `alias` 是符号链接; 第二个目标的祖先经它解析到 `data`, 因此
+        // 词法形态看起来不嵌套, 比较形态才会命中.
+        assert_invalid_at(
+            "[[entry]]\nsource = \"a\"\ntarget = \"alias\"\n\n[[entry]]\nsource = \"b\"\ntarget = \"alias/nvim/init.lua\"\n",
+            &root,
+            &["entry[0]", "entry[1]", "路径重叠"],
+        );
+    }
+
+    #[test]
+    fn v11_a_single_target_below_a_symlinked_parent_is_accepted() {
+        let dir = tempfile::tempdir().expect("创建临时目录");
+        let root = std::fs::canonicalize(dir.path()).expect("临时目录的物理路径");
+        std::fs::create_dir_all(root.join("data/nvim")).expect("创建 referent 目录");
+        std::os::unix::fs::symlink(root.join("data"), root.join("alias"))
+            .expect("建立父目录别名链接");
+
+        // 没有把链接本身声明为另一个目标时, 单个子目标必须被接受.
+        let manifest = parse(
+            "[[entry]]\nsource = \"a\"\ntarget = \"alias/nvim/init.lua\"\n",
+            &root,
+        )
+        .expect("单一目标位于符号链接父目录下必须被接受");
+        assert_eq!(manifest.entries.len(), 1);
+    }
+
+    #[test]
+    fn v11_a_source_symlink_whose_referent_contains_the_target_is_rejected() {
+        let dir = tempfile::tempdir().expect("创建临时目录");
+        let root = std::fs::canonicalize(dir.path()).expect("临时目录的物理路径");
+        std::fs::create_dir_all(root.join("data")).expect("创建 referent 目录");
+        std::os::unix::fs::symlink(root.join("data"), root.join("link")).expect("建立源符号链接");
+
+        // 源的解析目标 `data` 是目标 `data/child` 的祖先: 经源链接可以改写目标所在
+        // 目录, 必须整体拒绝.
+        assert_invalid_at(
+            "[[entry]]\nsource = \"link\"\ntarget = \"data/child\"\n",
+            &root,
+            &["entry[0]", "路径重叠", "data"],
+        );
+    }
+
+    #[test]
     fn v11_distinct_directory_trees_are_not_reported_as_overlapping() {
         let dir = tempfile::tempdir().expect("创建临时目录");
         let root = std::fs::canonicalize(dir.path()).expect("临时目录的物理路径");
@@ -1091,6 +1809,221 @@ mod tests {
         let text = "[[entry]]\nsource = \"a\"\ntarget = \"one\"\n\n[[entry]]\nsource = \"b\"\ntarget = \"two/child\"\n";
         let manifest = parse(text, &root).expect("不同目录树不得被身份判等误报");
         assert_eq!(manifest.entries.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // V-12: 目标 basename 的字节预算 (按 UTF-8 字节, 不是字符数)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn v12_a_two_hundred_byte_ascii_basename_is_accepted() {
+        let name = "a".repeat(entry::MAX_TARGET_BASENAME_BYTES);
+        let text = format!("[[entry]]\nsource = \"a\"\ntarget = \"link/{name}\"\n");
+        let manifest = parse(&text, &repo()).expect("200 字节 basename 必须被接受");
+        assert_eq!(
+            entry::target_basename_bytes(&manifest.entries[0].target_path),
+            entry::MAX_TARGET_BASENAME_BYTES
+        );
+    }
+
+    #[test]
+    fn v12_a_two_hundred_one_byte_ascii_basename_is_rejected() {
+        let name = "a".repeat(entry::MAX_TARGET_BASENAME_BYTES + 1);
+        let text = format!("[[entry]]\nsource = \"a\"\ntarget = \"link/{name}\"\n");
+        assert_invalid(
+            &text,
+            &["entry[0]", "末段 basename", "201", "200", name.as_str()],
+        );
+    }
+
+    #[test]
+    fn v12_multibyte_basenames_are_counted_in_utf8_bytes() {
+        // 67 个 3 字节字符共 201 字节, 显示宽度只有 134 列: 必须按字节拒绝.
+        let name = "日".repeat(67);
+        assert_eq!(name.len(), 201);
+        let text = format!("[[entry]]\nsource = \"a\"\ntarget = \"link/{name}\"\n");
+        assert_invalid(
+            &text,
+            &["entry[0]", "末段 basename", "201", "200", name.as_str()],
+        );
+    }
+
+    #[test]
+    fn v12_a_link_only_entry_is_rejected_at_the_manifest_layer() {
+        // 目标当前不存在: apply 只会创建链接. 清单契约不依赖运行时状态, 同样拒绝.
+        let name = "a".repeat(entry::MAX_TARGET_BASENAME_BYTES + 1);
+        let text = format!("[[entry]]\nsource = \"a\"\ntarget = \"link/{name}\"\n");
+        assert_invalid(&text, &["entry[0]", "末段 basename", "201", "200"]);
+    }
+
+    #[test]
+    fn v12_does_not_preempt_the_existing_rule_priority() {
+        // V-9: 仓库根自身, 其末段也超过 200 字节.
+        let repo_name = "r".repeat(entry::MAX_TARGET_BASENAME_BYTES + 1);
+        let deep_repo = Path::new("/tmp").join(&repo_name);
+        let message = invalid_message_at("[[entry]]\nsource = \"a\"\ntarget = \".\"\n", &deep_repo);
+        assert!(message.contains("仓库根本身或其祖先"), "{message}");
+        assert!(!message.contains("末段 basename"), "{message}");
+
+        // V-10: target 与 source 归一化后相同, 末段超过 200 字节.
+        let long = "a".repeat(entry::MAX_TARGET_BASENAME_BYTES + 1);
+        let same = format!("sub/{long}");
+        let text = format!("[[entry]]\nsource = \"{same}\"\ntarget = \"{same}\"\n");
+        let message = invalid_message_at(&text, &repo());
+        assert!(message.contains("自指"), "{message}");
+        assert!(!message.contains("末段 basename"), "{message}");
+
+        // V-11: 第二个目标落在第一个目标之内, 且自身末段超过 200 字节.
+        let text = format!(
+            "[[entry]]\nsource = \"a\"\ntarget = \"link\"\n\n[[entry]]\nsource = \"b\"\ntarget = \"link/{long}\"\n"
+        );
+        let message = invalid_message_at(&text, &repo());
+        assert!(message.contains("路径重叠"), "{message}");
+        assert!(!message.contains("末段 basename"), "{message}");
+    }
+
+    // -----------------------------------------------------------------------
+    // V-13: 目标完整路径的平台预算 (按 UTF-8 字节, 含最长生成后缀预留)
+    // -----------------------------------------------------------------------
+
+    /// 构造恰为 `bytes` 字节的绝对路径, 每段不超过 101 字节 (低于 V-12 的 200).
+    fn path_of_bytes(bytes: usize) -> String {
+        assert!(bytes >= 2, "绝对路径至少需要根与一个末段");
+        let content = bytes - 1;
+        let segments = (content - 1) / 101 + 1;
+        let last = content - 101 * (segments - 1);
+        let mut parts = Vec::with_capacity(segments);
+        for index in 0..segments {
+            let len = if index + 1 == segments { last } else { 100 };
+            parts.push("a".repeat(len));
+        }
+        format!("/{}", parts.join("/"))
+    }
+
+    /// 构造字节数超过 `bytes` 的绝对路径, 每段只含 3 字节字符, 末段不超过 198 字节.
+    fn multibyte_path_over(bytes: usize) -> String {
+        // 每段 66 个 3 字节字符 = 198 字节; 带分隔符的完整段共 199 字节.
+        let full = bytes / 199;
+        let remaining = bytes - full * 199;
+        let units = if remaining == 0 {
+            1
+        } else {
+            (remaining - 1) / 3 + 1
+        };
+        let mut parts: Vec<String> = (0..full).map(|_| "日".repeat(66)).collect();
+        parts.push("日".repeat(units));
+        let path = format!("/{}", parts.join("/"));
+        assert!(path.len() > bytes, "构造的路径必须超出给定字节数");
+        assert!(
+            parts.last().is_some_and(|part| part.len() <= 200),
+            "末段必须落在 V-12 的 200 字节预算内"
+        );
+        path
+    }
+
+    #[test]
+    fn v13_the_full_path_budget_is_inclusive_and_counts_utf8_bytes() {
+        let budget = entry::max_target_path_bytes();
+
+        // 预算减 1 与恰好预算都必须被接受.
+        for bytes in [budget - 1, budget] {
+            let target = path_of_bytes(bytes);
+            let text = format!("[[entry]]\nsource = \"a\"\ntarget = \"{target}\"\n");
+            let manifest = parse(&text, &repo()).expect("预算内与恰好预算都必须被接受");
+            assert_eq!(
+                entry::target_path_bytes(&manifest.entries[0].target_path),
+                bytes
+            );
+        }
+
+        // 预算加 1 必须整体拒绝, 说明给出下标, 实际字节数与预算.
+        let target = path_of_bytes(budget + 1);
+        let text = format!("[[entry]]\nsource = \"a\"\ntarget = \"{target}\"\n");
+        let message = invalid_message_at(&text, &repo());
+        for needle in [
+            "entry[0]",
+            "完整路径",
+            &(budget + 1).to_string(),
+            &budget.to_string(),
+        ] {
+            assert!(message.contains(needle), "说明中缺少 {needle:?}: {message}");
+        }
+        assert!(!message.contains("末段 basename"), "{message}");
+
+        // 多字节路径按字节计: 字符数远小于预算, 字节数超过预算仍必须拒绝.
+        let target = multibyte_path_over(budget);
+        let bytes = target.len();
+        let chars = target.chars().count();
+        assert!(bytes > budget && chars < budget);
+        let text = format!("[[entry]]\nsource = \"a\"\ntarget = \"{target}\"\n");
+        let message = invalid_message_at(&text, &repo());
+        assert!(message.contains("完整路径"), "{message}");
+        assert!(
+            message.contains(&format!("{bytes} 字节")),
+            "说明必须按字节给出实际长度: {message}"
+        );
+        assert!(
+            !message.contains(&format!("{chars} 字节")),
+            "不得按字符数报告: {message}"
+        );
+        assert!(message.contains(&budget.to_string()), "{message}");
+    }
+
+    #[test]
+    fn v13_does_not_preempt_the_existing_rule_priority() {
+        let budget = entry::max_target_path_bytes();
+        // 深仓库根: 其自身与所有相对 target 的完整路径都超过预算.
+        let deep_repo = path_of_bytes(budget + 10);
+
+        // V-9: 仓库根自身是落点.
+        let message = invalid_message_at(
+            "[[entry]]\nsource = \"a\"\ntarget = \".\"\n",
+            Path::new(&deep_repo),
+        );
+        assert!(message.contains("仓库根本身或其祖先"), "{message}");
+        assert!(!message.contains("完整路径"), "{message}");
+
+        // V-10: target 与 source 归一化后相同.
+        let message = invalid_message_at(
+            "[[entry]]\nsource = \"sub/rc\"\ntarget = \"sub/rc\"\n",
+            Path::new(&deep_repo),
+        );
+        assert!(message.contains("自指"), "{message}");
+        assert!(!message.contains("完整路径"), "{message}");
+
+        // V-11: 第二个目标落在第一个目标之内.
+        let message = invalid_message_at(
+            "[[entry]]\nsource = \"a\"\ntarget = \"link\"\n\n[[entry]]\nsource = \"b\"\ntarget = \"link/rc\"\n",
+            Path::new(&deep_repo),
+        );
+        assert!(message.contains("路径重叠"), "{message}");
+        assert!(!message.contains("完整路径"), "{message}");
+
+        // V-12: 末段超过 200 字节, 完整路径同时也超出平台预算.
+        let long = "a".repeat(entry::MAX_TARGET_BASENAME_BYTES + 1);
+        let text = format!("[[entry]]\nsource = \"a\"\ntarget = \"{long}\"\n");
+        let message = invalid_message_at(&text, Path::new(&deep_repo));
+        assert!(message.contains("末段 basename"), "{message}");
+        assert!(!message.contains("完整路径"), "{message}");
+    }
+
+    #[test]
+    fn v13_relative_targets_depend_on_the_repository_location() {
+        // 同一份含相对 target 的清单: 浅仓库根接受, 深仓库根拒绝.
+        let text = "[[entry]]\nsource = \"shell/rc\"\ntarget = \"link/rc\"\n";
+        parse(text, Path::new("/repo")).expect("浅仓库根必须接受这份清单");
+
+        let budget = entry::max_target_path_bytes();
+        let deep_repo = path_of_bytes(budget);
+        // `budget 字节的仓库根 + /link/rc` 超过预算.
+        let message = invalid_message_at(text, Path::new(&deep_repo));
+        assert!(message.contains("entry[0]"), "{message}");
+        assert!(message.contains("完整路径"), "{message}");
+        assert!(message.contains(&budget.to_string()), "{message}");
+        assert!(
+            message.contains(&(budget + "/link/rc".len()).to_string()),
+            "说明必须给出解析后的绝对路径字节数: {message}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1168,16 +2101,33 @@ mod tests {
         let home_identity = os::basis_identity(&real_home).expect("主目录物理身份");
         assert!(
             baselines.home.contains(&home_identity),
-            "HOME 是符号链接时, 其物理形态必须进入基准集合"
+            "HOME 是符号链接时, 其物理形态 (follow) 必须进入基准集合"
+        );
+        assert!(
+            baselines
+                .home
+                .contains(&os::target_identity(&home_alias).expect("主目录链接的 lstat 身份")),
+            "HOME 是符号链接时, 链接自身的 lstat 形态也必须进入基准集合"
         );
         assert_eq!(
             baselines.home.len(),
-            1,
-            "同一主目录的书写形态与物理形态只保留一份"
+            2,
+            "同一主目录的 lstat 形态与 follow 形态各保留一份"
         );
-        assert_eq!(
-            baselines.root,
-            Some(os::basis_identity(Path::new("/")).expect("文件系统根身份"))
+        // V-9c: 主目录的祖先进入独立集合, 且"主目录本身"的身份不混入其中.
+        let ancestor_identity = os::basis_identity(&root).expect("临时根身份");
+        assert!(
+            baselines.home_ancestors.contains(&ancestor_identity),
+            "主目录的祖先必须进入祖先身份集合"
+        );
+        assert!(
+            !baselines.home_ancestors.contains(&home_identity),
+            "主目录本身不得混入祖先身份集合"
+        );
+        assert!(
+            baselines
+                .root
+                .contains(&os::basis_identity(Path::new("/")).expect("文件系统根身份"))
         );
     }
 
@@ -1200,5 +2150,48 @@ mod tests {
         let text = "[[entry]]\nsource = \"a\"\ntarget = \"other.toml\"\n";
         let manifest = parse(text, &root).expect("与基准点不同对象的落点不得被误伤");
         assert_eq!(manifest.entries.len(), 1);
+    }
+
+    #[test]
+    fn v9b_the_lstat_form_of_a_symlinked_home_is_rejected() {
+        // 主目录书写形态本身是符号链接: 落点写成该链接路径时, 字符串比较会命中
+        // 书写形态, 但大小写变体或等价别名只能靠 lstat 身份识别.
+        let physical_dir = tempfile::tempdir().expect("创建主目录临时目录");
+        let physical_root =
+            std::fs::canonicalize(physical_dir.path()).expect("主目录临时目录的物理路径");
+        let real_home = physical_root.join("real-home");
+        std::fs::create_dir_all(&real_home).expect("创建物理主目录");
+
+        let alias_dir = tempfile::tempdir().expect("创建别名临时目录");
+        let alias_root = std::fs::canonicalize(alias_dir.path()).expect("别名临时目录的物理路径");
+        let home_alias = alias_root.join("home-alias");
+        std::os::unix::fs::symlink(&real_home, &home_alias).expect("建立主目录别名链接");
+
+        let written = home_alias.display().to_string();
+        let (_repo_dir, repo_root) = separate_repo_root();
+        let error = reject_with_home(&written, &home_alias, &repo_root)
+            .expect_err("主目录符号链接的 lstat 形态必须被识别");
+        let Error::ManifestInvalid(message) = error else {
+            panic!("必须归入 ManifestInvalid");
+        };
+        for needle in ["entry[0]", &format!("`{written}`"), "主目录"] {
+            assert!(message.contains(needle), "说明中缺少 {needle:?}: {message}");
+        }
+    }
+
+    #[test]
+    fn v9b_the_follow_form_of_a_symlinked_manifest_is_rejected() {
+        let dir = tempfile::tempdir().expect("创建临时目录");
+        let root = std::fs::canonicalize(dir.path()).expect("临时目录的物理路径");
+        let actual = root.join("actual-manifest.toml");
+        std::fs::write(&actual, "").expect("创建真实清单文件");
+        std::os::unix::fs::symlink(&actual, root.join(MANIFEST_NAME)).expect("建立清单符号链接");
+
+        // 落点写成清单链接的解析目标: 字符串不同, 只有 follow 形态的身份能命中.
+        assert_invalid_at(
+            "[[entry]]\nsource = \"a\"\ntarget = \"actual-manifest.toml\"\n",
+            &root,
+            &["entry[0]", "清单文件自身", "actual-manifest.toml"],
+        );
     }
 }

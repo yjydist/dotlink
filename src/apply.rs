@@ -12,8 +12,11 @@ use crate::entry::Entry;
 use crate::error::{Error, Result};
 use crate::os;
 
-/// 替换路径的暂存标签; 与撤销路径的 `dotlink-undo.partial` 区分, 便于诊断残留.
-const REPLACE_STAGING_LABEL: &str = "dotlink-replace.partial";
+/// 替换路径的暂存标签; 与撤销路径的 `dotlink-undo` 区分, 便于诊断残留.
+///
+/// 完整暂存名为 `<原名>.<pid>.<label>.partial`, 消歧序号插在 `label` 与 `.partial`
+/// 之间 (由 `os::stage_aside` 负责).
+const REPLACE_STAGING_LABEL: &str = "dotlink-replace";
 
 /// `ReplaceAndBackup` 应使用的备份命名空间, 由已经完成的判定结果唯一决定.
 ///
@@ -193,14 +196,26 @@ fn replace_with_backup(entry: &Entry, identity: ObjectIdentity, backup: &Path) -
 
 /// 建链失败后的收尾: 从本次备份恢复原内容, 备份不删除.
 ///
-/// 恢复成功与失败分别组装说明; 外层 [`replace_and_backup`] 统一补上备份路径, 因此
-/// 两条说明都能让用户找回原内容 (FR-016, 设计 D2 / D6).
+/// 三种结局分别组装说明; 外层 [`replace_and_backup`] 统一补上备份路径, 因此每条
+/// 说明都能让用户找回原内容 (FR-016, 设计 D2 / D6):
+///
+/// - 恢复成功: "已从备份恢复原内容";
+/// - 内容尚未落位 ([`backup::RestoreError::NotLanded`]): "从备份恢复原内容失败";
+/// - 内容已落位但父目录同步失败 ([`backup::RestoreError::LandedButUnsynced`]):
+///   只报告同步失败与"已恢复"的事实, 不得再出现"恢复失败"的措辞, 否则同一行会
+///   同时声称恢复失败与已恢复.
 fn recover_original(target: &Path, backup: &Path, cause: Error) -> Error {
     match backup::restore_backup(target, backup) {
         Ok(()) => Error::EntryFailed(format!("{cause}; 已从备份恢复原内容, 备份未删除")),
-        Err(error) => Error::EntryFailed(format!(
+        // 内容尚未落到目标: 可以如实说"恢复失败".
+        Err(backup::RestoreError::NotLanded(error)) => Error::EntryFailed(format!(
             "{cause}; 从备份恢复原内容失败: {error}, 备份未删除"
         )),
+        // rename 已成功, 内容已就位, 只有父目录同步失败; 底层原因含目标路径与
+        // "备份内容已恢复到"的结论.
+        Err(backup::RestoreError::LandedButUnsynced(error)) => {
+            Error::EntryFailed(format!("{cause}; {error}; 备份未删除"))
+        }
     }
 }
 
@@ -1328,6 +1343,41 @@ mod tests {
             fs::read_to_string(&backup).unwrap(),
             "original",
             "恢复失败时原内容必须仍可从备份找回"
+        );
+    }
+
+    /// 恢复已落位但父目录同步失败: 内容已恢复, 说明不得同时出现"恢复失败"与"已恢复".
+    ///
+    /// 直接调用 [`recover_original`] 以精确落在"rename 之后"的失败点; 备份路径由外层
+    /// [`replace_and_backup`] 统一补上, 与另外两条恢复结论共用同一段收尾.
+    #[test]
+    fn a_restore_that_landed_but_cannot_sync_is_not_reported_as_a_restore_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("bashrc");
+        let backup = dir.path().join("bashrc.dotlink-backup.20260101T000000");
+        fs::write(&backup, "original").unwrap();
+
+        let cause = Error::EntryFailed("模拟建链失败".to_string());
+        let guard = os::fail_directory_syncs();
+        let error = recover_original(&target, &backup, cause);
+        drop(guard);
+        let message = error.to_string();
+
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "original",
+            "rename 已落位, 内容必须已恢复"
+        );
+        assert!(message.contains("模拟建链失败"), "{message}");
+        assert!(message.contains("备份内容已恢复到"), "{message}");
+        assert!(message.contains("同步父目录"), "{message}");
+        assert!(
+            !message.contains("从备份恢复原内容失败"),
+            "内容已恢复时不得报告恢复失败: {message}"
+        );
+        assert!(
+            !message.contains("恢复失败"),
+            "内容已恢复时不得出现矛盾措辞: {message}"
         );
     }
 

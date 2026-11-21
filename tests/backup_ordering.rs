@@ -16,6 +16,18 @@ fn run_with_tz(env: &TempEnv, tz: &str, args: &[&str]) -> support::Run {
     let mut command = env.raw_cmd();
     command.env("TZ", tz);
     command.args(args);
+    observe(command)
+}
+
+/// 移除 `TZ` 的子进程调用: 未设置时区时时间戳仍必须是 UTC.
+fn run_without_tz(env: &TempEnv, args: &[&str]) -> support::Run {
+    let mut command = env.raw_cmd();
+    command.env_remove("TZ");
+    command.args(args);
+    observe(command)
+}
+
+fn observe(mut command: std::process::Command) -> support::Run {
     let output = command.output().expect("运行 dotlink");
     support::Run {
         code: output.status.code().unwrap_or(-1),
@@ -106,4 +118,47 @@ fn undo_restores_the_newer_backup_when_tz_changes_between_runs() {
         undone.stdout
     );
     env.assert_content(&target, "NEW-B\n");
+}
+
+/// 未知时区与未设置 `TZ` 都必须得到 15 字符的 UTC 时间戳.
+///
+/// 时间戳与当前 UTC 时刻比较, 而不只检查长度: 若混入本地时区, `Pacific/Nowhere`
+/// 这类无法解析的时区会让命名行为不可预测.
+#[test]
+fn backup_timestamp_stays_utc_with_unknown_or_unset_tz() {
+    for label in ["Pacific/Nowhere", "unset"] {
+        let env = TempEnv::new();
+        env.write_source("rc", "managed\n");
+        env.write_manifest(&manifest_of(&[("rc", "~/.rc", "replace_and_backup")]));
+        fs::write(env.home().join(".rc"), "OLD\n").unwrap();
+
+        let applied = if label == "unset" {
+            run_without_tz(&env, &["apply"])
+        } else {
+            run_with_tz(&env, label, &["apply"])
+        };
+        assert_eq!(
+            applied.code, 0,
+            "{label}: apply 必须成功:\nstdout:\n{}\nstderr:\n{}",
+            applied.stdout, applied.stderr
+        );
+
+        let stamps = backup_stamps(&env);
+        assert_eq!(stamps.len(), 1, "{label}: 应恰好产生一份备份: {stamps:?}");
+        let stamp = &stamps[0];
+        assert_eq!(stamp.len(), 15, "{label}: 时间戳必须是 15 字符: {stamp:?}");
+        assert_eq!(&stamp[8..9], "T", "{label}: 时间戳缺分隔符: {stamp:?}");
+        assert!(
+            stamp[..8].bytes().all(|byte| byte.is_ascii_digit())
+                && stamp[9..].bytes().all(|byte| byte.is_ascii_digit()),
+            "{label}: 时间戳必须是纯数字加 T 分隔: {stamp:?}"
+        );
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let difference = (unix_seconds(stamp) - now).abs();
+        assert!(
+            difference < 120,
+            "{label}: 时间戳必须与当前 UTC 同轴 (相差 {difference} 秒): {stamp:?}"
+        );
+    }
 }

@@ -76,6 +76,31 @@ pub fn exit_code_for(command: Command, outcomes: &[EntryOutcome]) -> i32 {
     }
 }
 
+/// [`exit_code_for`] 的迭代器入口: 生产路径直接从报告行取 token, 不物化 `Vec`.
+///
+/// 与 slice 版本共用 [`blocks_goal`] 与 [`is_settled`] 两个谓词, 因此两个入口对同一
+/// token 序列必然得出同一结论. 只返回 0 或 1.
+pub(crate) fn exit_code_for_iter<I>(command: Command, outcomes: I) -> i32
+where
+    I: IntoIterator<Item = EntryOutcome>,
+{
+    let mut goal_reached = true;
+    let mut has_pending_work = false;
+    for outcome in outcomes {
+        if blocks_goal(command, outcome) {
+            goal_reached = false;
+        }
+        if !is_settled(outcome) {
+            has_pending_work = true;
+        }
+    }
+    if goal_reached && !has_pending_work {
+        0
+    } else {
+        1
+    }
+}
+
 /// 条件 1: 该命令自身的目标谓词是否成立.
 ///
 /// `preview` 与 `apply` 的谓词同源 ("每个条目的目标路径都已成为指向其源条目的正确
@@ -89,40 +114,96 @@ pub fn exit_code_for(command: Command, outcomes: &[EntryOutcome]) -> i32 {
 /// 这份非对称是契约要求的行为, 不是实现疏漏: 未部署的清单上 `preview` 退 1 而
 /// `apply` 退 0 (`openspec/specs/cli-contract/spec.md` 的"只读与写入命令的求值时刻").
 fn goal_reached(command: Command, outcomes: &[EntryOutcome]) -> bool {
+    !outcomes
+        .iter()
+        .copied()
+        .any(|outcome| blocks_goal(command, outcome))
+}
+
+/// 条件 1 的单项判定: 该 token 是否使该命令的目标谓词为假.
+///
+/// 对 12 个 token 全部穷尽, 新增变体时这里会编译失败, 而不是被 `matches!` 静默
+/// 归入"不阻塞"的一侧. 语义与 `openspec/specs/cli-contract/spec.md` 的"两条件判据"
+/// 一致: `Missing` / `Fail` 不参与条件 1, 它们的残留待办只由条件 2 表达.
+fn blocks_goal(command: Command, outcome: EntryOutcome) -> bool {
     match command {
-        Command::Preview => !outcomes.iter().any(|outcome| {
-            matches!(
-                outcome,
-                EntryOutcome::Create | EntryOutcome::Replace | EntryOutcome::Conflict
-            )
-        }),
-        Command::Apply => !outcomes
-            .iter()
-            .any(|outcome| matches!(outcome, EntryOutcome::Conflict)),
-        Command::Undo => !outcomes
-            .iter()
-            .any(|outcome| matches!(outcome, EntryOutcome::Undo | EntryOutcome::Restore)),
-        Command::Status => !outcomes.iter().any(|outcome| {
-            matches!(
-                outcome,
-                EntryOutcome::Absent | EntryOutcome::Foreign | EntryOutcome::Wrong
-            )
-        }),
+        Command::Preview => match outcome {
+            EntryOutcome::Create | EntryOutcome::Replace | EntryOutcome::Conflict => true,
+            EntryOutcome::Ok
+            | EntryOutcome::Absent
+            | EntryOutcome::Missing
+            | EntryOutcome::Foreign
+            | EntryOutcome::Wrong
+            | EntryOutcome::Undo
+            | EntryOutcome::Restore
+            | EntryOutcome::Skip
+            | EntryOutcome::Fail => false,
+        },
+        Command::Apply => match outcome {
+            EntryOutcome::Conflict => true,
+            EntryOutcome::Create
+            | EntryOutcome::Ok
+            | EntryOutcome::Replace
+            | EntryOutcome::Absent
+            | EntryOutcome::Missing
+            | EntryOutcome::Foreign
+            | EntryOutcome::Wrong
+            | EntryOutcome::Undo
+            | EntryOutcome::Restore
+            | EntryOutcome::Skip
+            | EntryOutcome::Fail => false,
+        },
+        Command::Undo => match outcome {
+            EntryOutcome::Undo | EntryOutcome::Restore => true,
+            EntryOutcome::Create
+            | EntryOutcome::Ok
+            | EntryOutcome::Replace
+            | EntryOutcome::Conflict
+            | EntryOutcome::Absent
+            | EntryOutcome::Missing
+            | EntryOutcome::Foreign
+            | EntryOutcome::Wrong
+            | EntryOutcome::Skip
+            | EntryOutcome::Fail => false,
+        },
+        Command::Status => match outcome {
+            EntryOutcome::Absent | EntryOutcome::Foreign | EntryOutcome::Wrong => true,
+            EntryOutcome::Create
+            | EntryOutcome::Ok
+            | EntryOutcome::Replace
+            | EntryOutcome::Conflict
+            | EntryOutcome::Missing
+            | EntryOutcome::Undo
+            | EntryOutcome::Restore
+            | EntryOutcome::Skip
+            | EntryOutcome::Fail => false,
+        },
+    }
+}
+
+/// 条件 2 的单项判定: token 是否落在"成功"或"已是最新"两列.
+///
+/// 对 12 个 token 全部穷尽, 新增变体时这里会编译失败.
+fn is_settled(outcome: EntryOutcome) -> bool {
+    match outcome {
+        EntryOutcome::Create
+        | EntryOutcome::Ok
+        | EntryOutcome::Replace
+        | EntryOutcome::Undo
+        | EntryOutcome::Restore => true,
+        EntryOutcome::Conflict
+        | EntryOutcome::Absent
+        | EntryOutcome::Missing
+        | EntryOutcome::Foreign
+        | EntryOutcome::Wrong
+        | EntryOutcome::Skip
+        | EntryOutcome::Fail => false,
     }
 }
 
 /// 条件 2: 全部条目都落在"成功"或"已是最新"两列.
 fn no_pending_work(outcomes: &[EntryOutcome]) -> bool {
-    outcomes.iter().all(|outcome| {
-        matches!(
-            outcome,
-            EntryOutcome::Create
-                | EntryOutcome::Ok
-                | EntryOutcome::Replace
-                | EntryOutcome::Undo
-                | EntryOutcome::Restore
-        )
-    })
+    outcomes.iter().copied().all(is_settled)
 }
 
 #[cfg(test)]
@@ -134,6 +215,22 @@ mod tests {
         Command::Apply,
         Command::Status,
         Command::Undo,
+    ];
+
+    /// 全部 12 个 token; 新增变体时必须同时更新本表.
+    const ALL_OUTCOMES: [EntryOutcome; 12] = [
+        EntryOutcome::Create,
+        EntryOutcome::Ok,
+        EntryOutcome::Replace,
+        EntryOutcome::Conflict,
+        EntryOutcome::Absent,
+        EntryOutcome::Missing,
+        EntryOutcome::Foreign,
+        EntryOutcome::Wrong,
+        EntryOutcome::Undo,
+        EntryOutcome::Restore,
+        EntryOutcome::Skip,
+        EntryOutcome::Fail,
     ];
 
     #[test]
@@ -229,31 +326,54 @@ mod tests {
         assert_eq!(exit_code_for(Command::Status, &[EntryOutcome::Wrong]), 1);
     }
 
+    /// 12 个 token 都必须被两个条件显式分类; 生产侧的穷尽 `match` 与本表同时要求
+    /// 新增变体被处理, 不会出现"新 token 静默落入未覆盖分支".
+    #[test]
+    fn every_token_variant_is_explicitly_classified() {
+        const SETTLED: [(EntryOutcome, bool); 12] = [
+            (EntryOutcome::Create, true),
+            (EntryOutcome::Ok, true),
+            (EntryOutcome::Replace, true),
+            (EntryOutcome::Conflict, false),
+            (EntryOutcome::Absent, false),
+            (EntryOutcome::Missing, false),
+            (EntryOutcome::Foreign, false),
+            (EntryOutcome::Wrong, false),
+            (EntryOutcome::Undo, true),
+            (EntryOutcome::Restore, true),
+            (EntryOutcome::Skip, false),
+            (EntryOutcome::Fail, false),
+        ];
+        assert_eq!(SETTLED.len(), ALL_OUTCOMES.len());
+
+        for (outcome, settled) in SETTLED {
+            assert!(
+                ALL_OUTCOMES.contains(&outcome),
+                "{outcome:?} 不在 ALL_OUTCOMES 中"
+            );
+            assert_eq!(is_settled(outcome), settled, "{outcome:?}");
+            assert_eq!(no_pending_work(&[outcome]), settled, "{outcome:?}");
+            for command in COMMANDS {
+                assert_eq!(
+                    goal_reached(command, &[outcome]),
+                    !blocks_goal(command, outcome),
+                    "{command:?} / {outcome:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn exit_code_for_never_returns_two_or_three() {
-        let every_outcome = [
-            EntryOutcome::Create,
-            EntryOutcome::Ok,
-            EntryOutcome::Replace,
-            EntryOutcome::Conflict,
-            EntryOutcome::Absent,
-            EntryOutcome::Missing,
-            EntryOutcome::Foreign,
-            EntryOutcome::Wrong,
-            EntryOutcome::Undo,
-            EntryOutcome::Restore,
-            EntryOutcome::Skip,
-            EntryOutcome::Fail,
-        ];
         for command in COMMANDS {
             assert_eq!(exit_code_for(command, &[]), 0);
-            for outcome in every_outcome {
+            for outcome in ALL_OUTCOMES {
                 let code = exit_code_for(command, &[outcome]);
                 assert!(
                     code == 0 || code == 1,
                     "exit_code_for({command:?}, [{outcome:?}]) 返回了 {code}"
                 );
-                let code = exit_code_for(command, &every_outcome);
+                let code = exit_code_for(command, &ALL_OUTCOMES);
                 assert!(
                     code == 0 || code == 1,
                     "exit_code_for({command:?}, ..) 返回了 {code}"

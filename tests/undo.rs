@@ -33,6 +33,80 @@ fn deployed(env: &TempEnv, source: &str, target: &str) -> PathBuf {
     path
 }
 
+/// 当前文件系统是否接受给定字节数的单段名; 更小的 NAME_MAX 上跳过依赖它的用例.
+fn supports_basename_len(dir: &std::path::Path, bytes: usize) -> bool {
+    let probe = dir.join("p".repeat(bytes));
+    match fs::write(&probe, "") {
+        Ok(()) => {
+            let _ = fs::remove_file(&probe);
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidFilename => false,
+        Err(error) => panic!("创建单段名探针失败: {error}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 200 字节 basename: replace 的备份名与暂存名都在 NAME_MAX 内, undo 能恢复
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_two_hundred_byte_basename_can_be_replaced_and_restored() {
+    let env = TempEnv::new();
+    env.write_source("rc", "managed\n");
+
+    let name = "a".repeat(200);
+    // 目标名 200 + 最长生成后缀 50 = 250: 需要 NAME_MAX >= 250 才能覆盖实际暂存名.
+    // replace 与 undo 都会走暂存路径, 任一暂存名超限都会使操作失败而不是让断言失真.
+    if !supports_basename_len(env.home(), name.len() + 50) {
+        println!(
+            "跳过 a_two_hundred_byte_basename_can_be_replaced_and_restored: 当前文件系统的 NAME_MAX 小于 250 字节"
+        );
+        return;
+    }
+
+    env.write_manifest(&manifest_of(&[(
+        "rc",
+        &format!("~/{name}"),
+        "replace_and_backup",
+    )]));
+    let target = env.home().join(&name);
+    fs::write(&target, "original\n").unwrap();
+
+    let applied = run(&env, &["apply"]);
+    assert_eq!(
+        applied.code, 0,
+        "200 字节 basename 的 replace 必须成功;\nstdout:\n{}\nstderr:\n{}",
+        applied.stdout, applied.stderr
+    );
+    let line = line_for(&applied.stdout, &name);
+    assert_eq!(token_of(line), "replace", "{line}");
+    let backup = backup_path_from_output(&applied.stdout);
+    let backup_name = backup.file_name().unwrap().len();
+    assert!(
+        backup_name <= 255,
+        "备份名 {backup_name} 字节超过 NAME_MAX: {}",
+        backup.display()
+    );
+    env.assert_content(&backup, "original\n");
+    env.assert_symlink_to(&target, &env.repo().join("rc"));
+
+    let undone = run(&env, &["undo"]);
+    assert_eq!(
+        undone.code, 1,
+        "撤销了东西 (restore) 故退 1;\nstdout:\n{}",
+        undone.stdout
+    );
+    let line = line_for(&undone.stdout, &name);
+    assert_eq!(token_of(line), "restore", "{line}");
+    assert!(
+        fs::symlink_metadata(&target).unwrap().file_type().is_file(),
+        "恢复后目标必须是普通文件, 不再是链接"
+    );
+    env.assert_content(&target, "original\n");
+    env.assert_content(&backup, "original\n");
+}
+
 #[test]
 fn undo_restores_each_targets_latest_backup_from_shared_and_separate_directories() {
     let env = TempEnv::new();
@@ -557,6 +631,60 @@ fn undo_reports_missing_for_a_source_missing_entry() {
     );
 }
 
+/// 源缺失优先于目标侧事实: 目标为空且同目录有完整备份时, 仍只报 `missing`,
+/// 不得恢复备份, 也不得删除它.
+#[test]
+fn undo_does_not_restore_a_backup_when_the_source_is_missing_and_the_target_is_absent() {
+    let env = TempEnv::new();
+    env.write_manifest(&manifest_of(&[("shell/gone", "~/.gone", "-")]));
+    let backup = env.home().join(".gone.dotlink-backup.20260101T000000");
+    fs::write(&backup, "original\n").unwrap();
+
+    let undone = run(&env, &["undo"]);
+    assert_eq!(undone.code, 1, "源缺失必须退 1: {}", undone.stdout);
+    let line = line_for(&undone.stdout, "~/.gone");
+    assert_eq!(token_of(line), "missing", "{line}");
+    assert!(
+        fs::symlink_metadata(env.home().join(".gone")).is_err(),
+        "源缺失时不得恢复空目标上的备份"
+    );
+    env.assert_content(&backup, "original\n");
+    assert!(
+        undone
+            .stdout
+            .lines()
+            .last()
+            .unwrap_or_default()
+            .contains("1 失败"),
+        "源缺失必须计入失败列: {}",
+        undone.stdout
+    );
+}
+
+/// 源缺失且目标仍是悬空旧链接: 报 `missing`, 链接与备份都保持原样.
+#[test]
+fn undo_does_not_touch_a_dangling_link_or_restore_when_the_source_is_missing() {
+    let env = TempEnv::new();
+    env.write_manifest(&manifest_of(&[("shell/gone", "~/.gone", "-")]));
+    let target = env.home().join(".gone");
+    let missing_source = env.repo().join("shell/gone");
+    std::os::unix::fs::symlink(&missing_source, &target).expect("建立指向缺失源的链接");
+    let previous = fs::read_link(&target).unwrap();
+    let backup = env.home().join(".gone.dotlink-backup.20260101T000000");
+    fs::write(&backup, "original\n").unwrap();
+
+    let undone = run(&env, &["undo"]);
+    assert_eq!(undone.code, 1, "源缺失必须退 1: {}", undone.stdout);
+    let line = line_for(&undone.stdout, "~/.gone");
+    assert_eq!(token_of(line), "missing", "{line}");
+    assert_eq!(
+        fs::read_link(&target).expect("悬空链接必须原样保留"),
+        previous,
+        "源缺失时不得移除或改写链接"
+    );
+    env.assert_content(&backup, "original\n");
+}
+
 // ---------------------------------------------------------------------------
 // (c) 安全反例 (真实文件不被删除): 手工换成真实目录 -> skip 且目录完整保留
 // ---------------------------------------------------------------------------
@@ -828,8 +956,18 @@ fn undo_never_creates_a_state_or_index_file() {
     // 误报成"undo 往仓库里写了东西".
     deployed(&env, "shell/bashrc", ".bashrc");
 
-    let home_before = env.snapshot(env.home());
-    let repo_before = env.snapshot(env.repo());
+    // 本用例只关心路径的增减: 撤销链接会改变 HOME 目录的 mtime, 那属于合法副作用;
+    // 状态/索引文件的证据是"多出一个路径".
+    let home_before: Vec<PathBuf> = env
+        .snapshot(env.home())
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect();
+    let repo_before: Vec<PathBuf> = env
+        .snapshot(env.repo())
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect();
 
     let undone = run(&env, &["undo"]);
     assert_eq!(
@@ -839,44 +977,52 @@ fn undo_never_creates_a_state_or_index_file() {
     );
 
     // 仓库侧只允许"目标路径被移除"这一处变化; HOME 侧除目标路径外必须逐字节不变.
-    let home_after = env.snapshot(env.home());
+    let home_after: Vec<PathBuf> = env
+        .snapshot(env.home())
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect();
     let removed: Vec<PathBuf> = home_before
         .iter()
-        .filter(|row| !home_after.contains(row))
-        .map(|row| row.0.clone())
+        .filter(|path| !home_after.contains(path))
+        .cloned()
         .collect();
     assert_eq!(
         removed,
         vec![env.home().join(".bashrc")],
         "除待撤销的链接之外, HOME 不得有任何改动 (也不得出现状态/索引文件)"
     );
-    for row in &home_after {
+    for path in &home_after {
         assert!(
-            home_before.contains(row) || row.0.starts_with(env.home().join(".bashrc")),
+            home_before.contains(path) || path.starts_with(env.home().join(".bashrc")),
             "HOME 中出现了新路径: {}",
-            row.0.display()
+            path.display()
         );
     }
 
     // 仓库侧: HOME 位于仓库之内, 因此"被撤销的链接被移除"会在仓库快照里体现为
     // 少了一行. 这里逐行核对: 消失的只允许是那条链接, 且不得出现任何**新**路径
     // (新路径才是"写入了状态/索引文件"的证据).
-    let repo_after = env.snapshot(env.repo());
+    let repo_after: Vec<PathBuf> = env
+        .snapshot(env.repo())
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect();
     let disappeared: Vec<PathBuf> = repo_before
         .iter()
-        .filter(|row| !repo_after.contains(row))
-        .map(|row| row.0.clone())
+        .filter(|path| !repo_after.contains(path))
+        .cloned()
         .collect();
     assert_eq!(
         disappeared,
         vec![env.home().join(".bashrc")],
         "仓库中只允许少掉那条被撤销的链接"
     );
-    for row in &repo_after {
+    for path in &repo_after {
         assert!(
-            repo_before.contains(row),
+            repo_before.contains(path),
             "undo 往仓库里写入了新路径 (状态/索引文件?): {}",
-            row.0.display()
+            path.display()
         );
     }
 }

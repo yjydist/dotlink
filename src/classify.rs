@@ -46,14 +46,16 @@ pub struct EntryState {
 ///
 /// 全函数只读, 不产生任何文件系统改动. 每条目固定做两次 `lstat` (源与目标各一);
 /// 目标是符号链接时再做一次 `read_link` 与一次 `os::normalize` (后者按段 lstat
-/// 链接目标的祖先段). 仓库根的 `normalize` 在本函数里只做一次, 不随条目数重复.
-pub fn classify(manifest: &Manifest) -> Vec<EntryState> {
-    // 仓库根在整个运行中不变, 其规范化提到循环外, 每次运行只算一次.
-    let repo_root = os::normalize(&manifest.repo_root);
+/// 链接目标的祖先段).
+///
+/// `repo_root` 必须已经过 [`os::normalize`]: 由调用方 (`lib`) 在清单加载后计算一次,
+/// 判定, apply 与 undo 共用同一个值 (设计 D6). 本函数不再自行规范化仓库根, 因此不会
+/// 随条目数或命令数重复解析.
+pub fn classify(manifest: &Manifest, repo_root: &Path) -> Vec<EntryState> {
     manifest
         .entries
         .iter()
-        .map(|entry| classify_entry(entry, &repo_root))
+        .map(|entry| classify_entry(entry, repo_root))
         .collect()
 }
 
@@ -62,7 +64,7 @@ pub fn classify(manifest: &Manifest) -> Vec<EntryState> {
 /// 求值顺序严格为: 两次 `lstat` 的故障裁决 (`Unreadable` 先于表内各行) ->
 /// `SourceMissing` -> `Absent` -> 自上而下取首个命中者.
 ///
-/// `repo_root` 必须已经过 `os::normalize` (由 [`classify`] 在循环外算一次).
+/// `repo_root` 必须已经过 `os::normalize` (由 `lib` 计算一次后传入 [`classify`]).
 fn classify_entry(entry: &Entry, repo_root: &Path) -> EntryState {
     // 两次 lstat: source_path 与 target_path 各一次, 不做任何穿透.
     let source = lstat(&entry.source_path);
@@ -326,7 +328,7 @@ mod tests {
                 repo_root: self.repo.clone(),
                 entries: vec![self.entry(source_rel, target, on_conflict)],
             };
-            let mut states = classify(&manifest);
+            let mut states = classify(&manifest, &self.repo);
             assert_eq!(states.len(), 1, "classify 必须为每个条目给出一个结果");
             states.remove(0)
         }
@@ -790,7 +792,7 @@ mod tests {
             repo_root: f.repo.clone(),
             entries: vec![first, second],
         };
-        assert_eq!(classify(&manifest).len(), 2);
+        assert_eq!(classify(&manifest, &f.repo).len(), 2);
     }
 
     // =======================================================================
@@ -989,7 +991,7 @@ mod tests {
     /// `Current` x `on_conflict` 的组合都必须落在动作映射表内, 不存在"配到表外
     /// `Action`"的情形.
     ///
-    /// `action_mapping_follows_the_table` 逐格断言了 8 x 2 的具体取值; 这里断言的是
+    /// `action_mapping_follows_the_table` 逐格断言了 9 x 2 的具体取值; 这里断言的是
     /// **补集** -- 组合的**结构**而不是取值本身:
     ///
     /// - 动作映射表中带 "-" (与 `on_conflict` 无关) 的四种取值: 两个 `on_conflict`
@@ -1434,10 +1436,10 @@ mod tests {
 
         // 真实解析路径: 相对 source 由 `entry::resolve` 挂到仓库根上并过 `os::normalize`.
         let manifest = manifest::parse(&text, &indirect).expect("清单合法");
-        // 这一层直接钉住解析产物本身: `classify` 内部会把两侧都再规范化一次, 因此
-        // 它无法区分"解析阶段已规范化"与"字面拼接, 由 classify 兜底"; 只有此处能
-        // 捕捉 `entry.rs` 漏掉 `normalize` 的缺陷 (实测: 去掉该断言后, 把
-        // `entry.rs` 的 `source_path` 改成 `expand(...)` 字面拼接, 本用例仍会通过).
+        // 这一层直接钉住解析产物本身: `classify` 直接消费 `manifest` 中的路径, 不会
+        // 重新规范化 `source_path`, 因此只有此处能捕捉 `entry.rs` 漏掉 `normalize`
+        // 的缺陷 (实测: 去掉该断言后, 把 `entry.rs` 的 `source_path` 改成
+        // `expand(...)` 字面拼接, 本用例仍会通过).
         assert_eq!(
             manifest.entries[0].source_path, source,
             "source_path 必须是规范化后的绝对路径, 而不是 repo_root + source 的字面拼接"
@@ -1446,7 +1448,7 @@ mod tests {
         // 断言: 这里的 `target` 自身是符号链接, 其形态属 `normalize` 的语义范围,
         // 与本用例要钉住的"source_path 同源"无关.
 
-        let states = classify(&manifest);
+        let states = classify(&manifest, &repo);
         assert_eq!(
             states[0].current,
             Current::LinkedCorrect,

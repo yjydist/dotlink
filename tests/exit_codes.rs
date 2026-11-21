@@ -71,6 +71,31 @@ fn undo_is_idempotent_when_everything_was_already_removed() {
     assert_exit_code_for(Command::Undo, &all_ok, 0);
 }
 
+/// `undo` 的退出码矩阵: 目标侧状态与"本次是否从备份恢复"共同决定 token 与退出码.
+///
+/// `Ok` 代表 `Absent + 无备份`, `Restore` 代表本次恢复了备份 (无论目标原本是链接
+/// 还是为空), `Undo` 代表移除了链接且没有备份, `Missing` 代表源缺失. `restore` 计入
+/// 成功列, 但它改变了本次运行的目标状态, 因此目标谓词为假并退 1.
+#[test]
+fn undo_exit_codes_follow_the_target_predicate_across_backup_states() {
+    let cases = [
+        // Absent + no backup
+        (EntryOutcome::Ok, 0),
+        // Absent + backup
+        (EntryOutcome::Restore, 1),
+        // LinkedCorrect + no backup
+        (EntryOutcome::Undo, 1),
+        // LinkedCorrect + backup
+        (EntryOutcome::Restore, 1),
+        // SourceMissing + backup: 源缺失优先, 不恢复也不退 0.
+        (EntryOutcome::Missing, 1),
+    ];
+
+    for (outcome, expected) in cases {
+        assert_exit_code_for(Command::Undo, &[outcome], expected);
+    }
+}
+
 #[test]
 fn missing_source_forces_exit_code_one_for_every_command() {
     // SourceMissing 是终态: 即使 `undo` 的目标谓词在它身上已成立, 也不能退 0.

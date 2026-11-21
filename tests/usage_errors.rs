@@ -181,18 +181,55 @@ fn there_is_no_backup_cleanup_subcommand_or_option() {
             .stderr(contains("unexpected argument"));
     }
 
-    // 根帮助只列出四个子命令, 不出现回收类名字.
+    // 根帮助的子命令集合由 `root_help_lists_exactly_the_four_subcommands` 精确锁定,
+    // 这里不再用"若干禁用词不存在"的弱断言重复同一件事.
+}
+
+/// 解析根帮助的 `Commands:` 段, 返回其中列出的子命令名.
+fn root_help_commands(text: &str) -> Vec<&str> {
+    let mut commands = Vec::new();
+    let mut in_section = false;
+    for line in text.lines() {
+        if line.trim_end() == "Commands:" {
+            in_section = true;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        // 段落到空行为止; 子命令条目以两个空格加名字开头.
+        if line.trim().is_empty() || !line.starts_with("  ") {
+            break;
+        }
+        let name = line.split_whitespace().next().unwrap_or_default();
+        commands.push(name);
+    }
+    commands
+}
+
+/// `cli-contract` "命令面固定为四个子命令": 根帮助的 `Commands:` 段必须恰好列出
+/// `preview`, `apply`, `status`, `undo`, 不能多也不能少.
+#[test]
+fn root_help_lists_exactly_the_four_subcommands() {
+    let env = TempEnv::new();
     let observed = env.cmd().arg("--help").assert().code(0);
     let text = String::from_utf8_lossy(&observed.get_output().stdout).into_owned();
-    for command in ["preview", "apply", "status", "undo"] {
-        assert!(text.contains(command), "根帮助必须列出 {command}: {text}");
-    }
-    for forbidden in ["gc", "clean", "cleanup", "prune", "回收"] {
-        assert!(
-            !text.contains(forbidden),
-            "根帮助不得出现回收能力 {forbidden:?}: {text}"
-        );
-    }
+
+    assert_eq!(
+        root_help_commands(&text),
+        vec!["preview", "apply", "status", "undo"],
+        "根帮助 Commands 段的子命令集合不符:\n{text}"
+    );
+
+    // 解析器本身必须把第五个条目也算进来: 若产品新增子命令, 上面的精确相等断言
+    // 就会失败, 而不是因为禁用词列表没有更新而静默通过.
+    let with_extra =
+        "Commands:\n  preview  x\n  apply  x\n  status  x\n  undo  x\n  gc  x\n\nOptions:\n";
+    assert_ne!(
+        root_help_commands(with_extra),
+        vec!["preview", "apply", "status", "undo"],
+        "解析器必须识别出第五个子命令"
+    );
 }
 
 /// `cli-contract` "命令面固定为四个子命令": clap 的 `help` 子命令被关闭,
@@ -342,6 +379,23 @@ fn undo_help_mentions_the_restore_again_case() {
     assert!(
         text.contains("restore"),
         "undo 帮助必须给出再次报 `restore` 的情形:\n{text}"
+    );
+}
+
+/// `cli-contract` "undo 帮助写明完整目标谓词": `--help` 必须同时给出"不存在本工具
+/// 创建的链接"与"没有从备份恢复", 不得只写前半句而让 `Absent + 有备份` 暗示退出 0.
+#[test]
+fn undo_help_spells_out_the_full_target_predicate() {
+    let env = TempEnv::new();
+    let observed = env.cmd().args(["undo", "--help"]).assert().code(0);
+    let text = String::from_utf8_lossy(&observed.get_output().stdout).into_owned();
+    assert!(
+        text.contains("不存在本工具创建的链接"),
+        "undo 帮助必须写明目标路径上不存在本工具创建的链接:\n{text}"
+    );
+    assert!(
+        text.contains("没有从备份恢复"),
+        "undo 帮助必须写明本次没有从备份恢复任何内容:\n{text}"
     );
 }
 
