@@ -155,10 +155,13 @@ pub(super) fn copy_to_staging(
     base: &Path,
     suffix: &str,
 ) -> Result<(PathBuf, fs::Metadata)> {
+    // 顶层源的父目录挂载身份只算一次, 供整棵树复用; 顶层源本身是挂载点时, 第一次
+    // 比较就会在创建任何暂存对象或读取内容之前失败.
+    let parent_mount = parent_mount_identity(source);
     let mut last = PathBuf::new();
     for serial in 1..=os::MAX_STAGING_ATTEMPTS {
         let partial = staging_candidate(base, serial, suffix);
-        match copy_object(source, &partial) {
+        match copy_object(source, &partial, parent_mount.as_ref()) {
             Ok(metadata) => return Ok((partial, metadata)),
             Err(CopyFailure::StagingNameTaken) => last = partial,
             Err(CopyFailure::Fatal(error)) => {
@@ -184,8 +187,50 @@ pub(super) fn staging_candidate(base: &Path, serial: u64, suffix: &str) -> PathB
     with_suffix(base, &suffix)
 }
 
+/// 顶层源的父目录挂载身份; 无父目录 (`/`) 或父目录不可读时返回 `None`.
+///
+/// 顶层源没有父目录时跳过比较: 目标 `/` 已由清单校验拒绝, 该分支不可达. 父目录
+/// 读不到时同样跳过; 复制本身随后会以真实错误失败.
+fn parent_mount_identity(source: &Path) -> Option<os::MountIdentity> {
+    let parent = source
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())?;
+    let metadata = fs::symlink_metadata(parent).ok()?;
+    Some(os::mount_identity(parent, &metadata))
+}
+
+/// 计算对象自身的挂载身份, 并在给了父目录身份时拒绝挂载边界.
+///
+/// 比较发生在创建暂存对象或读取内容之前: 挂载边界使整次复制以
+/// [`CopyFailure::Fatal`] 失败, 不复制挂载点之后的内容, 也不触发暂存名换名重试.
+fn check_mount(
+    source: &Path,
+    metadata: &fs::Metadata,
+    parent: Option<&os::MountIdentity>,
+) -> std::result::Result<os::MountIdentity, CopyFailure> {
+    let identity = os::mount_identity(source, metadata);
+    if let Some(parent) = parent
+        && !identity.same_mount(parent)
+    {
+        return Err(CopyFailure::Fatal(mount_boundary_error(source)));
+    }
+    Ok(identity)
+}
+
+/// 挂载边界导致的复制失败说明: 给出挂载点完整路径, 并提示先卸载或移走.
+fn mount_boundary_error(path: &Path) -> io::Error {
+    io::Error::other(format!(
+        "拒绝复制 {}: 该路径与父目录不属于同一挂载, 是挂载点; 请先卸载或移走该挂载点再重试",
+        path.display()
+    ))
+}
+
 /// 排他创建副本, 返回复制起点处顶层对象的元数据. 只有取得目的地所有权之后的失败才
 /// 允许清理它.
+///
+/// `parent` 是 `source` 所在目录的挂载身份; 符号链接只复制链接文本, 不参与边界
+/// 判定 (链接不是挂载点, 也不会被跟随). 普通文件与目录在创建暂存对象或读取内容
+/// 之前比较自身与父目录的挂载身份, 目录通过比较后以自身身份递归子项.
 ///
 /// 返回值区分根名冲突与其余失败: 仅当**本函数自己创建目标根名**时收到
 /// `AlreadyExists` 才是 [`CopyFailure::StagingNameTaken`]; 子项递归通过
@@ -193,6 +238,7 @@ pub(super) fn staging_candidate(base: &Path, serial: u64, suffix: &str) -> PathB
 pub(super) fn copy_object(
     source: &Path,
     dest: &Path,
+    parent: Option<&os::MountIdentity>,
 ) -> std::result::Result<fs::Metadata, CopyFailure> {
     let metadata = fs::symlink_metadata(source)
         .map_err(|error| CopyFailure::Fatal(copy_error("读取", source, error)))?;
@@ -204,6 +250,8 @@ pub(super) fn copy_object(
             .map_err(|error| CopyFailure::from_root_create("备份链接", dest, error))
             .map(|()| metadata);
     }
+
+    let identity = check_mount(source, &metadata, parent)?;
 
     if file_type.is_dir() {
         let mut builder = fs::DirBuilder::new();
@@ -233,7 +281,7 @@ pub(super) fn copy_object(
             {
                 let entry = entry
                     .map_err(|error| CopyFailure::Fatal(copy_error("读取目录项", source, error)))?;
-                copy_child(&entry.path(), &dest.join(entry.file_name()))?;
+                copy_child(&entry.path(), &dest.join(entry.file_name()), &identity)?;
             }
             // 子项复制完成后再应用元数据: 创建子项会改变目录 mtime, 只读权限也会
             // 阻止后续子项写入.
@@ -284,15 +332,19 @@ pub(super) fn copy_object(
 /// 子项的"目标名已被占用"不再具有重试意义: 暂存根已经取得, 换名只会从头复制整棵
 /// 树并再次撞上同一个冲突. 因此把 [`CopyFailure::StagingNameTaken`] 包装成带子项
 /// 路径的致命错误 (openspec/specs/backup-lifecycle/spec.md 的"嵌套复制冲突不换名重试").
-fn copy_child(source: &Path, dest: &Path) -> std::result::Result<(), CopyFailure> {
+fn copy_child(
+    source: &Path,
+    dest: &Path,
+    parent: &os::MountIdentity,
+) -> std::result::Result<(), CopyFailure> {
     #[cfg(test)]
     let copied = if take_nested_copy_failure() {
         Err(CopyFailure::StagingNameTaken)
     } else {
-        copy_object(source, dest)
+        copy_object(source, dest, Some(parent))
     };
     #[cfg(not(test))]
-    let copied = copy_object(source, dest);
+    let copied = copy_object(source, dest, Some(parent));
 
     copied.map(|_| ()).map_err(|failure| match failure {
         CopyFailure::StagingNameTaken => nested_conflict(dest),
@@ -363,7 +415,9 @@ pub(super) fn remove_any(path: &Path) {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_dir() => {
             make_tree_writable(path);
-            let _ = fs::remove_dir_all(path);
+            // 清理对象通常不含挂载点, 但并发挂载仍可能让它出现边界; 复用与暂存删除
+            // 相同的原语, 在进入边界前停止并保留残渣, 不跨越边界删除挂载内容.
+            let _ = os::remove_tree(path);
         }
         Ok(_) => {
             let _ = fs::remove_file(path);
@@ -376,8 +430,20 @@ pub(super) fn remove_any(path: &Path) {
 ///
 /// 先对当前目录 `chmod 0700` 再尝试读取; 读不到时直接放弃该子树 (尽力而为). 只递归
 /// 真实目录: `symlink_metadata` 不跟随符号链接, 因此链接指向的树不会被动到. 文件与
-/// 符号链接本身只需父目录可写即可删除, 不再单独改权限.
+/// 符号链接本身只需父目录可写即可删除, 不再单独改权限. 进入子目录前比较挂载身份:
+/// 挂载点之后的内容不会被 chmod, 与删除路径保持同一边界.
 fn make_tree_writable(path: &Path) {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if !metadata.file_type().is_dir() {
+        return;
+    }
+    let identity = os::mount_identity(path, &metadata);
+    make_tree_writable_inner(path, &identity);
+}
+
+fn make_tree_writable_inner(path: &Path, own: &os::MountIdentity) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -393,7 +459,11 @@ fn make_tree_writable(path: &Path) {
             continue;
         };
         if metadata.file_type().is_dir() {
-            make_tree_writable(&child);
+            let identity = os::mount_identity(&child, &metadata);
+            if !identity.same_mount(own) {
+                continue;
+            }
+            make_tree_writable_inner(&child, &identity);
         }
     }
 }

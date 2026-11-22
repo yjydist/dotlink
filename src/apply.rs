@@ -332,18 +332,12 @@ fn remove_staged(target: &Path, staged: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(staged).map_err(|error| {
         Error::EntryFailed(format!("读取暂存对象 {} 失败: {error}", staged.display()))
     })?;
-    let removal = if metadata.is_dir() {
-        fs::remove_dir_all(staged)
-    } else {
-        fs::remove_file(staged)
-    };
+    if metadata.is_dir() {
+        return remove_staged_directory(target, staged);
+    }
 
-    match removal {
+    match fs::remove_file(staged) {
         Ok(()) => Ok(()),
-        Err(error) if metadata.is_dir() => Err(Error::EntryFailed(format!(
-            "删除暂存目录 {} 失败: {error}; 该目录可能已被部分删除, 未移回原路径",
-            staged.display()
-        ))),
         Err(error) => match os::rename_noreplace(staged, target) {
             Ok(()) => Err(Error::EntryFailed(format!(
                 "删除暂存对象 {} 失败: {error}; 已把对象移回原路径",
@@ -356,6 +350,54 @@ fn remove_staged(target: &Path, staged: &Path) -> Result<()> {
                 staged.display()
             ))),
         },
+    }
+}
+
+/// 删除目录暂存对象: 删除前先扫描挂载边界, 再使用不跨边界的递归删除.
+///
+/// 扫描发现边界时不删除任何对象, 尽力把暂存目录原子移回原路径; 扫描与删除之间仍
+/// 可能出现新的挂载点, 此时 [`os::remove_tree`] 在进入边界前停止, 可能已删除部分
+/// 兄弟项, 但不会跨越边界删除挂载内容 (设计 D3).
+fn remove_staged_directory(target: &Path, staged: &Path) -> Result<()> {
+    // 扫描失败不是"存在边界": 交给 `remove_tree` 按真实原因报告, 它在进入每个子项前
+    // 同样复核挂载身份, 因此不会因为扫描失败而失去边界保护.
+    if let Ok(Some(boundary)) = os::find_mount_boundary(staged) {
+        return Err(staged_mount_boundary(target, staged, &boundary.path));
+    }
+
+    match os::remove_tree(staged) {
+        Ok(()) => Ok(()),
+        Err(os::RemoveTreeError::Boundary(boundary)) => Err(Error::EntryFailed(format!(
+            "删除暂存目录 {} 时检测到挂载点 {}; 已停止删除, 该目录可能已被部分删除且未移回原路径; 暂存目录保留于 {}; 请先卸载或移走该挂载点再重试",
+            staged.display(),
+            boundary.path.display(),
+            staged.display()
+        ))),
+        Err(os::RemoveTreeError::Io(error)) => Err(Error::EntryFailed(format!(
+            "删除暂存目录 {} 失败: {error}; 该目录可能已被部分删除, 未移回原路径",
+            staged.display()
+        ))),
+    }
+}
+
+/// 删除前发现挂载边界: 不删除任何对象, 尽力把暂存目录原子移回原路径.
+///
+/// 移回成功时目标恢复为暂存目录, 该条目以 `fail` 结束且不建立链接; 移回失败时保留
+/// 暂存目录并给出其完整路径, 同时给出挂载边界路径 (设计 D3).
+fn staged_mount_boundary(target: &Path, staged: &Path, boundary: &Path) -> Error {
+    match os::rename_noreplace(staged, target) {
+        Ok(()) => Error::EntryFailed(format!(
+            "拒绝删除暂存目录 {}: 检测到挂载点 {}; 已把暂存目录移回原路径, 未建立链接; 请先卸载或移走该挂载点再重试",
+            staged.display(),
+            boundary.display()
+        )),
+        Err(rollback) => Error::EntryFailed(format!(
+            "拒绝删除暂存目录 {}: 检测到挂载点 {}; 且移回原路径 {} 失败: {rollback}; 暂存目录保留于 {}; 请先卸载或移走该挂载点再重试",
+            staged.display(),
+            boundary.display(),
+            target.display(),
+            staged.display()
+        )),
     }
 }
 
@@ -1251,6 +1293,136 @@ mod tests {
         assert_eq!(
             fs::read_to_string(staged.join("locked/secret")).unwrap(),
             "secret"
+        );
+    }
+
+    /// 删除前扫描到挂载边界: 不删除任何对象, 把暂存目录移回原路径, 该行仍是 `fail`.
+    #[test]
+    fn a_staged_directory_with_a_mount_boundary_is_moved_back_before_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("nvim");
+        let staged = dir.path().join("nvim.1.dotlink-replace.partial");
+        fs::create_dir_all(staged.join("nested")).unwrap();
+        fs::write(staged.join("nested/keep"), "keep").unwrap();
+
+        // 扫描阶段的第一次比较命中接缝: 子目录被视为挂载点.
+        let guard = os::fail_next_mount_comparison();
+        let error = remove_staged(&target, &staged).unwrap_err();
+        drop(guard);
+        let message = error.to_string();
+
+        assert!(message.contains("检测到挂载点"), "{message}");
+        assert!(
+            message.contains(&staged.join("nested").display().to_string()),
+            "说明必须给出挂载点完整路径: {message}"
+        );
+        assert!(message.contains("先卸载或移走"), "{message}");
+        assert!(
+            message.contains("已把暂存目录移回原路径"),
+            "移回成功时必须如实报告: {message}"
+        );
+        assert!(
+            fs::symlink_metadata(&staged).is_err(),
+            "暂存目录必须已被移回"
+        );
+        assert_eq!(
+            fs::read_to_string(target.join("nested/keep")).unwrap(),
+            "keep",
+            "挂载边界之外的内容不得被删除"
+        );
+        assert!(
+            !fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "失败时不得建立链接"
+        );
+
+        let entry = Entry {
+            source: "nvim.lua".to_string(),
+            target: "~/nvim".to_string(),
+            on_conflict: OnConflict::ReplaceAndBackup,
+            source_path: PathBuf::from("/repo/nvim.lua"),
+            target_path: target.clone(),
+        };
+        let row = crate::render::fail_row(&entry, &message);
+        assert_eq!(
+            row.token,
+            crate::EntryOutcome::Fail,
+            "挂载边界失败必须走 fail 通道"
+        );
+    }
+
+    /// 删除前发现边界但原路径已被占用: 新内容与暂存目录都保留, 说明给出两者路径.
+    #[test]
+    fn a_staged_directory_boundary_that_cannot_move_back_keeps_both_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("nvim");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("occupied"), "concurrent").unwrap();
+        let staged = dir.path().join("nvim.1.dotlink-replace.partial");
+        fs::create_dir_all(staged.join("nested")).unwrap();
+        fs::write(staged.join("nested/keep"), "keep").unwrap();
+
+        let guard = os::fail_next_mount_comparison();
+        let error = remove_staged(&target, &staged).unwrap_err();
+        drop(guard);
+        let message = error.to_string();
+
+        assert!(message.contains("移回原路径"), "{message}");
+        assert!(
+            message.contains(&staged.display().to_string()),
+            "说明必须给出暂存目录的完整路径: {message}"
+        );
+        assert!(
+            message.contains(&staged.join("nested").display().to_string()),
+            "说明必须给出挂载点完整路径: {message}"
+        );
+        assert_eq!(
+            fs::read_to_string(target.join("occupied")).unwrap(),
+            "concurrent",
+            "并发新建的内容不得被覆盖"
+        );
+        assert_eq!(
+            fs::read_to_string(staged.join("nested/keep")).unwrap(),
+            "keep",
+            "暂存目录不得被删除"
+        );
+    }
+
+    /// 扫描通过后删除阶段出现边界: 停止删除并保留暂存目录, 不把它移回原路径.
+    #[test]
+    fn a_boundary_detected_during_deletion_stops_and_keeps_the_staged_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("nvim");
+        let staged = dir.path().join("nvim.1.dotlink-replace.partial");
+        fs::create_dir_all(staged.join("nested")).unwrap();
+        fs::write(staged.join("nested/keep"), "keep").unwrap();
+
+        // 扫描产生 2 次比较 (暂存根到 nested, nested 到 keep); 让第 3 次, 即删除
+        // 阶段的第一项比较命中边界.
+        let guard = os::fail_mount_comparison_after(2);
+        let error = remove_staged(&target, &staged).unwrap_err();
+        drop(guard);
+        let message = error.to_string();
+
+        assert!(message.contains("已停止删除"), "{message}");
+        assert!(
+            message.contains(&staged.join("nested").display().to_string()),
+            "说明必须给出挂载点完整路径: {message}"
+        );
+        assert!(
+            message.contains(&staged.display().to_string()),
+            "说明必须给出暂存目录完整路径: {message}"
+        );
+        assert!(
+            fs::symlink_metadata(&target).is_err(),
+            "删除中止时不得把暂存目录移回原路径"
+        );
+        assert_eq!(
+            fs::read_to_string(staged.join("nested/keep")).unwrap(),
+            "keep",
+            "挂载点之后的内容不得被删除"
         );
     }
 

@@ -1285,6 +1285,95 @@ fn remove_any_clears_files_links_and_directories() {
     );
 }
 
+/// 复制在挂载边界之前失败: 不读取挂载内容, 已创建的暂存对象被清理, 原对象不变.
+#[test]
+fn copying_stops_at_a_mount_boundary_before_reading_the_mounted_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(source.join("nested")).unwrap();
+    fs::write(source.join("nested/keep"), "keep").unwrap();
+    let base = dir.path().join("source.dotlink-backup.20260101T000000");
+
+    // 第 1 次比较是顶层源与父目录, 第 2 次是子目录与顶层源: 在第二次伪造边界.
+    let guard = os::fail_mount_comparison_after(1);
+    let error = copy_to_staging(&source, &base, PARTIAL_SUFFIX).unwrap_err();
+    drop(guard);
+
+    let message = error.to_string();
+    assert!(message.contains("挂载点"), "{message}");
+    assert!(
+        message.contains("nested"),
+        "说明必须给出挂载点完整路径: {message}"
+    );
+    assert_eq!(
+        fs::read_to_string(source.join("nested/keep")).unwrap(),
+        "keep"
+    );
+    let residue: Vec<String> = fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(PARTIAL_SUFFIX))
+        .collect();
+    assert!(
+        residue.is_empty(),
+        "挂载边界失败不得残留暂存对象: {residue:?}"
+    );
+}
+
+/// 恢复复制同样在挂载边界之前失败: 目标不落地, 备份与挂载内容保持原样.
+#[test]
+fn restore_stops_at_a_mount_boundary_and_keeps_the_backup() {
+    let dir = tempfile::tempdir().unwrap();
+    let backup = dir.path().join("nvim.dotlink-backup.20260101T000000");
+    fs::create_dir_all(backup.join("nested")).unwrap();
+    fs::write(backup.join("nested/keep"), "keep").unwrap();
+    let target = dir.path().join("nvim");
+
+    let guard = os::fail_mount_comparison_after(1);
+    let error = restore_backup(&target, &backup).unwrap_err();
+    drop(guard);
+
+    assert!(matches!(error, RestoreError::NotLanded(_)));
+    assert!(
+        fs::symlink_metadata(&target).is_err(),
+        "边界失败不得创建目标"
+    );
+    assert_eq!(
+        fs::read_to_string(backup.join("nested/keep")).unwrap(),
+        "keep"
+    );
+    let residue: Vec<String> = fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(RESTORE_SUFFIX))
+        .collect();
+    assert!(residue.is_empty(), "恢复失败不得残留临时名: {residue:?}");
+}
+
+/// 失败清理遇到挂载边界时停止并保留残渣, 不跨越边界删除挂载内容.
+#[test]
+fn cleanup_stops_before_a_mount_boundary_and_keeps_the_residue() {
+    let dir = tempfile::tempdir().unwrap();
+    let tree = dir.path().join("tree.partial");
+    fs::create_dir_all(tree.join("nested")).unwrap();
+    fs::write(tree.join("nested/keep"), "keep").unwrap();
+
+    let guard = os::fail_mount_comparisons();
+    remove_any(&tree);
+    drop(guard);
+
+    assert!(
+        fs::symlink_metadata(&tree).is_ok(),
+        "挂载边界之前必须保留残渣"
+    );
+    assert_eq!(
+        fs::read_to_string(tree.join("nested/keep")).unwrap(),
+        "keep"
+    );
+}
+
 /// 恢复失败时不得残留 `.partial` -- 残渣是普通文件时必须按文件清除.
 ///
 /// 注入点: 目标路径被非空目录占住, 使"复制到临时名"成功而"改名到目标"失败
@@ -1352,7 +1441,7 @@ fn copying_never_changes_an_occupied_destination() {
             }
             let inode = fs::symlink_metadata(&dest).unwrap().ino();
             assert!(
-                copy_object(&source, &dest).is_err(),
+                copy_object(&source, &dest, None).is_err(),
                 "{source_kind}/{destination_kind}"
             );
             assert_eq!(fs::symlink_metadata(&dest).unwrap().ino(), inode);
@@ -1767,7 +1856,7 @@ fn a_copy_failure_cleans_only_its_own_partial_directory() {
     let user_file = dir.path().join("user-file");
     fs::write(&user_file, "keep").unwrap();
 
-    assert!(copy_object(&source, &dest).is_err());
+    assert!(copy_object(&source, &dest, None).is_err());
     assert!(!dest.exists());
     assert_eq!(fs::read_to_string(source.join("file")).unwrap(), "original");
     assert_eq!(

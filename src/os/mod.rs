@@ -5,8 +5,8 @@
 //! `openspec/specs/cli-contract/spec.md` 的"平台门禁先于一切其他步骤").
 //!
 //! 模块内部按职责拆分: `normalize` 负责路径规范化与归属判定, `fs_ops` 负责暂存,
-//! 原子移动与稳定存储同步, `metadata` 负责备份保真元数据. 本文件保留平台 stub,
-//! 文件系统身份与 crate 级 re-export.
+//! 原子移动与稳定存储同步, `metadata` 负责备份保真元数据, `mount` 负责挂载身份与
+//! 不跨挂载边界的遍历. 本文件保留平台 stub, 文件系统身份与 crate 级 re-export.
 
 use std::path::Path;
 
@@ -108,11 +108,19 @@ fn unsupported_identity() -> std::io::Error {
 
 mod fs_ops;
 mod metadata;
+mod mount;
 mod normalize;
 
 pub(crate) use fs_ops::{MAX_STAGING_ATTEMPTS, rename_noreplace, stage_aside, sync_dir, sync_file};
 #[cfg(test)]
 pub(crate) use fs_ops::{fail_directory_syncs, fail_syncs, staging_candidate};
+pub(crate) use mount::{
+    MountIdentity, RemoveTreeError, find_mount_boundary, mount_identity, remove_tree,
+};
+#[cfg(test)]
+pub(crate) use mount::{
+    fail_mount_comparison_after, fail_mount_comparisons, fail_next_mount_comparison,
+};
 pub(crate) use normalize::{comparison_form, is_inside_repo, link_destination, normalize};
 
 pub(crate) use metadata::{copy_xattrs, set_mtime};
