@@ -191,7 +191,9 @@ fn character_width(character: char) -> usize {
         | 0x20D0..=0x20FF
         | 0xFE00..=0xFE0F
         | 0xFE20..=0xFE2F => 0,
-        // 已在显示层转义的零宽 / bidi 控制符: 转义后是字面文本, 但直接传入时按 0 列.
+        // 零宽 / bidi 控制符直接传入时按 0 列, 仅作为测试侧对未转义文本的近似. 生产路径
+        // 的 `push_escaped` 会先转义这些码点并按 ASCII 字面计宽, 因此渲染不会走到本分支;
+        // 这里有意不与 `DEFAULT_IGNORABLE_RANGES` 合并, 以免把宽度规则与转义规则绑死.
         0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x2069 | 0xFEFF => 0,
         // East Asian Wide / Fullwidth 与 emoji: 数据与二分查找集中在 `WIDE_RANGES`.
         _ if is_wide(code) => 2,
@@ -199,11 +201,12 @@ fn character_width(character: char) -> usize {
     }
 }
 
-/// 把控制字符与常见布局控制符替换为可读转义形式, 只供显示层使用.
+/// 把控制字符, 布局控制符与 Default_Ignorable 码点替换为可读转义形式, 只供显示层使用.
 ///
-/// 对 `char::is_control()` (C0, C1 与 DEL) 与 [`is_layout_control`] 的字符使用
-/// `char::escape_default`: 换行 -> `\n`, 回车 -> `\r`, 制表 -> `\t`,
-/// ESC -> `\u{1b}`, BEL -> `\u{7}`, DEL -> `\u{7f}`, U+2028 -> `\u{2028}`.
+/// 对 `char::is_control()` (C0, C1 与 DEL), [`is_layout_control`] 与
+/// [`is_default_ignorable`] 的字符使用 `char::escape_default`: 换行 -> `\n`,
+/// 回车 -> `\r`, 制表 -> `\t`, ESC -> `\u{1b}`, BEL -> `\u{7}`, DEL -> `\u{7f}`,
+/// U+2028 -> `\u{2028}`, U+00AD -> `\u{ad}`, 标签字符 U+E0041 -> `\u{e0041}`.
 /// 其余字符原样保留, 因此正常路径与清单原文逐字一致, 且路径中的反斜杠与引号不会被
 /// 二次转义.
 ///
@@ -217,13 +220,15 @@ pub fn escape_controls(text: &str) -> String {
 
 /// 把转义后的 `text` 追加到 `out`, 返回转义结果的显示宽度.
 ///
-/// 转义只把控制字符与布局控制符展开为 ASCII (`\n` / `\u{...}`), 其中每个字符各占
-/// 1 列; 其余字符按 [`character_width`] 计宽. 一次遍历同时完成转义与计宽, 供
-/// [`render`] 直接写入输出缓冲, 避免为每行先构造转义后的 `String`.
+/// 转义只把控制字符, 布局控制符与 Default_Ignorable 码点展开为 ASCII
+/// (`\n` / `\u{...}`), 其中每个字符各占 1 列; 其余字符按 [`character_width`] 计宽.
+/// 一次遍历同时完成转义与计宽, 供 [`render`] 直接写入输出缓冲, 避免为每行先构造
+/// 转义后的 `String`.
 fn push_escaped(out: &mut String, text: &str) -> usize {
     let mut width = 0;
     for character in text.chars() {
-        if character.is_control() || is_layout_control(character) {
+        if character.is_control() || is_layout_control(character) || is_default_ignorable(character)
+        {
             for escaped in character.escape_default() {
                 out.push(escaped);
                 width += 1;
@@ -236,21 +241,59 @@ fn push_escaped(out: &mut String, text: &str) -> usize {
     width
 }
 
-/// 会改变行布局或视觉顺序, 但不是 `char::is_control()` 的字符.
+/// 会改变行布局, 但不是 `char::is_control()` 且不属于 Default_Ignorable 的字符.
 ///
-/// 覆盖 U+2028 / U+2029 (行分隔与段分隔) 与常见零宽 / bidi 控制符. 其他格式字符
-/// (例如 U+00AD, U+061C 与标签字符) 不在集合内, 仍按原样显示; README 记录该边界.
+/// 只覆盖 U+2028 / U+2029 (行分隔与段分隔). 其余常见零宽 / bidi 控制符同时具有
+/// Default_Ignorable 属性, 由 [`is_default_ignorable`] 统一覆盖, 这里不再重复列出.
 fn is_layout_control(character: char) -> bool {
-    matches!(
-        u32::from(character),
-        0x2028
-            | 0x2029
-            | 0x200B..=0x200F
-            | 0x202A..=0x202E
-            | 0x2060..=0x2064
-            | 0x2066..=0x2069
-            | 0xFEFF
-    )
+    matches!(u32::from(character), 0x2028 | 0x2029)
+}
+
+/// Unicode 17.0 中 Default_Ignorable_Code_Point 属性的排序区间表.
+///
+/// 区间按起点升序且互不重叠, 供 [`is_default_ignorable`] 二分查找. 数据取自
+/// Unicode 17.0 的 `DerivedCoreProperties.txt`; 升级 Unicode 版本时重跑该文件并更新
+/// 版本号. 这些码点在终端中通常不可见或会改变阅读顺序 (例如软连字符, bidi 控制符与
+/// 标签字符), 因此报告层统一转义. 未分配但属于该属性的保留码点 (例如 U+FFF0 与
+/// U+E0000 起的区间) 同样列入, 使输出不因码点未分配而漏转义.
+const DEFAULT_IGNORABLE_RANGES: &[(u32, u32)] = &[
+    (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
+    (0x061C, 0x061C),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x206F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFF8),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+];
+
+/// 码点是否具有 Unicode 17.0 的 Default_Ignorable_Code_Point 属性.
+///
+/// 与 [`is_wide`] 相同, 表已按起点排序且互不重叠, 用 `binary_search_by` 把"码点落在
+/// 区间内"表达为与区间元素的比较: 码点小于起点时元素更大, 大于终点时元素更小, 落在
+/// 区间内即相等.
+fn is_default_ignorable(character: char) -> bool {
+    let code = u32::from(character);
+    DEFAULT_IGNORABLE_RANGES
+        .binary_search_by(|&(start, end)| {
+            if code < start {
+                std::cmp::Ordering::Greater
+            } else if code > end {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
 }
 
 /// 报告中的一行.
@@ -1995,6 +2038,89 @@ mod tests {
         assert_eq!(escape_controls("\u{feff}"), r"\u{feff}");
         // 普通中文与反斜杠不被二次转义.
         assert_eq!(escape_controls(r"配置\路径"), r"配置\路径");
+    }
+
+    /// Default_Ignorable 区间表必须按起点升序且互不重叠: 二分查找依赖这一不变量.
+    #[test]
+    fn default_ignorable_range_table_is_sorted_and_disjoint() {
+        for pair in DEFAULT_IGNORABLE_RANGES.windows(2) {
+            let (start, end) = pair[0];
+            let (next_start, _) = pair[1];
+            assert!(start <= end, "U+{start:04X}..U+{end:04X} 区间倒置");
+            assert!(
+                end < next_start,
+                "U+{end:04X} 与 U+{next_start:04X} 重叠或未按起点排序"
+            );
+        }
+        if let Some(&(start, end)) = DEFAULT_IGNORABLE_RANGES.last() {
+            assert!(start <= end, "U+{start:04X}..U+{end:04X} 区间倒置");
+        }
+    }
+
+    /// Default_Ignorable 判定覆盖代表性码点, 且不影响普通可见字符与布局分隔符.
+    #[test]
+    fn default_ignorable_predicate_covers_representative_codepoints() {
+        for code in [
+            0x00AD, 0x034F, 0x061C, 0x115F, 0x17B4, 0x180B, 0x180E, 0x180F, 0x200B, 0x202A, 0x2060,
+            0x2065, 0x3164, 0xFE00, 0xFEFF, 0xFFA0, 0xFFF0, 0x1BCA0, 0x1D173, 0xE0041,
+        ] {
+            let character = char::from_u32(code).expect("有效码点");
+            assert!(
+                is_default_ignorable(character),
+                "U+{code:04X} 应属 Default_Ignorable"
+            );
+        }
+        for character in ['a', '~', '/', '.', '配', '\u{2028}', '\u{2029}', '\u{0301}'] {
+            assert!(
+                !is_default_ignorable(character),
+                "{character:?} 不应属 Default_Ignorable"
+            );
+        }
+    }
+
+    /// target 中的 Default_Ignorable 码点同样转义, 每条目仍只占一行.
+    #[test]
+    fn render_escapes_default_ignorable_codepoints_and_keeps_each_entry_on_one_line() {
+        let rows = vec![
+            ReportRow {
+                target_display: "~/.a\u{ad}b".to_string(),
+                token: EntryOutcome::Create,
+                note: "说明".to_string(),
+            },
+            ReportRow {
+                target_display: "~/.c\u{61c}d".to_string(),
+                token: EntryOutcome::Ok,
+                note: "说明".to_string(),
+            },
+            ReportRow {
+                target_display: "~/.e\u{e0041}f".to_string(),
+                token: EntryOutcome::Ok,
+                note: "说明".to_string(),
+            },
+            ReportRow {
+                target_display: "~/.g\u{fff0}h".to_string(),
+                token: EntryOutcome::Ok,
+                note: "说明".to_string(),
+            },
+        ];
+
+        let out = render(&rows);
+        assert_eq!(out.lines().count(), rows.len() + 1, "{out:?}");
+        assert!(out.contains(r"~/.a\u{ad}b"), "{out:?}");
+        assert!(out.contains(r"~/.c\u{61c}d"), "{out:?}");
+        assert!(out.contains(r"~/.e\u{e0041}f"), "{out:?}");
+        assert!(out.contains(r"~/.g\u{fff0}h"), "{out:?}");
+        for character in ['\u{ad}', '\u{61c}', '\u{e0041}', '\u{fff0}'] {
+            assert!(
+                !out.contains(character),
+                "输出含未转义 {character:?}: {out:?}"
+            );
+        }
+        assert_eq!(
+            out.lines().last().unwrap_or_default(),
+            summary_line_of(&rows).trim_end(),
+            "汇总行必须是最后一行: {out:?}"
+        );
     }
 
     #[test]

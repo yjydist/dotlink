@@ -742,3 +742,38 @@ fn status_preserves_trailing_spaces_in_the_actual_target() {
         "不得显示 trim 之后的实际指向: {foreign_line:?}"
     );
 }
+
+/// target 中的软连字符 U+00AD 在报告中显示为 `\u{ad}`, 文件系统仍使用原始路径.
+///
+/// 覆盖 spec delta 的"软连字符"与"文件系统操作使用原始路径"两个场景: 若判定改用其它
+/// 路径, 该条目会变成 `absent`, 而不是命中原始路径上的正确链接.
+#[test]
+fn a_soft_hyphen_target_is_escaped_in_the_report_but_used_verbatim_on_disk() {
+    let env = TempEnv::new();
+    env.write_source("shell/bashrc", "managed\n");
+    let raw_target = "~/.bash\u{ad}rc";
+    env.write_manifest(&manifest_of(&[("shell/bashrc", raw_target, "-")]));
+
+    // 在原始名称上建立指向源的正确链接.
+    let link = env.home().join(".bash\u{ad}rc");
+    std::os::unix::fs::symlink(physical_repo(&env).join("shell/bashrc"), &link)
+        .expect("在原始名称上建立链接");
+    env.assert_symlink_to(&link, &physical_repo(&env).join("shell/bashrc"));
+
+    let run = run(&env, &["status"]);
+    assert_eq!(
+        run.code, 0,
+        "原始路径上是正确链接, 应退出 0; stdout:\n{}",
+        run.stdout
+    );
+
+    // 只有命中原始路径才会得到 ok; 若改用其它路径, 这里会是 absent.
+    let line = line_for(&run.stdout, r"~/.bash\u{ad}rc");
+    assert_eq!(token_of(line), "ok", "{line}");
+    assert!(line.contains(r"\u{ad}"), "报告应显示转义形式: {line}");
+    assert!(
+        !run.stdout.contains('\u{ad}'),
+        "报告不得包含未转义的软连字符: {:?}",
+        run.stdout
+    );
+}
