@@ -52,23 +52,26 @@ fn backup_stamps(env: &TempEnv) -> Vec<String> {
     stamps
 }
 
+/// 公历年月日到 Unix epoch 起的天数 (Howard Hinnant 的 days-from-civil).
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 /// 把 `YYYYMMDDThhmmss` 按 UTC 解析为 Unix 秒.
 fn unix_seconds(stamp: &str) -> i64 {
-    let year: i32 = stamp[0..4].parse().expect("年份");
-    let month: u8 = stamp[4..6].parse().expect("月份");
-    let day: u8 = stamp[6..8].parse().expect("日期");
-    let hour: u8 = stamp[9..11].parse().expect("小时");
-    let minute: u8 = stamp[11..13].parse().expect("分钟");
-    let second: u8 = stamp[13..15].parse().expect("秒");
-    let date =
-        time::Date::from_calendar_date(year, time::Month::try_from(month).expect("合法月份"), day)
-            .expect("合法日期");
-    time::PrimitiveDateTime::new(
-        date,
-        time::Time::from_hms(hour, minute, second).expect("合法时间"),
-    )
-    .assume_utc()
-    .unix_timestamp()
+    let year: i64 = stamp[0..4].parse().expect("年份");
+    let month: i64 = stamp[4..6].parse().expect("月份");
+    let day: i64 = stamp[6..8].parse().expect("日期");
+    let hour: i64 = stamp[9..11].parse().expect("小时");
+    let minute: i64 = stamp[11..13].parse().expect("分钟");
+    let second: i64 = stamp[13..15].parse().expect("秒");
+    days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second
 }
 
 /// 先在 `TZ=Asia/Shanghai` 下生成旧内容备份, 等待至少 1 秒后在同一目标上以
@@ -154,7 +157,10 @@ fn backup_timestamp_stays_utc_with_unknown_or_unset_tz() {
             "{label}: 时间戳必须是纯数字加 T 分隔: {stamp:?}"
         );
 
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("系统时钟必须晚于 Unix epoch")
+            .as_secs() as i64;
         let difference = (unix_seconds(stamp) - now).abs();
         assert!(
             difference < 120,

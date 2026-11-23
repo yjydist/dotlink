@@ -7,6 +7,9 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::os::fd::AsFd;
+
 use crate::error::{Error, Result};
 use crate::os;
 
@@ -199,24 +202,6 @@ fn parent_mount_identity(source: &Path) -> Option<os::MountIdentity> {
     Some(os::mount_identity(parent, &metadata))
 }
 
-/// 计算对象自身的挂载身份, 并在给了父目录身份时拒绝挂载边界.
-///
-/// 比较发生在创建暂存对象或读取内容之前: 挂载边界使整次复制以
-/// [`CopyFailure::Fatal`] 失败, 不复制挂载点之后的内容, 也不触发暂存名换名重试.
-fn check_mount(
-    source: &Path,
-    metadata: &fs::Metadata,
-    parent: Option<&os::MountIdentity>,
-) -> std::result::Result<os::MountIdentity, CopyFailure> {
-    let identity = os::mount_identity(source, metadata);
-    if let Some(parent) = parent
-        && !identity.same_mount(parent)
-    {
-        return Err(CopyFailure::Fatal(mount_boundary_error(source)));
-    }
-    Ok(identity)
-}
-
 /// 挂载边界导致的复制失败说明: 给出挂载点完整路径, 并提示先卸载或移走.
 fn mount_boundary_error(path: &Path) -> io::Error {
     io::Error::other(format!(
@@ -225,16 +210,51 @@ fn mount_boundary_error(path: &Path) -> io::Error {
     ))
 }
 
-/// 排他创建副本, 返回复制起点处顶层对象的元数据. 只有取得目的地所有权之后的失败才
-/// 允许清理它.
+/// 把路径拆成父目录与末段; 末段是 `O_NOFOLLOW` 原语的相对名字.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn parent_and_name<'a>(
+    path: &'a Path,
+    context: &str,
+) -> std::result::Result<(&'a Path, &'a std::ffi::OsStr), CopyFailure> {
+    let name = path.file_name().ok_or_else(|| {
+        CopyFailure::Fatal(copy_error(
+            context,
+            path,
+            io::Error::other("路径没有末段, 无法以文件描述符相对方式访问"),
+        ))
+    })?;
+    Ok((parent_dir(path), name))
+}
+
+/// 把末段转成 `CStr`, 供 fd 相对原语使用.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn c_name(
+    name: &std::ffi::OsStr,
+    path: &Path,
+    context: &str,
+) -> std::result::Result<std::ffi::CString, CopyFailure> {
+    use std::os::unix::ffi::OsStrExt;
+
+    std::ffi::CString::new(name.as_bytes())
+        .map_err(|error| CopyFailure::Fatal(copy_error(context, path, io::Error::other(error))))
+}
+
+/// 复制 `source` 顶层的对象到 `dest`; 目录内容递归复制.
 ///
-/// `parent` 是 `source` 所在目录的挂载身份; 符号链接只复制链接文本, 不参与边界
+/// 只有取得目的地所有权之后的失败才允许清理它. 目录与文件的递归都从**源目录文件
+/// 描述符**出发, 子项以 `statat(..., SYMLINK_NOFOLLOW)` 判定, 目录以
+/// `openat(..., O_DIRECTORY | O_NOFOLLOW)` 打开, 文件副本以
+/// `openat(..., O_EXCL | O_NOFOLLOW)` 创建, 符号链接以 `readlinkat` + `symlinkat`
+/// 复制链接文本本身. 失败清理仍按路径处理本次创建的暂存对象.
+///
+/// `parent` 是 `source` 所在目录的挂载身份. 符号链接只复制链接文本, 不参与边界
 /// 判定 (链接不是挂载点, 也不会被跟随). 普通文件与目录在创建暂存对象或读取内容
 /// 之前比较自身与父目录的挂载身份, 目录通过比较后以自身身份递归子项.
 ///
 /// 返回值区分根名冲突与其余失败: 仅当**本函数自己创建目标根名**时收到
 /// `AlreadyExists` 才是 [`CopyFailure::StagingNameTaken`]; 子项递归通过
 /// [`copy_child`] 把同类失败包装成带子项路径的致命错误, 避免整树复制被误重试.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(super) fn copy_object(
     source: &Path,
     dest: &Path,
@@ -242,89 +262,193 @@ pub(super) fn copy_object(
 ) -> std::result::Result<fs::Metadata, CopyFailure> {
     let metadata = fs::symlink_metadata(source)
         .map_err(|error| CopyFailure::Fatal(copy_error("读取", source, error)))?;
-    let file_type = metadata.file_type();
-    if file_type.is_symlink() {
-        let raw = os::read_link(source)
-            .map_err(|error| CopyFailure::Fatal(copy_error("读取链接", source, error)))?;
-        return os::create_symlink(&raw, dest)
-            .map_err(|error| CopyFailure::from_root_create("备份链接", dest, error))
-            .map(|()| metadata);
-    }
 
-    let identity = check_mount(source, &metadata, parent)?;
+    let (source_parent, source_name) = parent_and_name(source, "读取")?;
+    let (dest_parent, dest_name) = parent_and_name(dest, "创建备份对象")?;
+    let source_parent_fd = os::open_directory_ancestor(source_parent)
+        .map_err(|error| CopyFailure::Fatal(copy_error("读取目录", source_parent, error)))?;
+    let dest_parent_fd = os::open_directory_ancestor(dest_parent)
+        .map_err(|error| CopyFailure::Fatal(copy_error("创建备份对象", dest_parent, error)))?;
 
-    if file_type.is_dir() {
-        let mut builder = fs::DirBuilder::new();
-        builder.recursive(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        builder
-            .create(dest)
-            .map_err(|error| CopyFailure::from_root_create("创建备份目录", dest, error))?;
-        let copied = (|| {
-            // `mkdir` 仍会应用进程 umask: 受限 umask 可能剥离 owner 写权限, 使后续
-            // 子项创建失败. 暂存根创建成功后立即收紧到 0700, 使复制与元数据应用不受
-            // umask 影响; 它只作用于本次创建的私有暂存目录.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-
-                fs::set_permissions(dest, fs::Permissions::from_mode(0o700)).map_err(|error| {
-                    CopyFailure::Fatal(copy_error("设置备份目录权限", dest, error))
-                })?;
-            }
-            for entry in fs::read_dir(source)
-                .map_err(|error| CopyFailure::Fatal(copy_error("读取目录", source, error)))?
-            {
-                let entry = entry
-                    .map_err(|error| CopyFailure::Fatal(copy_error("读取目录项", source, error)))?;
-                copy_child(&entry.path(), &dest.join(entry.file_name()), &identity)?;
-            }
-            // 子项复制完成后再应用元数据: 创建子项会改变目录 mtime, 只读权限也会
-            // 阻止后续子项写入.
-            apply_metadata(source, dest, &metadata).map_err(CopyFailure::fatal)?;
-            // 全部子项与目录自身都同步完成后, 复制产物才算落盘 (设计 D4).
-            skip_unsupported(os::sync_dir(dest))
-                .map_err(|error| CopyFailure::Fatal(copy_error("同步备份目录", dest, error)))
-        })();
-        finish_copy(dest, copied)?;
-        return Ok(metadata);
-    }
-
-    if !file_type.is_file() {
-        return Err(CopyFailure::Fatal(io::Error::new(
-            io::ErrorKind::Unsupported,
-            format!(
-                "无法复制特殊文件 {}; 请先手工移走该特殊文件再重试",
-                source.display()
-            ),
-        )));
-    }
-    let mut input = fs::File::open(source)
-        .map_err(|error| CopyFailure::Fatal(copy_error("读取", source, error)))?;
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut output = options
-        .open(dest)
-        .map_err(|error| CopyFailure::from_root_create("创建备份文件", dest, error))?;
-    let copied = io::copy(&mut input, &mut output)
-        .map_err(|error| CopyFailure::Fatal(copy_error("复制", source, error)))
-        .and_then(|_| apply_metadata(source, dest, &metadata).map_err(CopyFailure::fatal))
-        .and_then(|()| {
-            // 数据与元数据在 rename 到最终名前同步到稳定存储 (设计 D4).
-            skip_unsupported(os::sync_file(&output))
-                .map_err(|error| CopyFailure::Fatal(copy_error("同步备份文件", dest, error)))
-        });
-    finish_copy(dest, copied)?;
+    let source_name = c_name(source_name, source, "读取")?;
+    let dest_name = c_name(dest_name, dest, "创建备份对象")?;
+    copy_node(
+        &source_parent_fd,
+        &source_name,
+        source,
+        &dest_parent_fd,
+        &dest_name,
+        dest,
+        parent,
+    )?;
     Ok(metadata)
+}
+
+/// 非 macOS/Linux 平台的可编译占位: 平台门禁会在运行到复制之前退 3.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub(super) fn copy_object(
+    _source: &Path,
+    _dest: &Path,
+    _parent: Option<&os::MountIdentity>,
+) -> std::result::Result<fs::Metadata, CopyFailure> {
+    Err(CopyFailure::Fatal(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "当前平台不支持以文件描述符相对方式复制",
+    )))
+}
+
+/// 复制一个对象 (顶层或子项) 到父目录文件描述符下的 `dest_name`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn copy_node(
+    source_parent_fd: &rustix::fd::OwnedFd,
+    source_name: &std::ffi::CStr,
+    source_path: &Path,
+    dest_parent_fd: &rustix::fd::OwnedFd,
+    dest_name: &std::ffi::CStr,
+    dest_path: &Path,
+    parent: Option<&os::MountIdentity>,
+) -> std::result::Result<(), CopyFailure> {
+    use rustix::fs::{FileType, readlinkat, symlinkat};
+
+    let (file_type, identity, _) =
+        os::classify_child(source_parent_fd, source_name, source_path)
+            .map_err(|error| CopyFailure::Fatal(copy_error("读取", source_path, error)))?;
+
+    if file_type == FileType::Symlink {
+        let raw = readlinkat(source_parent_fd, source_name, Vec::new()).map_err(|error| {
+            CopyFailure::Fatal(copy_error("读取链接", source_path, error.into()))
+        })?;
+        return symlinkat(&raw, dest_parent_fd, dest_name)
+            .map_err(|error| CopyFailure::from_root_create("备份链接", dest_path, error.into()));
+    }
+
+    // 符号链接已在上方返回; 其余对象比较自身与父目录的挂载身份.
+    if let Some(parent) = parent
+        && !identity.same_mount(parent)
+    {
+        return Err(CopyFailure::Fatal(mount_boundary_error(source_path)));
+    }
+
+    #[cfg(test)]
+    run_copy_descend_hook(source_path);
+
+    if file_type == FileType::Directory {
+        return copy_directory_node(
+            source_parent_fd,
+            source_name,
+            source_path,
+            dest_parent_fd,
+            dest_name,
+            dest_path,
+            &identity,
+        );
+    }
+
+    if file_type == FileType::RegularFile {
+        return copy_file_node(
+            source_parent_fd,
+            source_name,
+            source_path,
+            dest_parent_fd,
+            dest_name,
+            dest_path,
+        );
+    }
+
+    Err(CopyFailure::Fatal(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!(
+            "无法复制特殊文件 {}; 请先手工移走该特殊文件再重试",
+            source_path.display()
+        ),
+    )))
+}
+
+/// 递归复制一个目录对象.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn copy_directory_node(
+    source_parent_fd: &rustix::fd::OwnedFd,
+    source_name: &std::ffi::CStr,
+    source_path: &Path,
+    dest_parent_fd: &rustix::fd::OwnedFd,
+    dest_name: &std::ffi::CStr,
+    dest_path: &Path,
+    identity: &os::MountIdentity,
+) -> std::result::Result<(), CopyFailure> {
+    use rustix::fs::{AtFlags, Mode, chmodat, mkdirat};
+
+    mkdirat(dest_parent_fd, dest_name, Mode::from_bits_truncate(0o700))
+        .map_err(|error| CopyFailure::from_root_create("创建备份目录", dest_path, error.into()))?;
+
+    let copied = (|| {
+        // `mkdir` 仍会应用进程 umask: 受限 umask 可能剥离 owner 访问权限, 使随后
+        // 打开目录与创建子项失败. 暂存根创建成功后立即收紧到 0700; 该 chmod 只作用于
+        // 本次创建的私有暂存目录.
+        chmodat(
+            dest_parent_fd,
+            dest_name,
+            Mode::from_bits_truncate(0o700),
+            AtFlags::empty(),
+        )
+        .map_err(|error| {
+            CopyFailure::Fatal(copy_error("设置备份目录权限", dest_path, error.into()))
+        })?;
+
+        let source_fd = os::open_child_directory(source_parent_fd, source_name, source_path)
+            .map_err(|error| CopyFailure::Fatal(copy_error("读取目录", source_path, error)))?;
+        let dest_fd = os::open_child_directory(dest_parent_fd, dest_name, dest_path)
+            .map_err(|error| CopyFailure::Fatal(copy_error("创建备份目录", dest_path, error)))?;
+
+        copy_directory_contents(&source_fd, &dest_fd, source_path, dest_path, identity)?;
+
+        // 子项复制完成后再应用元数据: 创建子项会改变目录 mtime, 只读权限也会阻止
+        // 后续子项写入.
+        apply_metadata(source_fd.as_fd(), dest_fd.as_fd(), dest_path)
+            .map_err(CopyFailure::fatal)?;
+        // 全部子项与目录自身都同步完成后, 复制产物才算落盘 (设计 D4).
+        skip_unsupported(os::sync_dir(dest_path))
+            .map_err(|error| CopyFailure::Fatal(copy_error("同步备份目录", dest_path, error)))
+    })();
+
+    finish_copy(dest_path, copied)?;
+    Ok(())
+}
+
+/// 从已打开的源目录文件描述符复制全部子项.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn copy_directory_contents(
+    source_fd: &rustix::fd::OwnedFd,
+    dest_fd: &rustix::fd::OwnedFd,
+    source_path: &Path,
+    dest_path: &Path,
+    identity: &os::MountIdentity,
+) -> std::result::Result<(), CopyFailure> {
+    use std::os::unix::ffi::OsStrExt;
+
+    for entry in rustix::fs::Dir::read_from(source_fd)
+        .map_err(|error| CopyFailure::Fatal(copy_error("读取目录", source_path, error.into())))?
+    {
+        let entry = entry.map_err(|error| {
+            CopyFailure::Fatal(copy_error("读取目录项", source_path, error.into()))
+        })?;
+        let name = entry.file_name();
+        // 原始 `readdir` 会返回 `.` 与 `..`; 标准库 `read_dir` 已过滤, 这里必须自行跳过.
+        if matches!(name.to_bytes(), b"." | b"..") {
+            continue;
+        }
+        let child_source = source_path.join(std::ffi::OsStr::from_bytes(name.to_bytes()));
+        let child_dest = dest_path.join(std::ffi::OsStr::from_bytes(name.to_bytes()));
+        copy_child(
+            source_fd,
+            name,
+            &child_source,
+            dest_fd,
+            name,
+            &child_dest,
+            identity,
+        )?;
+    }
+    Ok(())
 }
 
 /// 递归复制一个子项.
@@ -332,24 +456,83 @@ pub(super) fn copy_object(
 /// 子项的"目标名已被占用"不再具有重试意义: 暂存根已经取得, 换名只会从头复制整棵
 /// 树并再次撞上同一个冲突. 因此把 [`CopyFailure::StagingNameTaken`] 包装成带子项
 /// 路径的致命错误 (openspec/specs/backup-lifecycle/spec.md 的"嵌套复制冲突不换名重试").
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn copy_child(
-    source: &Path,
-    dest: &Path,
+    source_parent_fd: &rustix::fd::OwnedFd,
+    source_name: &std::ffi::CStr,
+    source_path: &Path,
+    dest_parent_fd: &rustix::fd::OwnedFd,
+    dest_name: &std::ffi::CStr,
+    dest_path: &Path,
     parent: &os::MountIdentity,
 ) -> std::result::Result<(), CopyFailure> {
     #[cfg(test)]
     let copied = if take_nested_copy_failure() {
         Err(CopyFailure::StagingNameTaken)
     } else {
-        copy_object(source, dest, Some(parent))
+        copy_node(
+            source_parent_fd,
+            source_name,
+            source_path,
+            dest_parent_fd,
+            dest_name,
+            dest_path,
+            Some(parent),
+        )
     };
     #[cfg(not(test))]
-    let copied = copy_object(source, dest, Some(parent));
+    let copied = copy_node(
+        source_parent_fd,
+        source_name,
+        source_path,
+        dest_parent_fd,
+        dest_name,
+        dest_path,
+        Some(parent),
+    );
 
-    copied.map(|_| ()).map_err(|failure| match failure {
-        CopyFailure::StagingNameTaken => nested_conflict(dest),
+    copied.map_err(|failure| match failure {
+        CopyFailure::StagingNameTaken => nested_conflict(dest_path),
         fatal => fatal,
     })
+}
+
+/// 复制一个普通文件: 源以 `O_NOFOLLOW` 打开, 副本以 `O_EXCL | O_NOFOLLOW` 创建.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn copy_file_node(
+    source_parent_fd: &rustix::fd::OwnedFd,
+    source_name: &std::ffi::CStr,
+    source_path: &Path,
+    dest_parent_fd: &rustix::fd::OwnedFd,
+    dest_name: &std::ffi::CStr,
+    dest_path: &Path,
+) -> std::result::Result<(), CopyFailure> {
+    use rustix::fs::{Mode, OFlags, openat};
+
+    let source_fd = os::open_child_file(source_parent_fd, source_name, source_path)
+        .map_err(|error| CopyFailure::Fatal(copy_error("读取", source_path, error)))?;
+    let dest_fd = openat(
+        dest_parent_fd,
+        dest_name,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_bits_truncate(0o600),
+    )
+    .map_err(|error| CopyFailure::from_root_create("创建备份文件", dest_path, error.into()))?;
+
+    let mut input = fs::File::from(source_fd);
+    let mut output = fs::File::from(dest_fd);
+    let copied = io::copy(&mut input, &mut output)
+        .map_err(|error| CopyFailure::Fatal(copy_error("复制", source_path, error)))
+        .and_then(|_| {
+            apply_metadata(input.as_fd(), output.as_fd(), dest_path).map_err(CopyFailure::fatal)
+        })
+        .and_then(|()| {
+            // 数据与元数据在 rename 到最终名前同步到稳定存储 (设计 D4).
+            skip_unsupported(os::sync_file(&output))
+                .map_err(|error| CopyFailure::Fatal(copy_error("同步备份文件", dest_path, error)))
+        });
+    finish_copy(dest_path, copied)?;
+    Ok(())
 }
 
 fn nested_conflict(dest: &Path) -> CopyFailure {
@@ -361,20 +544,34 @@ fn nested_conflict(dest: &Path) -> CopyFailure {
 
 /// 给普通文件或目录应用保真元数据, 顺序固定为**扩展属性 -> 权限位 -> mtime**.
 ///
-/// 扩展属性必须最先设置: 目标此刻仍是创建时的 `0600` / `0700`, 最终权限若只读,
-/// `setxattr` 会返回 `EACCES` (macOS 实测). 权限位只改变 ctime, mtime 最后设置即可
-/// 覆盖前面所有写入 (目录还包括子项创建). 平台不支持某类元数据时返回 `Unsupported`,
-/// 视为该平台的降级, 不使备份失败.
-fn apply_metadata(source: &Path, dest: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+/// 全部作用于已打开的目的地文件描述符: 扩展属性用 `fsetxattr`, 权限用 `fchmod`,
+/// mtime 用 `futimens`. 扩展属性必须最先设置: 目标此刻仍是创建时的 `0600` /
+/// `0700`, 最终权限若只读, `setxattr` 会返回 `EACCES` (macOS 实测). 权限位只改变
+/// ctime, mtime 最后设置即可覆盖前面所有写入 (目录还包括子项创建). 平台不支持某类
+/// 元数据时返回 `Unsupported`, 视为该平台的降级, 不使备份失败.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn apply_metadata(
+    source_fd: std::os::fd::BorrowedFd<'_>,
+    dest_fd: std::os::fd::BorrowedFd<'_>,
+    dest: &Path,
+) -> io::Result<()> {
+    use rustix::fs::{Mode, fchmod, fstat};
+
     #[cfg(test)]
     if take_metadata_failure() {
         return Err(io::Error::other("模拟应用备份元数据失败"));
     }
-    skip_unsupported(os::copy_xattrs(source, dest))
+    skip_unsupported(os::copy_xattrs(source_fd, dest_fd))
         .map_err(|error| copy_error("设置备份扩展属性", dest, error))?;
-    fs::set_permissions(dest, metadata.permissions())
-        .map_err(|error| copy_error("设置备份权限", dest, error))?;
-    skip_unsupported(os::set_mtime(metadata, dest))
+
+    let stat = fstat(source_fd)?;
+    fchmod(
+        dest_fd,
+        Mode::from_bits_truncate((stat.st_mode & 0o7777) as _),
+    )
+    .map_err(|error| copy_error("设置备份权限", dest, error.into()))?;
+
+    skip_unsupported(os::set_mtime(source_fd, dest_fd))
         .map_err(|error| copy_error("设置备份修改时间", dest, error))
 }
 
@@ -428,10 +625,12 @@ pub(super) fn remove_any(path: &Path) {
 
 /// 尽力恢复目录树中每个目录的 owner rwx, 使失败清理不被只读权限位阻挡.
 ///
-/// 先对当前目录 `chmod 0700` 再尝试读取; 读不到时直接放弃该子树 (尽力而为). 只递归
-/// 真实目录: `symlink_metadata` 不跟随符号链接, 因此链接指向的树不会被动到. 文件与
-/// 符号链接本身只需父目录可写即可删除, 不再单独改权限. 进入子目录前比较挂载身份:
-/// 挂载点之后的内容不会被 chmod, 与删除路径保持同一边界.
+/// 先对当前目录 `fchmod 0700` 再尝试读取; 读不到时直接放弃该子树 (尽力而为). 只
+/// 递归真实目录, 子项以 `statat(..., SYMLINK_NOFOLLOW)` 判定, 目录以
+/// `openat(..., O_DIRECTORY | O_NOFOLLOW)` 打开: 符号链接指向的树不会被动到, 遍历
+/// 期间被替换的目录项也不会被跟随. 进入子目录前比较挂载身份: 挂载点之后的内容
+/// 不会被 chmod, 与删除路径保持同一边界.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn make_tree_writable(path: &Path) {
     let Ok(metadata) = fs::symlink_metadata(path) else {
         return;
@@ -440,32 +639,88 @@ fn make_tree_writable(path: &Path) {
         return;
     }
     let identity = os::mount_identity(path, &metadata);
-    make_tree_writable_inner(path, &identity);
+    let Ok(fd) = os::open_directory(path) else {
+        return;
+    };
+    make_tree_writable_inner(&fd, path, &identity);
 }
 
-fn make_tree_writable_inner(path: &Path, own: &os::MountIdentity) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn make_tree_writable(_path: &Path) {}
 
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
-    }
-    let Ok(entries) = fs::read_dir(path) else {
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn make_tree_writable_inner(fd: &rustix::fd::OwnedFd, path: &Path, own: &os::MountIdentity) {
+    use rustix::fs::{FileType, Mode, fchmod};
+    use std::os::unix::ffi::OsStrExt;
+
+    let _ = fchmod(fd, Mode::from_bits_truncate(0o700));
+    let Ok(entries) = rustix::fs::Dir::read_from(fd) else {
         return;
     };
     for entry in entries.flatten() {
-        let child = entry.path();
-        let Ok(metadata) = fs::symlink_metadata(&child) else {
+        let name = entry.file_name();
+        if matches!(name.to_bytes(), b"." | b"..") {
+            continue;
+        }
+        let child = path.join(std::ffi::OsStr::from_bytes(name.to_bytes()));
+        let Ok((file_type, identity, _)) = os::classify_child(fd, name, &child) else {
             continue;
         };
-        if metadata.file_type().is_dir() {
-            let identity = os::mount_identity(&child, &metadata);
-            if !identity.same_mount(own) {
-                continue;
-            }
-            make_tree_writable_inner(&child, &identity);
+        if file_type != FileType::Directory {
+            continue;
         }
+        if !identity.same_mount(own) {
+            continue;
+        }
+        let Ok(child_fd) = os::open_child_directory(fd, name, &child) else {
+            continue;
+        };
+        make_tree_writable_inner(&child_fd, &child, &identity);
     }
+}
+
+// 测试接缝: 子项被判定为目录或文件之后, 打开它之前运行一次注入动作.
+//
+// 真实的"判定之后目录项被替换为符号链接"竞态无法在可移植测试里稳定触发; 线程局部
+// 钩子让 `copy_node` 的"拒绝跟随"分支可被确定性断言. 钩子可对同一路径重复触发,
+// 由用例自行判断; 生产构建不包含该钩子.
+#[cfg(test)]
+type CopyDescendHook = Box<dyn Fn(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    static COPY_DESCEND: std::cell::RefCell<Option<CopyDescendHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// 在复制递归打开子项之前注册一个注入钩子, 直到守卫被丢弃.
+#[cfg(test)]
+pub(super) fn before_copy_descend(hook: impl Fn(&Path) + 'static) -> CopyDescendGuard {
+    let previous = COPY_DESCEND.with(|slot| slot.borrow_mut().replace(Box::new(hook)));
+    CopyDescendGuard { previous }
+}
+
+#[cfg(test)]
+pub(super) struct CopyDescendGuard {
+    previous: Option<CopyDescendHook>,
+}
+
+#[cfg(test)]
+impl Drop for CopyDescendGuard {
+    fn drop(&mut self) {
+        COPY_DESCEND.with(|slot| {
+            *slot.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+#[cfg(test)]
+fn run_copy_descend_hook(path: &Path) {
+    COPY_DESCEND.with(|slot| {
+        if let Some(hook) = slot.borrow().as_ref() {
+            hook(path);
+        }
+    });
 }
 
 /// PID 减少并发命名碰撞; 排他性由创建操作保证, 不能依赖 PID 未被复用.

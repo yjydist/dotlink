@@ -76,8 +76,12 @@ fn run_on(supported: bool) -> i32 {
 
     // 3. 清单取自**当前工作目录**, 不向上搜索父目录 (FR-015). 校验失败 (含当前
     //    工作目录或 `HOME` 不可用) 在这里结束, 退出码的唯一来源是 `Error::exit_code`.
-    let manifest = match manifest::load() {
-        Ok(manifest) => manifest,
+    //    同一清单上的并发调用在这里串行化: `apply` / `undo` 取排他锁, `preview` /
+    //    `status` 取共享锁. 锁 guard (`_manifest_lock`) 活到本函数结束, 因此写入
+    //    命令在整个执行期间独占该清单; 平台不支持 flock 时降级为不加锁.
+    let lock_mode = manifest::lock_mode_for(command);
+    let (manifest, _manifest_lock) = match manifest::load(lock_mode) {
+        Ok(loaded) => loaded,
         Err(error) => {
             // 与 `platform_gate` 同构: 标准错误不可写时只放弃说明, 清单错误仍是 2.
             // 原因可能带着来自清单或环境的路径, 因此与报告行共用同一个转义助手,

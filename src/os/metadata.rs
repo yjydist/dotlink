@@ -1,23 +1,25 @@
 //! 备份保真所需的平台元数据原语: 扩展属性复制与修改时间设置.
 //!
-//! 只有 macOS/Linux 提供实现; 其他平台返回 `Unsupported`, 由调用者视为"本平台
-//! 不保留该元数据"并跳过. `backup.rs` 因此不必按平台分支.
+//! 只有 macOS/Linux 提供实现; 其他平台不提供, `backup.rs` 的 fd 相对复制只在目标
+//! 平台编译, 平台门禁会在运行到复制之前退 3.
 //!
 //! 错误分类是**逐属性**的, 而不是整体成败: 文件系统不支持扩展属性, 内核保护属性
 //! 或权限不足都只跳过该属性; 磁盘满, I/O 失败等仍上抛, 使该条目失败.
+//!
+//! 全部原语作用于**已打开的文件描述符**: 复制扩展属性用 `flistxattr` /
+//! `fgetxattr` / `fsetxattr`, 设置修改时间用 `futimens`, 因此复制递归不依赖路径,
+//! 也不会在复制期间跟随被替换的目录项.
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod imp {
     use std::ffi::{OsStr, OsString};
-    use std::fs;
     use std::io;
+    use std::os::fd::{AsFd, BorrowedFd};
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::MetadataExt;
-    use std::path::Path;
 
     use rustix::fs::Timespec;
     use rustix::fs::{
-        AtFlags, CWD, Timestamps, UTIME_OMIT, XattrFlags, getxattr, listxattr, setxattr, utimensat,
+        Timestamps, UTIME_OMIT, XattrFlags, fgetxattr, flistxattr, fsetxattr, fstat, futimens,
     };
     use rustix::io::Errno;
 
@@ -26,12 +28,12 @@ mod imp {
     /// 名称与值原样写入. 列举本身不可用时 (文件系统不支持, 内核未实现) 视为该对象
     /// 没有可复制的属性, 返回 `Ok`. 单个属性读取或写入失败时按 [`is_skippable`]
     /// 分类: 可跳过者忽略, 其余上抛.
-    pub(crate) fn copy_xattrs(source: &Path, dest: &Path) -> io::Result<()> {
-        for name in xattr_names(source)? {
-            let Some(value) = read_xattr(source, &name)? else {
+    pub(crate) fn copy_xattrs(source: BorrowedFd<'_>, dest: BorrowedFd<'_>) -> io::Result<()> {
+        for name in xattr_names(source.as_fd())? {
+            let Some(value) = read_xattr(source.as_fd(), &name)? else {
                 continue;
             };
-            match setxattr(dest, &name, &value, XattrFlags::empty()) {
+            match fsetxattr(dest.as_fd(), &name, &value, XattrFlags::empty()) {
                 Ok(()) => {}
                 Err(errno) if is_skippable(errno) => {}
                 Err(errno) => return Err(xattr_error("写入", &name, errno)),
@@ -42,25 +44,26 @@ mod imp {
 
     /// 把 `dest` 的修改时间设为 `source` 的修改时间; `atime` 传 `UTIME_OMIT`,
     /// 保持原值, 不在保真范围内.
-    pub(crate) fn set_mtime(source: &fs::Metadata, dest: &Path) -> io::Result<()> {
+    pub(crate) fn set_mtime(source: BorrowedFd<'_>, dest: BorrowedFd<'_>) -> io::Result<()> {
+        let stat = fstat(source.as_fd())?;
         let times = Timestamps {
             last_access: Timespec {
                 tv_sec: 0,
                 tv_nsec: UTIME_OMIT,
             },
             last_modification: Timespec {
-                tv_sec: source.mtime(),
-                tv_nsec: source.mtime_nsec(),
+                tv_sec: stat.st_mtime,
+                tv_nsec: stat.st_mtime_nsec as _,
             },
         };
-        utimensat(CWD, dest, &times, AtFlags::empty()).map_err(io::Error::from)
+        futimens(dest.as_fd(), &times).map_err(io::Error::from)
     }
 
-    /// 列举 `path` 上的扩展属性名.
-    fn xattr_names(path: &Path) -> io::Result<Vec<OsString>> {
+    /// 列举 `source` 上的扩展属性名.
+    fn xattr_names(source: BorrowedFd<'_>) -> io::Result<Vec<OsString>> {
         let mut buffer: Vec<u8> = Vec::new();
         loop {
-            match listxattr(path, &mut buffer[..]) {
+            match flistxattr(source.as_fd(), &mut buffer[..]) {
                 // 空缓冲区只返回所需长度, 不写入任何字节; 长度超出当前缓冲区时扩容.
                 Ok(length) if length > buffer.len() => grow(&mut buffer, length),
                 Ok(length) => return Ok(split_names(&buffer[..length])),
@@ -74,10 +77,10 @@ mod imp {
     }
 
     /// 读取一个属性; 属性已消失时返回 `Ok(None)`.
-    fn read_xattr(path: &Path, name: &OsStr) -> io::Result<Option<Vec<u8>>> {
+    fn read_xattr(source: BorrowedFd<'_>, name: &OsStr) -> io::Result<Option<Vec<u8>>> {
         let mut buffer: Vec<u8> = Vec::new();
         loop {
-            match getxattr(path, name, &mut buffer[..]) {
+            match fgetxattr(source.as_fd(), name, &mut buffer[..]) {
                 // 空缓冲区只返回所需长度; 长度超出当前缓冲区时扩容.
                 Ok(length) if length > buffer.len() => grow(&mut buffer, length),
                 Ok(length) => return Ok(Some(buffer[..length].to_vec())),
@@ -136,14 +139,18 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::fs;
+        use std::os::fd::AsFd;
+        use std::path::Path;
 
         fn set_xattr(path: &Path, name: &str, value: &[u8]) -> Result<(), Errno> {
-            setxattr(path, name, value, XattrFlags::empty())
+            rustix::fs::setxattr(path, name, value, XattrFlags::empty())
         }
 
         fn get_xattr(path: &Path, name: &str) -> Vec<u8> {
             let mut buffer = vec![0_u8; 64 * 1024];
-            let value = getxattr(path, name, &mut buffer[..]).expect("读取测试扩展属性");
+            let value =
+                rustix::fs::getxattr(path, name, &mut buffer[..]).expect("读取测试扩展属性");
             buffer[..value].to_vec()
         }
 
@@ -168,7 +175,9 @@ mod imp {
                 Err(error) => panic!("设置测试扩展属性: {error}"),
             }
 
-            copy_xattrs(&source, &dest).unwrap();
+            let source_file = fs::File::open(&source).unwrap();
+            let dest_file = fs::File::open(&dest).unwrap();
+            copy_xattrs(source_file.as_fd(), dest_file.as_fd()).unwrap();
 
             assert_eq!(get_xattr(&dest, "user.test"), value);
         }
@@ -181,8 +190,10 @@ mod imp {
             fs::write(&source, "content").unwrap();
             fs::write(&dest, "content").unwrap();
 
+            let source_file = fs::File::open(&source).unwrap();
+            let dest_file = fs::File::open(&dest).unwrap();
             // 没有属性可复制时是成功, 不是失败.
-            copy_xattrs(&source, &dest).unwrap();
+            copy_xattrs(source_file.as_fd(), dest_file.as_fd()).unwrap();
         }
 
         #[test]
@@ -220,11 +231,21 @@ mod imp {
                     tv_nsec: 123_456_789,
                 },
             };
-            utimensat(CWD, &source, &known, AtFlags::empty()).unwrap();
+            let source_file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&source)
+                .unwrap();
+            futimens(source_file.as_fd(), &known).unwrap();
 
-            let metadata = fs::metadata(&source).unwrap();
-            set_mtime(&metadata, &dest).unwrap();
+            let dest_file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&dest)
+                .unwrap();
+            set_mtime(source_file.as_fd(), dest_file.as_fd()).unwrap();
 
+            use std::os::unix::fs::MetadataExt;
             let copied = fs::metadata(&dest).unwrap();
             assert_eq!(copied.mtime(), 1_600_000_000);
             assert_eq!(copied.mtime_nsec(), 123_456_789);
@@ -232,28 +253,5 @@ mod imp {
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-mod imp {
-    use std::fs;
-    use std::io;
-    use std::path::Path;
-
-    /// 其他平台没有可用的扩展属性原语: 返回 `Unsupported`, 调用者据此跳过.
-    pub(crate) fn copy_xattrs(_source: &Path, _dest: &Path) -> io::Result<()> {
-        Err(unsupported("扩展属性"))
-    }
-
-    /// 其他平台不保证可设置的修改时间原语: 返回 `Unsupported`, 调用者据此跳过.
-    pub(crate) fn set_mtime(_source: &fs::Metadata, _dest: &Path) -> io::Result<()> {
-        Err(unsupported("修改时间"))
-    }
-
-    fn unsupported(feature: &str) -> io::Error {
-        io::Error::new(
-            io::ErrorKind::Unsupported,
-            format!("当前平台不支持保留{feature}"),
-        )
-    }
-}
-
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) use imp::{copy_xattrs, set_mtime};

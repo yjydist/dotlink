@@ -7,8 +7,6 @@ use std::fs;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use time::{OffsetDateTime, UtcOffset};
-
 use super::copy::*;
 use super::name::*;
 use super::test_support::*;
@@ -67,8 +65,8 @@ fn is_timestamp_accepts_valid_calendar_values() {
         "20260228T235959",
         "20240229T000000",
         "20261231T235959",
-        // 年份范围以 `time` 能否构成合法日期为准: 4 位数字的上下端都被接受.
-        // 本工具生成的年份来自 `now_utc()`, 不会走到这两端, 这里只为固定住当前范围.
+        // 年份范围由 4 位数字形态固定; 项目内的公历校验接受 0000 至 9999 的上下端.
+        // 本工具生成的年份来自系统时钟, 不会走到这两端, 这里只为固定住当前范围.
         "00000101T000000",
         "99991231T235959",
     ] {
@@ -571,23 +569,20 @@ fn a_failed_parent_sync_reports_the_published_backup() {
 /// 同一目标的备份会落在不同时间轴上, 字符串序不再等于时间序.
 #[test]
 fn timestamp_formats_a_fixed_instant_in_utc() {
-    let offset = UtcOffset::from_hms(8, 0, 0).unwrap();
-    let fixed = time::Date::from_calendar_date(2026, time::Month::November, 4)
-        .unwrap()
-        .with_hms(23, 17, 19)
-        .unwrap()
-        .assume_offset(offset);
-
+    // 2026-11-04T15:17:19Z 的 Unix 秒. Unix 秒本身即 UTC, 因此格式化不再需要偏移.
     assert_eq!(
-        format_timestamp(fixed),
+        format_unix_timestamp(1_793_805_439),
         "20261104T151719",
-        "2026-11-04T23:17:19+08:00 的 UTC 形态必须是 20261104T151719"
+        "固定 Unix 秒的 UTC 形态必须是 20261104T151719"
     );
     assert_eq!(
-        format_timestamp(OffsetDateTime::from_unix_timestamp(0).unwrap()),
+        format_unix_timestamp(0),
         "19700101T000000",
         "epoch 的 UTC 形态必须是 19700101T000000"
     );
+    // 闰日与月末边界.
+    assert_eq!(format_unix_timestamp(1_709_164_800), "20240229T000000");
+    assert_eq!(format_unix_timestamp(1_727_654_400), "20240930T000000");
 }
 
 #[test]
@@ -1079,6 +1074,118 @@ fn write_backup_does_not_follow_nested_links_inside_a_directory() {
         fs::read_link(backup.join("dangling")).unwrap(),
         PathBuf::from("/definitely/gone")
     );
+}
+
+/// 复制期间某个子目录在判定之后被替换为仓库外的符号链接: 复制必须失败, 不读取或
+/// 复制链接目标的内容, 不发布最终备份名, 原对象与链接目标保持原样.
+#[test]
+fn copying_refuses_a_child_replaced_by_an_outside_symlink() {
+    let outside_dir = tempfile::tempdir().unwrap();
+    let outside = outside_dir.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("secret"), "secret").unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let object = dir.path().join("nvim");
+    fs::create_dir_all(object.join("victim")).unwrap();
+    fs::write(object.join("victim/inside"), "inside").unwrap();
+    fs::write(object.join("init.lua"), "init").unwrap();
+
+    let victim = object.join("victim");
+    let replaced = victim.clone();
+    let outside_path = outside.clone();
+    let guard = before_copy_descend(move |path| {
+        if path == replaced {
+            fs::remove_dir_all(&replaced).unwrap();
+            os::create_symlink(&outside_path, &replaced).unwrap();
+        }
+    });
+
+    let base = dir.path().join("nvim");
+    let result = copy_to_staging(&object, &base, PARTIAL_SUFFIX);
+    drop(guard);
+
+    let error = result.expect_err("子目录被替换为链接后复制必须失败");
+    let message = error.to_string();
+    assert!(
+        message.contains("不跟随链接目标"),
+        "失败说明必须指出拒绝跟随: {message}"
+    );
+    assert_eq!(
+        fs::read_to_string(outside.join("secret")).unwrap(),
+        "secret",
+        "链接目标的内容必须保持原样"
+    );
+    assert!(
+        fs::symlink_metadata(&victim)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "被替换的目录项本身不应被跟随或删除"
+    );
+    // 不得留下最终名或暂存残渣.
+    let residue: Vec<String> = fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("nvim."))
+        .collect();
+    assert!(residue.is_empty(), "失败不得留下暂存残渣: {residue:?}");
+}
+
+/// 复制期间某个普通文件在判定之后被替换为仓库外的符号链接: 复制必须失败, 不读取
+/// 链接目标的内容, 不发布最终备份名, 链接目标保持原样.
+#[test]
+fn copying_refuses_a_file_replaced_by_an_outside_symlink() {
+    let outside_dir = tempfile::tempdir().unwrap();
+    let outside = outside_dir.path().join("secret.txt");
+    fs::write(&outside, "outside-secret").unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let object = dir.path().join("nvim");
+    fs::create_dir(&object).unwrap();
+    let victim = object.join("init.lua");
+    fs::write(&victim, "original").unwrap();
+
+    let replaced = victim.clone();
+    let outside_path = outside.clone();
+    let guard = before_copy_descend(move |path| {
+        if path == replaced {
+            fs::remove_file(&replaced).unwrap();
+            os::create_symlink(&outside_path, &replaced).unwrap();
+        }
+    });
+
+    let base = dir.path().join("nvim");
+    let result = copy_to_staging(&object, &base, PARTIAL_SUFFIX);
+    drop(guard);
+
+    let error = result.expect_err("文件被替换为链接后复制必须失败");
+    let message = error.to_string();
+    assert!(
+        message.contains("不跟随链接目标"),
+        "失败说明必须指出拒绝跟随: {message}"
+    );
+    assert_eq!(
+        fs::read_to_string(&outside).unwrap(),
+        "outside-secret",
+        "链接目标的内容必须保持原样"
+    );
+    assert!(
+        fs::symlink_metadata(&victim)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "被替换的文件本身不应被跟随或删除"
+    );
+    // 不得留下最终名或暂存残渣.
+    let residue: Vec<String> = fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("nvim."))
+        .collect();
+    assert!(residue.is_empty(), "失败不得留下暂存残渣: {residue:?}");
 }
 
 #[test]

@@ -17,6 +17,9 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use rustix::fs::{AtFlags, CWD, Mode, OFlags, openat, statat};
+
 /// 路径所在挂载的身份: 设备号, 以及平台能提供时的挂载标识.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MountIdentity {
@@ -270,7 +273,272 @@ pub(crate) enum RemoveTreeError {
 ///
 /// `root` 自身不作为边界: 调用方传入的是本工具创建的, 或刚由原子 rename 移入的
 /// 暂存目录, 它不可能是挂载点. 只扫描目录; 非目录返回 `None`. 遍历顺序与
-/// `read_dir` 一致, 不保证"第一个"在并发变化下稳定.
+/// `readdir` 一致, 不保证"第一个"在并发变化下稳定.
+///
+/// 子项从已打开的目录文件描述符出发, 以 `statat(..., SYMLINK_NOFOLLOW)` 判定,
+/// 目录以 `openat(..., O_DIRECTORY | O_NOFOLLOW)` 打开, 因此遍历期间被替换成符号
+/// 链接的目录项不会被跟随.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn find_mount_boundary(root: &Path) -> io::Result<Option<MountBoundary>> {
+    let metadata = fs::symlink_metadata(root)?;
+    if !metadata.file_type().is_dir() {
+        return Ok(None);
+    }
+    let identity = mount_identity(root, &metadata);
+    let dir_fd = open_directory(root)?;
+    find_in_directory(&dir_fd, root, &identity)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn find_in_directory(
+    dir_fd: &rustix::fd::OwnedFd,
+    dir_path: &Path,
+    parent: &MountIdentity,
+) -> io::Result<Option<MountBoundary>> {
+    for entry in rustix::fs::Dir::read_from(dir_fd)? {
+        let entry = entry?;
+        // 原始 `readdir` 会返回 `.` 与 `..`; 标准库 `read_dir` 已过滤, 这里必须自行跳过.
+        if is_dot_entry(entry.file_name()) {
+            continue;
+        }
+        let (file_type, identity, path) = classify_child(dir_fd, entry.file_name(), dir_path)?;
+        // 符号链接只复制或删除链接本身, 从不跟随, 因此不参与挂载边界判定.
+        if file_type.is_symlink() {
+            continue;
+        }
+        if !identity.same_mount(parent) {
+            return Ok(Some(MountBoundary { path }));
+        }
+        if file_type.is_dir() {
+            run_before_descend_hook(&path);
+            let child_fd = open_child_directory(dir_fd, entry.file_name(), &path)?;
+            if let Some(boundary) = find_in_directory(&child_fd, &path, &identity)? {
+                return Ok(Some(boundary));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// 递归删除 `root`, 在进入任何子项之前复核挂载边界.
+///
+/// 与 `fs::remove_dir_all` 不同, 本函数不会跨越挂载边界: 发现边界立即返回
+/// [`RemoveTreeError::Boundary`], 该路径及其内容保持原样, 但同级的其他子项可能已被
+/// 删除. 符号链接按链接本身移除, 不跟随. 不自动修改权限位: 只读目录仍按既有语义
+/// 使删除失败, 由调用方决定是否先恢复权限.
+///
+/// 子项从已打开的目录文件描述符出发: 判定用 `statat(..., SYMLINK_NOFOLLOW)`, 目录以
+/// `openat(..., O_DIRECTORY | O_NOFOLLOW)` 打开, 删除用 `unlinkat` (目录带
+/// `REMOVEDIR`). 若目录项在判定为目录之后被替换为符号链接或非目录, 打开以
+/// `ELOOP` / `ENOTDIR` 失败, 该路径按失败处理, 不跟随链接目标.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn remove_tree(root: &Path) -> Result<(), RemoveTreeError> {
+    let metadata = fs::symlink_metadata(root).map_err(RemoveTreeError::Io)?;
+    if !metadata.file_type().is_dir() {
+        // 符号链接与普通文件只移除对象本身.
+        unlink_at(CWD, root, AtFlags::empty()).map_err(RemoveTreeError::Io)?;
+        return Ok(());
+    }
+    let identity = mount_identity(root, &metadata);
+    let dir_fd = open_directory(root).map_err(RemoveTreeError::Io)?;
+    remove_directory_contents(&dir_fd, root, &identity)?;
+    unlink_at(CWD, root, AtFlags::REMOVEDIR).map_err(RemoveTreeError::Io)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn remove_directory_contents(
+    dir_fd: &rustix::fd::OwnedFd,
+    dir_path: &Path,
+    parent: &MountIdentity,
+) -> Result<(), RemoveTreeError> {
+    for entry in
+        rustix::fs::Dir::read_from(dir_fd).map_err(|error| RemoveTreeError::Io(error.into()))?
+    {
+        let entry = entry.map_err(|error| RemoveTreeError::Io(error.into()))?;
+        // 原始 `readdir` 会返回 `.` 与 `..`; 标准库 `read_dir` 已过滤, 这里必须自行跳过.
+        if is_dot_entry(entry.file_name()) {
+            continue;
+        }
+        let (file_type, identity, path) =
+            classify_child(dir_fd, entry.file_name(), dir_path).map_err(RemoveTreeError::Io)?;
+        if file_type.is_symlink() {
+            unlink_at(dir_fd, entry.file_name(), AtFlags::empty()).map_err(RemoveTreeError::Io)?;
+            continue;
+        }
+        if !identity.same_mount(parent) {
+            return Err(RemoveTreeError::Boundary(MountBoundary { path }));
+        }
+        if file_type.is_dir() {
+            run_before_descend_hook(&path);
+            let child_fd = open_child_directory(dir_fd, entry.file_name(), &path)
+                .map_err(RemoveTreeError::Io)?;
+            remove_directory_contents(&child_fd, &path, &identity)?;
+            unlink_at(dir_fd, entry.file_name(), AtFlags::REMOVEDIR)
+                .map_err(RemoveTreeError::Io)?;
+        } else {
+            unlink_at(dir_fd, entry.file_name(), AtFlags::empty()).map_err(RemoveTreeError::Io)?;
+        }
+    }
+    Ok(())
+}
+
+/// 以 `O_DIRECTORY | O_NOFOLLOW` 打开一个目录; 末段是符号链接或非目录时失败.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn open_directory(path: &Path) -> io::Result<rustix::fd::OwnedFd> {
+    openat(
+        CWD,
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(io::Error::from)
+}
+
+/// 打开一个已存在目录, 用于定位对象所在目录 (跟随末段符号链接).
+///
+/// 与 [`open_directory`] 的区别是不加 `O_NOFOLLOW`: 目标的父目录本身可能就是符号
+/// 链接 (例如 `~/.config`), 这是既有行为. 遍历真正进入的子目录仍用
+/// [`open_child_directory`] 的 `O_NOFOLLOW`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn open_directory_ancestor(path: &Path) -> io::Result<rustix::fd::OwnedFd> {
+    openat(
+        CWD,
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(io::Error::from)
+}
+
+/// 以 `O_DIRECTORY | O_NOFOLLOW` 打开父目录下的一个子目录.
+///
+/// 若目录项在判定为目录之后被替换成符号链接或普通文件, `openat` 返回 `ELOOP` 或
+/// `ENOTDIR`; 此时返回失败, 不跟随任何链接目标. 调用方据此使该条目失败.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn open_child_directory(
+    parent: &rustix::fd::OwnedFd,
+    name: &std::ffi::CStr,
+    path: &Path,
+) -> io::Result<rustix::fd::OwnedFd> {
+    match openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => Ok(fd),
+        Err(errno) if is_replaced_during_traversal(errno) => {
+            Err(replaced_during_traversal(path, errno))
+        }
+        Err(errno) => Err(errno.into()),
+    }
+}
+
+/// 以 `O_NOFOLLOW` 打开父目录下的一个普通文件.
+///
+/// 判定为文件之后被替换成符号链接时 `openat` 返回 `ELOOP`; 此时返回失败, 不跟随
+/// 链接读取其目标内容.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn open_child_file(
+    parent: &rustix::fd::OwnedFd,
+    name: &std::ffi::CStr,
+    path: &Path,
+) -> io::Result<rustix::fd::OwnedFd> {
+    match openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => Ok(fd),
+        Err(errno) if is_replaced_during_traversal(errno) => {
+            Err(replaced_during_traversal(path, errno))
+        }
+        Err(errno) => Err(errno.into()),
+    }
+}
+
+/// 目录项在判定之后被替换时的统一说明; 不跟随链接目标.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn replaced_during_traversal(path: &Path, errno: rustix::io::Errno) -> io::Error {
+    io::Error::new(
+        io::Error::from(errno).kind(),
+        format!(
+            "拒绝进入 {}: 该目录项在遍历期间被替换为符号链接或非目录, 不跟随链接目标",
+            path.display()
+        ),
+    )
+}
+
+/// `readdir` 返回的 `.` 与 `..` 不是可遍历子项.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn is_dot_entry(name: &std::ffi::CStr) -> bool {
+    matches!(name.to_bytes(), b"." | b"..")
+}
+
+/// 判定目录项时用到的 `ELOOP` / `ENOTDIR`: 视为遍历期间被替换.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn is_replaced_during_traversal(errno: rustix::io::Errno) -> bool {
+    errno == rustix::io::Errno::LOOP || errno == rustix::io::Errno::NOTDIR
+}
+
+/// 用 `statat(..., SYMLINK_NOFOLLOW)` 判定父目录下的一个子项.
+///
+/// 返回对象类型, 挂载身份与完整路径 (仅用于错误说明与路径式挂载标识回退). 不跟随
+/// 末段符号链接.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn classify_child(
+    parent: &rustix::fd::OwnedFd,
+    name: &std::ffi::CStr,
+    dir_path: &Path,
+) -> io::Result<(rustix::fs::FileType, MountIdentity, PathBuf)> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let stat = statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)?;
+    let file_type = rustix::fs::FileType::from_raw_mode(stat.st_mode);
+    let path = dir_path.join(std::ffi::OsStr::from_bytes(name.to_bytes()));
+    let mount = entry_mount_id(parent, name, &path);
+    Ok((
+        file_type,
+        MountIdentity::new(stat.st_dev as u64, mount),
+        path,
+    ))
+}
+
+/// 子项的挂载标识: 优先在父目录文件描述符上做 fd 相对的 `statx`; 失败时退回既有的
+/// 路径式 `mount_id`. 任何一步失败都只是缺失挂载标识, 调用方退回设备号比较.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn entry_mount_id(parent: &rustix::fd::OwnedFd, name: &std::ffi::CStr, path: &Path) -> Option<u64> {
+    // 只有 Linux 的 `statx` 分支使用 fd 相对参数; macOS 直接走路径式 `mount_id`.
+    #[cfg(not(target_os = "linux"))]
+    let _ = (parent, name);
+
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::fs::{StatxFlags, statx};
+
+        if let Ok(stat) = statx(parent, name, AtFlags::SYMLINK_NOFOLLOW, StatxFlags::MNT_ID)
+            && let Some(mount_id) = mount_id_from_mask(stat.stx_mask, stat.stx_mnt_id)
+        {
+            return Some(mount_id);
+        }
+    }
+    mount_id(path)
+}
+
+/// `unlinkat` 的薄封装: 绝对路径或相对父目录文件描述符.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn unlink_at<Fd: rustix::fd::AsFd>(
+    dirfd: Fd,
+    path: impl rustix::path::Arg,
+    flags: AtFlags,
+) -> io::Result<()> {
+    rustix::fs::unlinkat(dirfd, path, flags).map_err(io::Error::from)
+}
+
+// 非 macOS/Linux 平台的可编译回退: 平台门禁会在任何文件系统操作之前退 3, 这里只
+// 保留原有的路径式遍历, 不提供 fd 相对原语.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub(crate) fn find_mount_boundary(root: &Path) -> io::Result<Option<MountBoundary>> {
     let metadata = fs::symlink_metadata(root)?;
     if !metadata.file_type().is_dir() {
@@ -280,12 +548,12 @@ pub(crate) fn find_mount_boundary(root: &Path) -> io::Result<Option<MountBoundar
     find_in_directory(root, &identity)
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn find_in_directory(dir: &Path, parent: &MountIdentity) -> io::Result<Option<MountBoundary>> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
         let metadata = fs::symlink_metadata(&path)?;
-        // 符号链接只复制或删除链接本身, 从不跟随, 因此不参与挂载边界判定.
         if metadata.file_type().is_symlink() {
             continue;
         }
@@ -302,12 +570,7 @@ fn find_in_directory(dir: &Path, parent: &MountIdentity) -> io::Result<Option<Mo
     Ok(None)
 }
 
-/// 递归删除 `root`, 在进入任何子项之前复核挂载边界.
-///
-/// 与 `fs::remove_dir_all` 不同, 本函数不会跨越挂载边界: 发现边界立即返回
-/// [`RemoveTreeError::Boundary`], 该路径及其内容保持原样, 但同级的其他子项可能已被
-/// 删除. 符号链接按链接本身移除, 不跟随. 不自动修改权限位: 只读目录仍按既有语义
-/// 使删除失败, 由调用方决定是否先恢复权限.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub(crate) fn remove_tree(root: &Path) -> Result<(), RemoveTreeError> {
     let metadata = fs::symlink_metadata(root).map_err(RemoveTreeError::Io)?;
     if !metadata.file_type().is_dir() {
@@ -318,6 +581,7 @@ pub(crate) fn remove_tree(root: &Path) -> Result<(), RemoveTreeError> {
     fs::remove_dir(root).map_err(RemoveTreeError::Io)
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn remove_directory_contents(dir: &Path, parent: &MountIdentity) -> Result<(), RemoveTreeError> {
     for entry in fs::read_dir(dir).map_err(RemoveTreeError::Io)? {
         let entry = entry.map_err(RemoveTreeError::Io)?;
@@ -340,6 +604,36 @@ fn remove_directory_contents(dir: &Path, parent: &MountIdentity) -> Result<(), R
     }
     Ok(())
 }
+
+// 测试接缝: 目录项被判定为目录之后, 打开它之前运行一次注入动作.
+//
+// 真实的"判定之后目录项被替换为符号链接"竞态无法在可移植测试里稳定触发; 线程局部
+// 钩子让 `remove_tree` 的"拒绝跟随"分支可被确定性断言. 生产构建不包含该钩子.
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+type DescendHook = Box<dyn FnOnce(&Path)>;
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+thread_local! {
+    static BEFORE_DESCEND: std::cell::RefCell<Option<DescendHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// 在目标平台的下一次目录递归前运行一次注入动作.
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+pub(crate) fn before_descend(hook: impl FnOnce(&Path) + 'static) {
+    BEFORE_DESCEND.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+fn run_before_descend_hook(path: &Path) {
+    let hook = BEFORE_DESCEND.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(path);
+    }
+}
+
+#[cfg(all(not(test), any(target_os = "macos", target_os = "linux")))]
+fn run_before_descend_hook(_path: &Path) {}
 
 // 测试接缝: 让挂载身份比较返回模拟的"不同挂载".
 //
@@ -730,6 +1024,61 @@ mod tests {
             "不得跟随链接删除其目标"
         );
         assert_eq!(fs::read_to_string(kept.join("keep")).unwrap(), "keep");
+    }
+
+    /// 目录项在判定为目录之后被替换为仓库外的符号链接: 删除必须失败, 绝不进入或
+    /// 删除链接目标的内容.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn remove_tree_refuses_a_directory_replaced_by_an_outside_symlink() {
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside = outside_dir.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("secret"), "secret").unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let tree = dir.path().join("tree");
+        fs::create_dir_all(tree.join("victim")).unwrap();
+        fs::write(tree.join("victim/inside"), "inside").unwrap();
+
+        let victim = tree.join("victim");
+        let replaced = victim.clone();
+        let outside_path = outside.clone();
+        before_descend(move |path| {
+            if path == replaced {
+                fs::remove_dir_all(&replaced).unwrap();
+                std::os::unix::fs::symlink(&outside_path, &replaced).unwrap();
+            }
+        });
+
+        let error = remove_tree(&tree).expect_err("目录项被替换后必须失败");
+        match error {
+            RemoveTreeError::Io(error) => {
+                assert!(
+                    error.to_string().contains("不跟随链接目标"),
+                    "失败说明必须指出拒绝跟随: {error}"
+                );
+            }
+            RemoveTreeError::Boundary(boundary) => {
+                panic!(
+                    "期望遍历失败, 实际报告挂载边界: {}",
+                    boundary.path.display()
+                )
+            }
+        }
+
+        assert_eq!(
+            fs::read_to_string(outside.join("secret")).unwrap(),
+            "secret",
+            "链接目标的内容必须保持原样"
+        );
+        assert!(
+            fs::symlink_metadata(&victim)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "被替换的目录项本身不应被跟随或删除"
+        );
     }
 
     #[test]

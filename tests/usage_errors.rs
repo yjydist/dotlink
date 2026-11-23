@@ -263,6 +263,30 @@ fn help_and_version_exit_zero_with_output() {
         .stdout(contains("dotlink"));
 }
 
+/// 帮助文本必须是纯文本: 不得含 markdown 强调符, 同时保留退出码语义.
+#[test]
+fn help_output_contains_no_markdown_emphasis() {
+    let env = TempEnv::new();
+    for args in [
+        vec!["--help"],
+        vec!["preview", "--help"],
+        vec!["apply", "--help"],
+        vec!["status", "--help"],
+        vec!["undo", "--help"],
+    ] {
+        let observed = env.cmd().args(&args).assert().code(0);
+        let text = String::from_utf8_lossy(&observed.get_output().stdout).into_owned();
+        assert!(
+            !text.contains("**"),
+            "`{args:?}` 的帮助不得含 markdown 强调符:\n{text}"
+        );
+        assert!(
+            text.contains("退出码"),
+            "`{args:?}` 的帮助必须保留退出码语义:\n{text}"
+        );
+    }
+}
+
 #[test]
 fn usage_errors_do_not_touch_the_filesystem() {
     let env = TempEnv::new();

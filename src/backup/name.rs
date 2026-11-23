@@ -9,8 +9,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-
-use time::{Date, Month, OffsetDateTime, Time, UtcOffset};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, Result};
 
@@ -241,24 +240,58 @@ pub(super) fn parent_dir(path: &Path) -> &Path {
 /// 偏移下生成的备份无法比较, `undo` 可能恢复较旧的内容; 因此这里没有本地时区分支,
 /// 也不依赖运行环境的时区数据.
 pub(super) fn timestamp() -> String {
-    format_timestamp(OffsetDateTime::now_utc())
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        // 系统时钟早于 Unix epoch 时退化为 epoch, 使命名仍然确定且格式合法.
+        .unwrap_or(0);
+    format_unix_timestamp(seconds)
 }
 
-/// 把任意时刻归一到 UTC 后格式化为 15 字符 `YYYYMMDDThhmmss`.
+/// 把 Unix 秒 (UTC) 格式化为 15 字符 `YYYYMMDDThhmmss`.
 ///
-/// 拆出无副作用的格式化函数是为了让带偏移的固定时刻可被单元测试断言: `+08:00` 的输入必须输出
-/// UTC 化的字面值, 而不是原时刻的本地字段.
-pub(super) fn format_timestamp(at: OffsetDateTime) -> String {
-    let utc = at.to_offset(UtcOffset::UTC);
-    format!(
-        "{:04}{:02}{:02}T{:02}{:02}{:02}",
-        utc.year(),
-        u8::from(utc.month()),
-        utc.day(),
-        utc.hour(),
-        utc.minute(),
-        utc.second()
-    )
+/// 拆出无副作用的格式化函数是为了让固定时刻可被单元测试断言. Unix 秒本身即 UTC,
+/// 因此这里没有本地时区分支, 也不读取运行环境的时区数据.
+pub(super) fn format_unix_timestamp(seconds: i64) -> String {
+    let days = seconds.div_euclid(86_400);
+    let time_of_day = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = time_of_day / 3_600;
+    let minute = (time_of_day % 3_600) / 60;
+    let second = time_of_day % 60;
+    format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}")
+}
+
+/// 把 Unix epoch 起的天数换算为公历年月日 (Howard Hinnant 的 civil-from-days).
+///
+/// 纯整数运算, 不依赖任何日期库; 覆盖闰年与世纪闰年, 并按 UTC 解释.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    (year + i64::from(month <= 2), month, day)
+}
+
+/// 公历闰年规则.
+fn is_leap_year(year: i64) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+}
+
+/// 指定年月的真实天数; 月份非法时返回 0 (由调用方按非法字段处理).
+fn days_in_month(year: i64, month: u8) -> u8 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
 }
 
 /// 完整命名的后缀拆成 `(时间戳, 序号数字串)`; 裸名 (无序号) 的序号记为空串, 数值上是 0.
@@ -308,7 +341,8 @@ fn cmp_serial(a: &str, b: &str) -> Ordering {
 /// 只有合法的 UTC 日历时刻才使 "定长字符串序即时间序" 成立; 形态合法但字段非法的
 /// 名字 (例如 `20261301T000000`) 取值无意义, 不参与查找
 /// (openspec/specs/backup-lifecycle/spec.md 的"时间戳字段非法的备份不参与查找").
-/// 日历判定复用 `time` 的构造校验, 不重复实现每月天数与闰年规则.
+/// 日历判定在项目内实现: 月份在 01 至 12 之间, 日落在该月真实天数内 (含世纪闰年),
+/// 时分秒各自在真实范围内.
 pub(super) fn is_timestamp(text: &str) -> bool {
     let bytes = text.as_bytes();
     if bytes.len() != 15
@@ -320,11 +354,8 @@ pub(super) fn is_timestamp(text: &str) -> bool {
     }
 
     // 字节切片在形态校验之后是安全的: 15 个字节全是 ASCII 数字或 `T`.
-    let year = text[0..4].parse::<i32>().ok();
-    let month = text[4..6]
-        .parse::<u8>()
-        .ok()
-        .and_then(|month| Month::try_from(month).ok());
+    let year = text[0..4].parse::<i64>().ok();
+    let month = text[4..6].parse::<u8>().ok();
     let day = text[6..8].parse::<u8>().ok();
     let hour = text[9..11].parse::<u8>().ok();
     let minute = text[11..13].parse::<u8>().ok();
@@ -335,8 +366,12 @@ pub(super) fn is_timestamp(text: &str) -> bool {
         return false;
     };
 
-    Date::from_calendar_date(year, month, day).is_ok()
-        && Time::from_hms(hour, minute, second).is_ok()
+    (1..=12).contains(&month)
+        && day >= 1
+        && day <= days_in_month(year, month)
+        && hour <= 23
+        && minute <= 59
+        && second <= 59
 }
 
 /// 在同目录内给 `path` 追加一个后缀.

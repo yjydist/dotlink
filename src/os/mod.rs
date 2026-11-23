@@ -117,12 +117,17 @@ pub(crate) use fs_ops::{fail_directory_syncs, fail_syncs, staging_candidate};
 pub(crate) use mount::{
     MountIdentity, RemoveTreeError, find_mount_boundary, mount_identity, remove_tree,
 };
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) use mount::{
+    classify_child, open_child_directory, open_child_file, open_directory, open_directory_ancestor,
+};
 #[cfg(test)]
 pub(crate) use mount::{
     fail_mount_comparison_after, fail_mount_comparisons, fail_next_mount_comparison,
 };
 pub(crate) use normalize::{comparison_form, is_inside_repo, link_destination, normalize};
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) use metadata::{copy_xattrs, set_mtime};
 
 #[cfg(all(test, unix))]

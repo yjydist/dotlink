@@ -880,13 +880,87 @@ fn concurrent_apply_never_creates_a_link_to_the_wrong_place() {
         }
     }
 
-    // 该已知限制只要求"不静默产生错误结果" -- 最终每个目标都是指向正确源的链接, 因此
-    // 即便某一侧报了 `fail`, 落点也绝不是"指向错误位置的链接".
-    // 不断言备份文件的唯一性 (并发下允许出现重复备份, 那是已记录的已知限制).
+    // 在支持 `flock` 的本地文件系统上, 同一清单的两个 `apply` 已串行化, 因此每个目标
+    // 最终都是指向正确源的链接, 不会出现交错的部分替换. 重复备份只在平台不支持
+    // `flock` 的降级路径上仍是已知限制; 串行化正常时不应产生, 见下面的
+    // `concurrent_replace_and_backup_serializes_and_keeps_one_backup`.
     for (source, target) in &entries {
         let link = env.home().join(target.trim_start_matches("~/"));
         assert_link(&env, &link, source);
     }
+}
+
+/// 两个 `apply` 在同一清单上竞争替换同一个外部占用目标: `flock` 使它们串行执行,
+/// 因此两个进程都成功, 目标最终指向正确源, 且只发布一份备份.
+#[test]
+fn concurrent_replace_and_backup_serializes_and_keeps_one_backup() {
+    let env = TempEnv::new();
+    env.write_source("rc", "managed\n");
+    env.write_manifest(&manifest_of(&[(
+        "rc",
+        "~/.concurrent-replace",
+        "replace_and_backup",
+    )]));
+
+    let target = env.home().join(".concurrent-replace");
+    fs::write(&target, "foreign\n").unwrap();
+
+    let gate_dir = tempfile::tempdir().expect("创建并发门控目录");
+    let gate = gate_dir.path().join("gate");
+    let first_ready = gate_dir.path().join("first-ready");
+    let second_ready = gate_dir.path().join("second-ready");
+
+    let mut first = gated_apply(&env, &gate, &first_ready);
+    let mut second = gated_apply(&env, &gate, &second_ready);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !(first_ready.exists() && second_ready.exists()) {
+        assert!(
+            Instant::now() < deadline,
+            "受门控的 apply 进程未在 10 秒内就绪"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        first.try_wait().expect("检查第一个进程").is_none()
+            && second.try_wait().expect("检查第二个进程").is_none(),
+        "放行前两个 apply 进程都必须仍在运行"
+    );
+
+    fs::write(&gate, "").expect("释放并发启动屏障");
+    let first_output = first.wait_with_output().expect("等待第一个进程");
+    let second_output = second.wait_with_output().expect("等待第二个进程");
+
+    for output in [&first_output, &second_output] {
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "串行化后两个 apply 都必须成功:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        let lines = entry_lines(&text);
+        assert_eq!(lines.len(), 1, "输出行数不符:\n{text}");
+        let token = token_of(lines[0]);
+        assert!(
+            token == "replace" || token == "ok",
+            "竞争同一目标的 token 只能是 replace 或 ok: {token}"
+        );
+    }
+
+    assert_link(&env, &target, "rc");
+    let backups: Vec<String> = backups_in(env.home())
+        .into_iter()
+        .filter(|name| {
+            name.starts_with(".concurrent-replace.dotlink-backup.") && !name.ends_with(".partial")
+        })
+        .collect();
+    assert_eq!(
+        backups.len(),
+        1,
+        "串行化后同一目标只能发布一份备份: {backups:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

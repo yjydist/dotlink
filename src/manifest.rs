@@ -1,8 +1,10 @@
-//! 清单解析与全量校验 (V-1 到 V-13).
+//! 清单解析与全量校验 (V-1 到 V-14).
 
 use std::collections::{BTreeMap, HashMap};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use crate::cli::Command;
 use crate::entry::{self, Entry, OnConflict};
 use crate::error::{Error, Result};
 use crate::os;
@@ -62,28 +64,110 @@ impl ComparisonForms {
     }
 }
 
+/// 同一清单上的并发调用串行化所需的锁模式.
+///
+/// 写入命令 (`apply` / `undo`) 取排他锁, 只读命令 (`preview` / `status`) 取共享锁.
+/// 锁加在已打开的 `dotlink.toml` 文件描述符上, 不新建任何锁文件或状态文件.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LockMode {
+    Shared,
+    Exclusive,
+}
+
+/// 各子命令应取的锁模式.
+///
+/// 平台不支持 `flock` 时本模式仍被计算, 只是降级为不加锁并继续执行.
+pub(crate) fn lock_mode_for(command: Command) -> LockMode {
+    match command {
+        Command::Apply | Command::Undo => LockMode::Exclusive,
+        Command::Preview | Command::Status => LockMode::Shared,
+    }
+}
+
+/// 持有一份已取得的清单锁; 丢弃守卫即随文件描述符关闭而释放锁.
+///
+/// 由调用方 ( `lib::run_on` ) 持有到整条命令结束, 因此 `apply` / `undo` 在结束前
+/// 不会被同一清单上的另一个写入命令打断.
+#[derive(Debug)]
+pub(crate) struct ManifestLock {
+    _file: std::fs::File,
+}
+
 /// 从当前工作目录读取并校验 `dotlink.toml`.
 ///
 /// V-1 的前一半: 清单文件与**当前工作目录**都必须可用. 二者的说明必须可区分
 /// (FR-015) -- 目录已被删除时报"找不到清单"会把用户引向错误的方向.
-pub fn load() -> Result<Manifest> {
+///
+/// 读取前先按 `mode` 对已打开的文件描述符取锁: 文件打开, 加锁与读取都来自同一个
+/// 文件描述符, 锁 guard 随返回值交给调用方持有. 平台不支持 `flock` 时降级为
+/// 不加锁并继续; 其他锁错误与读取失败一样按清单错误处理 (退出码 2).
+pub fn load(mode: LockMode) -> Result<(Manifest, Option<ManifestLock>)> {
     let cwd = std::env::current_dir().map_err(|error| {
         Error::ManifestInvalid(format!("当前工作目录不可用, 无法定位清单: {error}"))
     })?;
 
     let path = cwd.join(MANIFEST_NAME);
-    let text = std::fs::read_to_string(&path).map_err(|error| {
-        Error::ManifestInvalid(format!("无法读取清单 ./{MANIFEST_NAME}: {error}"))
-    })?;
+    let (text, lock) = read_manifest(&path, mode)?;
+    parse(&text, &cwd).map(|manifest| (manifest, lock))
+}
 
-    parse(&text, &cwd)
+/// 清单读取失败的统一说明: 与既有"无法读取清单"文本一致.
+fn read_error(error: impl std::fmt::Display) -> Error {
+    Error::ManifestInvalid(format!("无法读取清单 ./{MANIFEST_NAME}: {error}"))
+}
+
+/// 清单加锁失败的说明: 与读取失败同样整体拒绝 (退出码 2).
+fn lock_error(error: impl std::fmt::Display) -> Error {
+    Error::ManifestInvalid(format!("无法锁定清单 ./{MANIFEST_NAME}: {error}"))
+}
+
+/// 打开清单, 取锁, 再从同一文件描述符读取文本.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn read_manifest(path: &Path, mode: LockMode) -> Result<(String, Option<ManifestLock>)> {
+    use rustix::fs::{CWD, FlockOperation, Mode, OFlags, flock, openat};
+
+    let fd =
+        openat(CWD, path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty()).map_err(read_error)?;
+    let mut file = std::fs::File::from(fd);
+
+    let operation = match mode {
+        LockMode::Shared => FlockOperation::LockShared,
+        LockMode::Exclusive => FlockOperation::LockExclusive,
+    };
+    let locked = match flock(&file, operation) {
+        Ok(()) => true,
+        // 平台不支持 flock 时按既有降级策略继续: 命令行为与退出码只由清单与文件
+        // 系统状态决定.
+        Err(errno) if lock_errno_is_unsupported(errno) => false,
+        Err(errno) => return Err(lock_error(errno)),
+    };
+
+    let mut text = String::new();
+    file.read_to_string(&mut text).map_err(read_error)?;
+    Ok((text, locked.then_some(ManifestLock { _file: file })))
+}
+
+/// 平台不支持 `flock` 时降级继续; 其余错误按清单错误处理.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn lock_errno_is_unsupported(errno: rustix::io::Errno) -> bool {
+    errno == rustix::io::Errno::NOTSUP
+        || errno == rustix::io::Errno::OPNOTSUPP
+        || errno == rustix::io::Errno::NOLCK
+        || errno == rustix::io::Errno::NOSYS
+}
+
+/// 非目标平台: 不取锁, 按原样读取. 平台门禁会在参数解析与清单读取之前退 3.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn read_manifest(path: &Path, _mode: LockMode) -> Result<(String, Option<ManifestLock>)> {
+    let text = std::fs::read_to_string(path).map_err(read_error)?;
+    Ok((text, None))
 }
 
 /// 解析并校验给定的清单文本.
 ///
 /// 只读, 不写文件系统: 读取 `text` 与 `repo_root`, 展开 `~` 所需的 `HOME`, 以及
 /// V-9 / V-9b / V-9c / V-11 需要的文件系统元数据与符号链接解析结果, 不产生任何
-/// 文件系统改动. 校验规则 V-1 到 V-13 见 `openspec/specs/manifest-schema/spec.md`,
+/// 文件系统改动. 校验规则 V-1 到 V-14 见 `openspec/specs/manifest-schema/spec.md`,
 /// 逐条对应如下:
 /// V-2 语法 (本函数前半), V-3 条目非空, V-4 两字段非空, V-5 目标路径互不重复,
 /// V-6 目标可解析为绝对路径, V-7 `on_conflict` 取值合法, V-8 只出现已定义的键.
@@ -95,15 +179,66 @@ pub fn load() -> Result<Manifest> {
 /// 主目录的 `~` 简写; 它与其他 V-9 判定同在条目循环内运行.
 ///
 /// V-11 在全部条目解析后检查目标之间, 目标与源之间的路径隔离. V-12 随后检查
-/// 目标末段 basename 的字节预算, V-13 最后检查目标完整路径的平台预算; 两条预算
-/// 都放在 V-9 / V-10 / V-11 之后以保持既有报错优先级.
+/// 目标末段 basename 的字节预算, V-13 检查目标完整路径的平台预算, V-14 最后读取
+/// 目标最近已存在祖先的 `f_namemax` 收紧运行期预算; 它们都放在 V-9 / V-10 / V-11
+/// 之后以保持既有报错优先级. V-14 探测失败时跳过, 不改变静态预算的接受面.
 /// 不校验源条目是否存在 (那是运行时状态 `SourceMissing`) 或条目数量上限.
 pub fn parse(text: &str, repo_root: &Path) -> Result<Manifest> {
-    // 手工从 `toml::Table` 读而不是反序列化进一个 `#[derive(Deserialize)]` 的中间
-    // 结构: `#[serde(deny_unknown_fields)]` 的错误里没有条目下标, 而 V-4 到 V-8 都
-    // 必须指出下标 / 键名 / 层级, 逐键遍历是唯一能同时给出这三者的形态.
-    let root = toml::from_str::<toml::Table>(text).map_err(|error| syntax_error(text, &error))?;
+    let root = parse_root(text)?;
+    let written_entries = entry_array(&root)?;
 
+    // 仓库根与主目录在整个解析中不变: 各规范化一次即可, 不随条目数重复访问文件系统.
+    // V-9 的仓库形态比较基准与 `entry::resolve_with` 的越界判定同源.
+    let repo = os::normalize(repo_root);
+    let home = entry::home().map(|path| os::normalize(&path));
+    // `HOME` 自身可能是符号链接 (例如 `/home/u -> /mnt/u`), 于是同一主目录有两个
+    // 路径形态: `HOME` 的书写形态, 以及解析它的符号链接后的物理形态. V-9 必须两种
+    // 都识别, 否则把主目录落点写成物理形态时会被静默放行, 一次 `replace_and_backup`
+    // 就会备份并替换整个主目录.
+    let home_physical = home.as_ref().ok().map(|home| physical_home(home));
+    // V-9 的身份基准: 文件系统根, 主目录的两种形态, 仓库根及其祖先, 清单文件.
+    // 在条目循环之前算一次, 后续每个条目只做常数次比较.
+    let baselines = BaselineIdentities::collect(
+        repo_root,
+        &repo,
+        home.as_deref().ok(),
+        home_physical.as_deref(),
+    );
+    let context = EntryContext {
+        repo_root,
+        repo,
+        home,
+        home_physical,
+        baselines,
+    };
+
+    let (entries, forms, registry) = parse_entries(written_entries, &context)?;
+
+    // V-11: 全部条目解析后检查目标之间, 目标与源之间的路径隔离. 放在逐条目校验之后,
+    // 使既有单条目规则的报错优先级不变.
+    reject_overlapping_paths(&entries, &forms, &registry.lexical, &registry.comparison)?;
+    // V-12: 目标末段 basename 的字节预算. 放在 V-9 / V-10 / V-11 之后: 长 basename
+    // 与既有规则同时命中时仍报原规则.
+    reject_overlong_target_basenames(&entries)?;
+    // V-13: 目标完整路径的平台预算. 放在 V-12 之后: basename 超限时仍先报 V-12.
+    reject_overlong_target_paths(&entries)?;
+    // V-14: 目标最近已存在祖先所在文件系统的 NAME_MAX. 放在最后: 前序规则命中时
+    // 报错优先级不变; 探测失败时跳过, 不因此拒绝清单.
+    reject_runtime_name_max(&entries)?;
+
+    Ok(Manifest {
+        repo_root: repo_root.to_path_buf(),
+        entries,
+    })
+}
+
+/// V-2: 把清单文本解析成 TOML 表.
+fn parse_root(text: &str) -> Result<toml::Table> {
+    toml::from_str::<toml::Table>(text).map_err(|error| syntax_error(text, &error))
+}
+
+/// V-8 (顶层) 与 V-3: 取出非空的 `entry` 数组.
+fn entry_array(root: &toml::Table) -> Result<&[toml::Value]> {
     // V-8 (顶层): 只允许 `entry`.
     for name in root.keys() {
         if name != ENTRY_KEY {
@@ -129,173 +264,58 @@ pub fn parse(text: &str, repo_root: &Path) -> Result<Manifest> {
             "`{ENTRY_KEY}` 不能为空: 至少需要一个条目"
         )));
     }
+    Ok(written_entries)
+}
 
-    let mut entries: Vec<Entry> = Vec::with_capacity(written_entries.len());
-    // 仓库根与主目录在整个解析中不变: 各规范化一次即可, 不随条目数重复访问文件系统.
-    // V-9 的仓库形态比较基准与 `entry::resolve_with` 的越界判定同源.
-    let repo = os::normalize(repo_root);
-    let home = entry::home().map(|path| os::normalize(&path));
-    // `HOME` 自身可能是符号链接 (例如 `/home/u -> /mnt/u`), 于是同一主目录有两个
-    // 路径形态: `HOME` 的书写形态, 以及解析它的符号链接后的物理形态. V-9 必须两种
-    // 都识别, 否则把主目录落点写成物理形态时会被静默放行, 一次 `replace_and_backup`
-    // 就会备份并替换整个主目录.
-    let home_physical = home.as_ref().ok().map(|home| physical_home(home));
-    // V-9 的身份基准: 文件系统根, 主目录的两种形态, 仓库根及其祖先, 清单文件.
-    // 在条目循环之前算一次, 后续每个条目只做常数次比较.
-    let baselines = BaselineIdentities::collect(
-        repo_root,
-        &repo,
-        home.as_deref().ok(),
-        home_physical.as_deref(),
-    );
-    // V-5 的重复检测: 目标路径 -> 首次声明它的条目下标. 用哈希表把逐条目两两比较的
-    // O(N^2) 降到 O(N), 并保持"报第一对冲突"的语义 (get 返回的是最早的下标).
-    let mut first_declared_at: HashMap<std::path::PathBuf, usize> =
-        HashMap::with_capacity(written_entries.len());
-    // 同一表按文件系统身份再存一份: 两个不同写法指向同一对象时字符串不会重合.
-    let mut first_declared_identity: HashMap<os::FileIdentity, usize> =
-        HashMap::with_capacity(written_entries.len());
-    // 同一表按比较形态 (末段也解析) 再存一份: 符号链接目标与其 referent 作为两个
-    // 目标出现时, 词法字符串不会重合. 已正确部署的链接 (比较形态等于自己的源) 不
-    // 进入本表, 使"多个独立目标共享同一源"在部署后仍被接受.
-    let mut first_declared_comparison: HashMap<std::path::PathBuf, usize> =
-        HashMap::with_capacity(written_entries.len());
-    // 每个条目的比较形态; 与 `entries` 一一对应, 只在校验内使用.
-    let mut forms: Vec<ComparisonForms> = Vec::with_capacity(written_entries.len());
+/// 条目循环之外算一次的解析上下文: 规范化的仓库根与主目录, 以及 V-9 的身份基准.
+struct EntryContext<'a> {
+    repo_root: &'a Path,
+    repo: PathBuf,
+    home: std::result::Result<PathBuf, Error>,
+    home_physical: Option<PathBuf>,
+    baselines: BaselineIdentities,
+}
 
-    for (index, written) in written_entries.iter().enumerate() {
-        let Some(table) = written.as_table() else {
-            return Err(invalid_entry(
-                index,
-                format!("必须是表 (`[[{ENTRY_KEY}]]`)"),
-            ));
-        };
+/// V-5 的重复检测表: 目标路径, 比较形态与文件系统身份各一份.
+struct TargetRegistry {
+    lexical: HashMap<std::path::PathBuf, usize>,
+    comparison: HashMap<std::path::PathBuf, usize>,
+    identity: HashMap<os::FileIdentity, usize>,
+}
 
-        // V-8 (条目内): 只允许 source / target / on_conflict. 拼错的 `on_conflict`
-        // 若被静默忽略会退化成本不存在的默认 `skip`, 比报错危险得多.
-        for name in table.keys() {
-            if !ENTRY_KEYS.contains(&name.as_str()) {
-                return Err(invalid_entry(
-                    index,
-                    format!(
-                        "{ENTRY_LEVEL}出现未知键 `{name}`: 只允许 {}",
-                        allowed_keys()
-                    ),
-                ));
-            }
+impl TargetRegistry {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            lexical: HashMap::with_capacity(capacity),
+            comparison: HashMap::with_capacity(capacity),
+            identity: HashMap::with_capacity(capacity),
         }
+    }
 
-        // V-4: 两个必填字段都必须是非空字符串.
-        let source = required_string(table, index, SOURCE_KEY)?;
-        let target = required_string(table, index, TARGET_KEY)?;
-        // V-7: 取值属于 {skip, replace_and_backup}, 缺省为 skip.
-        let on_conflict = parse_on_conflict(table, index)?;
-
-        // V-6: `entry::resolve_with` 是路径形态"能否解析"的唯一裁决处 (`~` 展开 /
-        // 相对仓库根的挂接 / 源侧只接受相对路径都在那里); 这里只补上条目下标与两个
-        // 书写形态. `error` 自身已说明是哪一侧, 哪种形态非法, 因此不再加统一前缀.
-        let resolved = entry::resolve_with(
-            &source,
-            &target,
-            on_conflict,
-            repo_root,
-            &repo,
-            home.as_deref(),
-        )
-        .map_err(|error| {
-            invalid_entry(
-                index,
-                format!("{error} ({SOURCE_KEY} = `{source}`, {TARGET_KEY} = `{target}`)"),
-            )
-        })?;
-
-        // V-9: 目标落点不得退化 (文件系统根 / 主目录 / 仓库根本身或其祖先).
-        // 落点身份在这里只取一次, V-5 与 V-10 复用同一结果. 取不到 (目标尚不存在或
-        // 元数据不可读) 时传 None, 校验退回字符串比较.
-        let landing_identity = os::target_identity(&resolved.target_path).ok();
-        reject_degenerate_target(
-            index,
-            &resolved,
-            &repo,
-            home.as_deref().ok(),
-            home_physical.as_deref(),
-            landing_identity,
-            &baselines,
-        )?;
-        // V-10: 目标不得指向本条目自己的 source -- 归一化后重合时建出的链接指向
-        // 自己, 恒为断链. 跨条目和祖先关系由全量 V-11 校验处理.
-        if resolved.target_path == resolved.source_path {
-            return Err(invalid_entry(
-                index,
-                format!(
-                    "`{target}` 归一化后与本条目的 `{SOURCE_KEY}` 相同 (均为 `{}`): 自指链接恒为断链",
-                    resolved.target_path.display()
-                ),
-            ));
-        }
-        // 两侧都存在时再比较身份: 大小写别名等写法不同却指向同一对象, 同样构成自指.
-        // 目标侧用 lstat 身份 (落点对象本身), 源侧同理, 与 V-5 / V-11 同一个口径.
-        if let Some(landing_identity) = landing_identity {
-            let source_identity = os::target_identity(&resolved.source_path).ok();
-            if source_identity == Some(landing_identity) {
-                return Err(invalid_entry(
-                    index,
-                    format!(
-                        "`{target}` 与本条目的 `{SOURCE_KEY} = {source}` 指向同一个对象 (目标落点 `{}`): 自指链接恒为断链",
-                        resolved.target_path.display()
-                    ),
-                ));
-            }
-        }
-
-        // 清单比较形态: 只在校验内使用, 不写回 `Entry`.
-        let target_comparison = os::comparison_form(&resolved.target_path);
-        let source_comparison = os::comparison_form(&resolved.source_path);
-        let comparison = ComparisonForms {
-            target_is_own_source_link: target_comparison == resolved.source_path,
-            target: target_comparison,
-            source: source_comparison,
-        };
-
-        // V-10: `source` 是符号链接时, 其解析目标同样参与自指判定. 目标等于源的
-        // 解析目标时, 建出的链接会形成 `target -> source -> target` 的环.
-        if comparison.source != resolved.source_path && resolved.target_path == comparison.source {
-            return Err(invalid_entry(
-                index,
-                format!(
-                    "`{target}` 与本条目的 `{SOURCE_KEY} = {source}` 的符号链接解析目标相同 (均为 `{}`): 自指链接恒为断链",
-                    comparison.source.display()
-                ),
-            ));
-        }
-        // 源是符号链接时, follow 身份指向其最终对象. 目标落点与该对象相同时同样
-        // 构成自指; 保留上面的 lstat 判等, 以覆盖目标本身是链接对象的情况.
-        if let Some(landing_identity) = landing_identity
-            && os::basis_identity(&resolved.source_path).ok() == Some(landing_identity)
-        {
-            return Err(invalid_entry(
-                index,
-                format!(
-                    "`{target}` 与本条目的 `{SOURCE_KEY} = {source}` 的符号链接解析目标指向同一个对象 (目标落点 `{}`): 自指链接恒为断链",
-                    resolved.target_path.display()
-                ),
-            ));
-        }
-
+    /// V-5: 检查并登记一个目标; 命中重复时整体拒绝.
+    ///
+    /// 三份表在同一处检查与登记, 报错文本与优先级保持既有实现.
+    fn register(
+        &mut self,
+        index: usize,
+        target_path: &Path,
+        comparison: &ComparisonForms,
+        landing_identity: Option<os::FileIdentity>,
+    ) -> Result<()> {
         // V-5: 比较 `os::normalize` 之后的 `target_path` (由 `resolve_with` 产出).
         // 不得用 `Path::canonicalize`: 待部署的目标通常尚不存在.
-        if let Some(&previous) = first_declared_at.get(resolved.target_path.as_path()) {
+        if let Some(&previous) = self.lexical.get(target_path) {
             return Err(Error::ManifestInvalid(format!(
                 "条目 `{}` 与条目 `{}` 声明了同一个目标路径: {}",
                 entry_label(previous),
                 entry_label(index),
-                resolved.target_path.display()
+                target_path.display()
             )));
         }
         // 目标比较形态重合: 符号链接目标与它解析后的同一对象作为两个目标出现.
         // 已正确部署的链接 (比较形态等于自己的源) 不参与, 见 `ComparisonForms`.
         if let Some(key) = comparison.target_key()
-            && let Some(&previous) = first_declared_comparison.get(key)
+            && let Some(&previous) = self.comparison.get(key)
         {
             return Err(Error::ManifestInvalid(format!(
                 "条目 `{}` 与条目 `{}` 声明了同一个目标路径 (比较形态均为 `{}`): 符号链接目标与它解析后的对象不能同时作为目标",
@@ -306,43 +326,174 @@ pub fn parse(text: &str, repo_root: &Path) -> Result<Manifest> {
         }
         // 字符串不同但两侧都存在且身份相同: 大小写别名等写法仍指向同一个目标.
         if let Some(identity) = landing_identity
-            && let Some(&previous) = first_declared_identity.get(&identity)
+            && let Some(&previous) = self.identity.get(&identity)
         {
             return Err(Error::ManifestInvalid(format!(
                 "条目 `{}` 与条目 `{}` 声明了同一个目标路径: {}",
                 entry_label(previous),
                 entry_label(index),
-                resolved.target_path.display()
+                target_path.display()
             )));
         }
-        first_declared_at.insert(resolved.target_path.clone(), index);
+
+        self.lexical.insert(target_path.to_path_buf(), index);
         if let Some(key) = comparison.target_key() {
-            first_declared_comparison.insert(key.to_path_buf(), index);
+            self.comparison.insert(key.to_path_buf(), index);
         }
         if let Some(identity) = landing_identity {
-            first_declared_identity.insert(identity, index);
+            self.identity.insert(identity, index);
         }
+        Ok(())
+    }
+}
 
-        forms.push(comparison);
-        entries.push(resolved);
+/// 逐条目执行 V-4 到 V-10, 并完成 V-5 的检查与登记.
+fn parse_entries(
+    written_entries: &[toml::Value],
+    context: &EntryContext<'_>,
+) -> Result<(Vec<Entry>, Vec<ComparisonForms>, TargetRegistry)> {
+    let mut entries: Vec<Entry> = Vec::with_capacity(written_entries.len());
+    let mut forms: Vec<ComparisonForms> = Vec::with_capacity(written_entries.len());
+    let mut registry = TargetRegistry::with_capacity(written_entries.len());
+
+    for (index, written) in written_entries.iter().enumerate() {
+        let (entry, form) = parse_entry(index, written, context, &mut registry)?;
+        entries.push(entry);
+        forms.push(form);
     }
 
-    reject_overlapping_paths(
-        &entries,
-        &forms,
-        &first_declared_at,
-        &first_declared_comparison,
-    )?;
-    // V-12: 目标末段 basename 的字节预算. 放在 V-9 / V-10 / V-11 之后: 长 basename
-    // 与既有规则同时命中时仍报原规则.
-    reject_overlong_target_basenames(&entries)?;
-    // V-13: 目标完整路径的平台预算. 放在 V-12 之后: basename 超限时仍先报 V-12.
-    reject_overlong_target_paths(&entries)?;
+    Ok((entries, forms, registry))
+}
 
-    Ok(Manifest {
-        repo_root: repo_root.to_path_buf(),
-        entries,
-    })
+/// 解析并校验单个条目, 按 V-8 (条目内), V-4, V-7, V-6, V-9, V-10, V-5 的顺序执行.
+fn parse_entry(
+    index: usize,
+    written: &toml::Value,
+    context: &EntryContext<'_>,
+    registry: &mut TargetRegistry,
+) -> Result<(Entry, ComparisonForms)> {
+    let Some(table) = written.as_table() else {
+        return Err(invalid_entry(
+            index,
+            format!("必须是表 (`[[{ENTRY_KEY}]]`)"),
+        ));
+    };
+
+    // V-8 (条目内): 只允许 source / target / on_conflict. 拼错的 `on_conflict`
+    // 若被静默忽略会退化成本不存在的默认 `skip`, 比报错危险得多.
+    for name in table.keys() {
+        if !ENTRY_KEYS.contains(&name.as_str()) {
+            return Err(invalid_entry(
+                index,
+                format!(
+                    "{ENTRY_LEVEL}出现未知键 `{name}`: 只允许 {}",
+                    allowed_keys()
+                ),
+            ));
+        }
+    }
+
+    // V-4: 两个必填字段都必须是非空字符串.
+    let source = required_string(table, index, SOURCE_KEY)?;
+    let target = required_string(table, index, TARGET_KEY)?;
+    // V-7: 取值属于 {skip, replace_and_backup}, 缺省为 skip.
+    let on_conflict = parse_on_conflict(table, index)?;
+
+    // V-6: `entry::resolve_with` 是路径形态"能否解析"的唯一裁决处 (`~` 展开 /
+    // 相对仓库根的挂接 / 源侧只接受相对路径都在那里); 这里只补上条目下标与两个
+    // 书写形态. `error` 自身已说明是哪一侧, 哪种形态非法, 因此不再加统一前缀.
+    let resolved = entry::resolve_with(
+        &source,
+        &target,
+        on_conflict,
+        context.repo_root,
+        &context.repo,
+        context.home.as_deref(),
+    )
+    .map_err(|error| {
+        invalid_entry(
+            index,
+            format!("{error} ({SOURCE_KEY} = `{source}`, {TARGET_KEY} = `{target}`)"),
+        )
+    })?;
+
+    // V-9: 目标落点不得退化 (文件系统根 / 主目录 / 仓库根本身或其祖先).
+    // 落点身份在这里只取一次, V-5 与 V-10 复用同一结果. 取不到 (目标尚不存在或
+    // 元数据不可读) 时传 None, 校验退回字符串比较.
+    let landing_identity = os::target_identity(&resolved.target_path).ok();
+    reject_degenerate_target(
+        index,
+        &resolved,
+        &context.repo,
+        context.home.as_deref().ok(),
+        context.home_physical.as_deref(),
+        landing_identity,
+        &context.baselines,
+    )?;
+    // V-10: 目标不得指向本条目自己的 source -- 归一化后重合时建出的链接指向
+    // 自己, 恒为断链. 跨条目和祖先关系由全量 V-11 校验处理.
+    if resolved.target_path == resolved.source_path {
+        return Err(invalid_entry(
+            index,
+            format!(
+                "`{target}` 归一化后与本条目的 `{SOURCE_KEY}` 相同 (均为 `{}`): 自指链接恒为断链",
+                resolved.target_path.display()
+            ),
+        ));
+    }
+    // 两侧都存在时再比较身份: 大小写别名等写法不同却指向同一对象, 同样构成自指.
+    // 目标侧用 lstat 身份 (落点对象本身), 源侧同理, 与 V-5 / V-11 同一个口径.
+    if let Some(landing_identity) = landing_identity {
+        let source_identity = os::target_identity(&resolved.source_path).ok();
+        if source_identity == Some(landing_identity) {
+            return Err(invalid_entry(
+                index,
+                format!(
+                    "`{target}` 与本条目的 `{SOURCE_KEY} = {source}` 指向同一个对象 (目标落点 `{}`): 自指链接恒为断链",
+                    resolved.target_path.display()
+                ),
+            ));
+        }
+    }
+
+    // 清单比较形态: 只在校验内使用, 不写回 `Entry`.
+    let target_comparison = os::comparison_form(&resolved.target_path);
+    let source_comparison = os::comparison_form(&resolved.source_path);
+    let comparison = ComparisonForms {
+        target_is_own_source_link: target_comparison == resolved.source_path,
+        target: target_comparison,
+        source: source_comparison,
+    };
+
+    // V-10: `source` 是符号链接时, 其解析目标同样参与自指判定. 目标等于源的
+    // 解析目标时, 建出的链接会形成 `target -> source -> target` 的环.
+    if comparison.source != resolved.source_path && resolved.target_path == comparison.source {
+        return Err(invalid_entry(
+            index,
+            format!(
+                "`{target}` 与本条目的 `{SOURCE_KEY} = {source}` 的符号链接解析目标相同 (均为 `{}`): 自指链接恒为断链",
+                comparison.source.display()
+            ),
+        ));
+    }
+    // 源是符号链接时, follow 身份指向其最终对象. 目标落点与该对象相同时同样
+    // 构成自指; 保留上面的 lstat 判等, 以覆盖目标本身是链接对象的情况.
+    if let Some(landing_identity) = landing_identity
+        && os::basis_identity(&resolved.source_path).ok() == Some(landing_identity)
+    {
+        return Err(invalid_entry(
+            index,
+            format!(
+                "`{target}` 与本条目的 `{SOURCE_KEY} = {source}` 的符号链接解析目标指向同一个对象 (目标落点 `{}`): 自指链接恒为断链",
+                resolved.target_path.display()
+            ),
+        ));
+    }
+
+    // V-5: 在 V-9 / V-10 之后检查目标重复并登记三份索引.
+    registry.register(index, &resolved.target_path, &comparison, landing_identity)?;
+
+    Ok((resolved, comparison))
 }
 
 /// 把一条可选身份登记到 `map`; 首次出现的条目下标保留 (与字符串表同一口径).
@@ -550,6 +701,116 @@ fn reject_overlong_target_paths(entries: &[Entry]) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// V-14: 目标末段加最长生成后缀不得超过最近已存在祖先所在文件系统的 `f_namemax`.
+///
+/// 静态预算 (V-12 的 200 字节 + 50 字节生成后缀 = 250) 只是常见 255 字节文件系统上
+/// 的保守上限; 实际文件系统可能更小 (例如部分网络文件系统). 本校验从 `target_path`
+/// 向上寻找最近的已存在祖先, 读取 `statvfs` 的 `f_namemax`; 只有探测成功且值大于 0
+/// 时才收紧接受面. 找不到已存在祖先或 `statvfs` 失败时跳过该条目, 仍按静态预算判定,
+/// 不因此拒绝清单.
+///
+/// PATH_MAX 继续使用平台常量: 没有可移植的只读运行期接口, 本校验不增加运行期
+/// PATH_MAX 探测.
+fn reject_runtime_name_max(entries: &[Entry]) -> Result<()> {
+    for (index, entry) in entries.iter().enumerate() {
+        let Some((ancestor, limit)) = effective_name_max(&entry.target_path) else {
+            continue;
+        };
+        let basename_bytes = entry::target_basename_bytes(&entry.target_path);
+        let needed = basename_bytes + entry::MAX_GENERATED_SUFFIX_BYTES;
+        if needed as u64 > limit {
+            return Err(invalid_entry(
+                index,
+                format!(
+                    "`{}` 的末段 basename 为 {basename_bytes} 字节, 加最长生成后缀 {} 字节后为 {needed} 字节, 超过最近已存在祖先 `{}` 所在文件系统的 NAME_MAX ({limit} 字节): 请缩短目标末段或换用支持更长文件名的文件系统",
+                    entry.target,
+                    entry::MAX_GENERATED_SUFFIX_BYTES,
+                    ancestor.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 取得 `target_path` 最近已存在祖先的 `f_namemax`; 不可用时返回 `None`.
+///
+/// 祖先从 `target_path` 的父目录开始向上寻找 (`target` 本身不是自己的祖先); 首个
+/// 存在且 `statvfs` 成功的祖先决定该条目的运行期上限. 探测失败只是跳过, 不改变
+/// 静态预算的接受面.
+fn effective_name_max(target_path: &Path) -> Option<(PathBuf, u64)> {
+    #[cfg(test)]
+    match NAME_MAX_OVERRIDE.with(std::cell::Cell::get) {
+        InjectedNameMax::Unavailable => return None,
+        InjectedNameMax::Value(limit) => {
+            let ancestor =
+                nearest_existing_ancestor(target_path).unwrap_or_else(|| target_path.to_path_buf());
+            return Some((ancestor, limit));
+        }
+        InjectedNameMax::None => {}
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let ancestor = nearest_existing_ancestor(target_path)?;
+        let stat = rustix::fs::statvfs(&ancestor).ok()?;
+        (stat.f_namemax > 0).then_some((ancestor, stat.f_namemax))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
+/// 从 `path` 的父目录开始向上寻找首个存在的祖先.
+fn nearest_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .skip(1)
+        .find(|ancestor| std::fs::symlink_metadata(ancestor).is_ok())
+        .map(Path::to_path_buf)
+}
+
+// 测试接缝: 注入 `f_namemax`, 避免依赖真实文件系统的 255 上限.
+//
+// 真实的较小 NAME_MAX 需要在特定文件系统上挂载; 线程局部注入让 255 接受, 143 拒绝
+// 与探测失败跳过三条分支可被确定性断言, 且并行测试互不影响. 生产构建不包含该状态.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InjectedNameMax {
+    None,
+    Value(u64),
+    Unavailable,
+}
+
+#[cfg(test)]
+thread_local! {
+    static NAME_MAX_OVERRIDE: std::cell::Cell<InjectedNameMax> =
+        const { std::cell::Cell::new(InjectedNameMax::None) };
+}
+
+/// 注入运行期 `f_namemax`: `Some(limit)` 伪装探测成功, `None` 伪装探测失败.
+#[cfg(test)]
+fn inject_name_max(limit: Option<u64>) -> NameMaxGuard {
+    let value = match limit {
+        Some(limit) => InjectedNameMax::Value(limit),
+        None => InjectedNameMax::Unavailable,
+    };
+    let previous = NAME_MAX_OVERRIDE.with(|slot| slot.replace(value));
+    NameMaxGuard { previous }
+}
+
+#[cfg(test)]
+struct NameMaxGuard {
+    previous: InjectedNameMax,
+}
+
+#[cfg(test)]
+impl Drop for NameMaxGuard {
+    fn drop(&mut self) {
+        NAME_MAX_OVERRIDE.with(|slot| slot.set(self.previous));
+    }
 }
 
 /// 取 `path` 的落点身份并查出映射中的条目下标; 路径不存在时返回 None.
@@ -2193,5 +2454,125 @@ mod tests {
             &root,
             &["entry[0]", "清单文件自身", "actual-manifest.toml"],
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 并发串行化: 锁模式与平台降级
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn write_commands_take_an_exclusive_lock_and_read_commands_take_a_shared_lock() {
+        assert_eq!(lock_mode_for(Command::Apply), LockMode::Exclusive);
+        assert_eq!(lock_mode_for(Command::Undo), LockMode::Exclusive);
+        assert_eq!(lock_mode_for(Command::Preview), LockMode::Shared);
+        assert_eq!(lock_mode_for(Command::Status), LockMode::Shared);
+    }
+
+    /// 只有平台不支持锁的 errno 才降级; 真实错误必须按清单失败处理.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn only_unsupported_flock_errnos_degrade() {
+        use rustix::io::Errno;
+
+        for errno in [Errno::NOTSUP, Errno::OPNOTSUPP, Errno::NOLCK, Errno::NOSYS] {
+            assert!(lock_errno_is_unsupported(errno), "{errno:?} 应降级为不加锁");
+        }
+        for errno in [Errno::IO, Errno::INVAL, Errno::ACCESS, Errno::BADF] {
+            assert!(
+                !lock_errno_is_unsupported(errno),
+                "{errno:?} 不得被当作平台不支持"
+            );
+        }
+    }
+
+    /// 共享锁之间互斥性为假: 同一文件上的两个共享锁可以并存, 不互相阻塞.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn two_shared_locks_can_coexist() {
+        use rustix::fs::{CWD, FlockOperation, Mode, OFlags, flock, openat};
+
+        let dir = tempfile::tempdir().expect("创建临时目录");
+        let path = dir.path().join(MANIFEST_NAME);
+        std::fs::write(&path, "[[entry]]\nsource = \"a\"\ntarget = \"b\"\n").expect("写入清单");
+
+        let open = || {
+            let fd = openat(CWD, &path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
+                .expect("打开清单");
+            std::fs::File::from(fd)
+        };
+        let first = open();
+        let second = open();
+        flock(&first, FlockOperation::LockShared).expect("第一个共享锁");
+        flock(&second, FlockOperation::LockShared).expect("第二个共享锁必须可以并存");
+    }
+
+    // -----------------------------------------------------------------------
+    // V-14: 运行期 NAME_MAX 预算
+    // -----------------------------------------------------------------------
+
+    /// 用 `name_len` 字节的末段构造绝对目标.
+    fn target_with_basename(name_len: usize) -> String {
+        let name = "a".repeat(name_len);
+        format!("[[entry]]\nsource = \"a\"\ntarget = \"link/{name}\"\n")
+    }
+
+    #[test]
+    fn v14_a_255_byte_name_max_accepts_a_200_byte_basename() {
+        let _guard = inject_name_max(Some(255));
+        let text = target_with_basename(entry::MAX_TARGET_BASENAME_BYTES);
+        let manifest = parse(&text, &repo()).expect("250 字节预算不得超过 255");
+        assert_eq!(manifest.entries.len(), 1);
+    }
+
+    #[test]
+    fn v14_a_143_byte_name_max_rejects_a_200_byte_basename() {
+        let _guard = inject_name_max(Some(143));
+        let text = target_with_basename(entry::MAX_TARGET_BASENAME_BYTES);
+        let message = invalid_message_at(&text, &repo());
+        for needle in ["entry[0]", "NAME_MAX", "143", "250", "200"] {
+            assert!(message.contains(needle), "说明中缺少 {needle:?}: {message}");
+        }
+    }
+
+    #[test]
+    fn v14_a_probe_failure_does_not_reject_the_manifest() {
+        let _guard = inject_name_max(None);
+        let text = target_with_basename(entry::MAX_TARGET_BASENAME_BYTES);
+        parse(&text, &repo()).expect("探测失败时必须跳过运行期检查");
+    }
+
+    #[test]
+    fn v14_accepts_exactly_the_runtime_limit_and_rejects_one_byte_over() {
+        // 200 字节末段加 50 字节生成后缀 = 250: 恰好等于上限时接受.
+        let _guard = inject_name_max(Some(250));
+        let text = target_with_basename(entry::MAX_TARGET_BASENAME_BYTES);
+        parse(&text, &repo()).expect("恰好等于 f_namemax 时必须接受");
+
+        let _guard = inject_name_max(Some(249));
+        let message = invalid_message_at(&text, &repo());
+        assert!(message.contains("249"), "{message}");
+    }
+
+    #[test]
+    fn v14_does_not_preempt_the_static_basename_budget() {
+        // V-12 先命中: 201 字节末段即使运行期上限更小, 仍报静态 basename 预算.
+        let _guard = inject_name_max(Some(1));
+        let text = target_with_basename(entry::MAX_TARGET_BASENAME_BYTES + 1);
+        let message = invalid_message_at(&text, &repo());
+        assert!(message.contains("末段 basename"), "{message}");
+        assert!(!message.contains("NAME_MAX"), "{message}");
+    }
+
+    #[test]
+    fn v14_does_not_preempt_the_static_path_budget() {
+        // V-13 先命中: 完整路径超过静态 PATH_MAX 预算时, 即使运行期上限更小,
+        // 仍报完整路径预算, 不报 NAME_MAX.
+        let _guard = inject_name_max(Some(1));
+        let budget = entry::max_target_path_bytes();
+        let target = path_of_bytes(budget + 1);
+        let text = format!("[[entry]]\nsource = \"a\"\ntarget = \"{target}\"\n");
+        let message = invalid_message_at(&text, &repo());
+        assert!(message.contains("完整路径"), "{message}");
+        assert!(!message.contains("NAME_MAX"), "{message}");
     }
 }
