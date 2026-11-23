@@ -482,6 +482,57 @@ fn v5_two_entries_with_the_same_target_are_rejected() {
     );
 }
 
+#[test]
+fn absent_case_aliases_are_accepted_and_the_second_create_fails() {
+    if !case_insensitive_volume() {
+        println!(
+            "跳过 absent_case_aliases_are_accepted_and_the_second_create_fails: 当前卷大小写敏感, 无法构造大小写别名"
+        );
+        return;
+    }
+
+    let env = env_with_source();
+    // 两个 target 都尚不存在且仅大小写不同: 身份判等取不到文件系统身份, 字符串比较
+    // 又不同, 因此清单被接受. 这是已知限制, 不是要支持的行为.
+    env.write_manifest(
+        "[[entry]]\nsource = \"shell/bashrc\"\ntarget = \"~/.Foo\"\n\n\
+         [[entry]]\nsource = \"shell/bashrc\"\ntarget = \"~/.foo\"\n",
+    );
+
+    // 判定在任何改动之前完成, 两个 target 都记为待创建.
+    let preview = run(&env, &["preview"]);
+    assert_eq!(
+        token_of(line_for(&preview.stdout, "~/.Foo")),
+        "create",
+        "{}",
+        preview.stdout
+    );
+    assert_eq!(
+        token_of(line_for(&preview.stdout, "~/.foo")),
+        "create",
+        "{}",
+        preview.stdout
+    );
+
+    // apply 按清单顺序建立第一条链接后, 第二条在同一对象上得到 EEXIST.
+    let apply = run(&env, &["apply"]);
+    assert_eq!(
+        token_of(line_for(&apply.stdout, "~/.Foo")),
+        "create",
+        "{}",
+        apply.stdout
+    );
+    let failed = line_for(&apply.stdout, "~/.foo");
+    assert_eq!(token_of(failed), "fail", "{}", apply.stdout);
+    assert!(
+        failed.contains("File exists") || failed.contains("EEXIST"),
+        "第二条建链必须给出 EEXIST 原因: {failed}"
+    );
+
+    // 第一条仍是正确的链接, 第二条的失败不得改写它.
+    env.assert_symlink_to(&env.home().join(".Foo"), &env.repo().join("shell/bashrc"));
+}
+
 // ---------------------------------------------------------------------------
 // V-6: 每个条目的 `target` 可解析为绝对路径
 // ---------------------------------------------------------------------------
